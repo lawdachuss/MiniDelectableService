@@ -239,6 +239,17 @@ def main():
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/146.0.0.0 Safari/537.36"
         )
+    # CRITICAL: cf_clearance is bound to the UA + TLS fingerprint of the minting
+    # browser. The DVR presents cookies over httpcloak's 'chrome-146-windows'
+    # fingerprint, so an Edge UA ("Edg/") stored from a previous browser grab
+    # would mismatch the fingerprint and get 403. Normalize to Chrome 146.
+    if "Edg/" in user_agent or "Edge/" in user_agent:
+        print(f"  [FIX] Edge UA detected ({user_agent[:80]}...) -> forcing Chrome 146 UA")
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        )
     print(f"  Resolved User-Agent: {user_agent}")
     print(f"UA_EXTRACTED={user_agent}")
 

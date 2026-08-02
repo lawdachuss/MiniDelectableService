@@ -111,10 +111,17 @@ def save_to_supabase(rest, api_key, value):
 
 
 def launch_browser(p):
-    """Launch Edge/Chrome *headed first* (needed to pass the managed Turnstile
-    challenge on datacenter IPs), falling back to headless/bundled Chromium."""
+    """Launch Chrome *first*, headed if possible.
+
+    CRITICAL: the cf_clearance cookie is bound to the TLS fingerprint of the
+    browser that minted it. The Go DVR presents that cookie over httpcloak's
+    'chrome-146-windows' TLS fingerprint, so the clearance MUST be minted by a
+    real Chrome (whose fingerprint matches) - Edge has a different TLS
+    fingerprint and Cloudflare rejects the mismatch (403), even with a fresh
+    clearance. Chrome is tried first; Edge is only a last resort.
+    """
     attempts = []
-    for ch in ("msedge", "chrome"):
+    for ch in ("chrome", "msedge"):
         for headless in (False, True):
             attempts.append((ch, headless))
             try:
@@ -271,15 +278,18 @@ def main():
     print("\n[1/4] Loading current cookies from Supabase...")
     settings = supabase_request("GET", get_url, api_key)
     old_str = ""
-    user_agent = os.environ.get("USER_AGENT", "")
     if settings and len(settings) > 0:
         val = settings[0].get("value", {})
         if isinstance(val, dict):
             old_str = val.get("cookies", "") or ""
-            if not user_agent:
-                user_agent = val.get("user_agent", "") or ""
     old = parse_cookies(old_str)
     print(f"  Existing cookies: {len(old)} (will be replaced by a fresh set)")
+
+    # CRITICAL: the DVR presents these cookies over httpcloak's
+    # 'chrome-146-windows' TLS fingerprint, and cf_clearance is bound to the
+    # TLS fingerprint + UA of the minting browser. We MUST use a Chrome 146 UA
+    # (never Edge's UA - that mismatches the fingerprint and gets 403).
+    user_agent = CHROME146_UA
 
     # --- Launch browser and visit the site ---
     print("\n[2/4] Launching browser...")
@@ -345,8 +355,14 @@ def main():
             print(f"  sessionid: {'[OK]' if browser_cookies.get('sessionid') else '[NO]'}")
 
             # --- Merge: browser cookies ARE the fresh set. We deliberately do
-            # NOT merge old stored cookies back in (they're stale/IP-bound).
+            # NOT merge stale IP-bound cookies back in. The ONLY exception is
+            # __cf_bm / csrftoken from the refresher's *just-fetched* set (same
+            # IP, seconds old) - the clean browser may not have re-issued them.
             merged = dict(browser_cookies)
+            for keep in ("__cf_bm", "csrftoken"):
+                if keep not in merged and keep in old and old[keep]:
+                    merged[keep] = old[keep]
+                    print(f"  Kept freshly-refreshed {keep} (browser had none)")
             print(f"\n[4/4] Fresh cookie set: {len(merged)}")
 
             new_cookie_str = join_cookies(merged)
