@@ -89,11 +89,17 @@ func loadDotEnv(path string) {
 // missing, or the refresh fails, the app continues with whatever cookies are
 // already stored in Supabase/.env.
 func refreshCookies() {
-	py, err := exec.LookPath("python")
-	if err != nil {
-		py, err = exec.LookPath("python3")
+	// Locate a Python interpreter: python, python3, or the Windows launcher (py -3).
+	py := ""
+	var pyArgs []string
+	for _, cand := range [][]string{{"python"}, {"python3"}, {"py", "-3"}} {
+		if p, err := exec.LookPath(cand[0]); err == nil {
+			py = p
+			pyArgs = append([]string{}, cand[1:]...)
+			break
+		}
 	}
-	if err != nil {
+	if py == "" {
 		fmt.Println("⚠️  Python not found — skipping automatic cookie refresh (install Python + pip install -r requirements.txt)")
 		return
 	}
@@ -120,7 +126,8 @@ func refreshCookies() {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, py, script)
+	args := append(append([]string{}, pyArgs...), script)
+	cmd := exec.CommandContext(ctx, py, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

@@ -64,6 +64,9 @@ for ($i = 0; $i -lt 60; $i++) {
   Start-Sleep -Seconds 3
 }
 Write-Host "(OK) DVR on port 8080"
+Write-Host "--- DVR startup log ---"
+Get-Content $dvrLog -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+Write-Host "--- end DVR startup log ---"
 
 
 
