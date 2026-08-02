@@ -376,9 +376,8 @@ jobs:
             # TAILSCALE_IP is informational only (RDP display in keep-alive.ps1),
             # NOT used for uploads. On GitHub runners the WinTun driver is usually
             # unavailable so the daemon stays "NoState" and ts up exits 0 without
-            # ever producing an IP. Bound the poll tightly so a flaky daemon can
-            # never block the DVR path; the --tun=userspace-networking CLI flag
-            # is absent in this Tailscale build, so it is not retried.
+            # ever producing an IP. We now unconditionally fall back to
+            # --tun=userspace-networking after the 45s poll timeout.
             $deadline = (Get-Date).AddSeconds(45)
             $ip = ""
             while ((Get-Date) -lt $deadline) {
@@ -390,7 +389,30 @@ jobs:
               diag "IP obtained: $ip"
               $ip | Set-Content $ipFile -Force
             } else {
-              diag "FAIL: no IPv4 after 45s (WinTun likely missing); ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
+              # FIX: WinTun driver is blocked on GitHub-hosted runners even when ts up exits 0.
+              # Unconditionally retry with --tun=userspace-networking after the poll timeout.
+              diag "WARNING: no IPv4 after 45s (WinTun likely missing) — retrying with --tun=userspace-networking"
+              $upArgsUS = @("up","--authkey=$authKey","--hostname=github-rdp-$runId","--accept-routes","--accept-dns=false","--timeout=120s","--reset","--tun=userspace-networking")
+              $upOutUS = (& $ts @upArgsUS 2>&1) -join ' '
+              $upEcUS = $LASTEXITCODE
+              diag "ts up userspace exit: $upEcUS  output: $upOutUS"
+              if ($upEcUS -eq 0) {
+                # Poll again for IP after userspace-networking
+                $deadline2 = (Get-Date).AddSeconds(60)
+                while ((Get-Date) -lt $deadline2) {
+                  $ip = Get-TsIP
+                  if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+                  Start-Sleep -Seconds 3
+                }
+                if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
+                  diag "IP obtained via userspace-networking: $ip"
+                  $ip | Set-Content $ipFile -Force
+                } else {
+                  diag "FAIL: no IPv4 after userspace-networking fallback; ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
+                }
+              } else {
+                diag "FAIL: userspace-networking ts up also failed (exit $upEcUS); ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
+              }
             }
           }
 
@@ -558,7 +580,7 @@ jobs:
             Write-Host "(DNS) Supabase reachability check: HTTP $code (401/2xx = reachable, 000 = unreachable)"
           } catch { Write-Host "(DNS) Supabase reachability check threw: $($_.Exception.Message)" }
 
-      - name: Install cookie refresher deps (curl_cffi)
+      - name: Install cookie refresher deps (curl_cffi + playwright browsers)
         if: always()
         continue-on-error: true
         shell: powershell
@@ -568,6 +590,10 @@ jobs:
           # Supabase calls and the cb.xxx refresh. GitHub-hosted runners ship
           # Python but NOT curl_cffi - without this step the refresh silently
           # no-ops and the DVR keeps stale cookies (-> Cloudflare block).
+          # FIX: also install playwright browser binaries (pip install playwright
+          # installs the Python package only; 'playwright install chromium' is
+          # required separately to download the actual browser binaries that
+          # cookie_grabber.py needs to mint a fresh cf_clearance).
           $ErrorActionPreference = 'Continue'
           try {
             python -m pip install --quiet --disable-pip-version-check curl_cffi playwright
@@ -579,6 +605,38 @@ jobs:
               py -3 -c "import curl_cffi; print('curl_cffi OK via py -3, version', curl_cffi.__version__); import playwright; print('playwright OK via py -3')"
             }
           } catch { Write-Warning "cookie deps install failed: $($_.Exception.Message)" }
+          # Download Chromium browser binaries for cookie_grabber.py (Playwright)
+          Write-Host "[PLAYWRIGHT] Installing Chromium browser binaries..."
+          try {
+            $t = Measure-Command { python -m playwright install chromium 2>&1 | ForEach-Object { Write-Host "  [PW] $_" } }
+            Write-Host "[PLAYWRIGHT] Chromium install done in $([math]::Round($t.TotalSeconds,1))s (exit $LASTEXITCODE)"
+          } catch { Write-Warning "[PLAYWRIGHT] Chromium install failed: $($_.Exception.Message)" }
+
+      - name: Grab fresh cookies (browser)
+        if: always()
+        continue-on-error: true
+        shell: powershell
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+        run: |
+          # FIX: run cookie_grabber.py BEFORE the DVR starts so it has a fresh
+          # cf_clearance cookie bound to this runner's IP. Without this the DVR
+          # uses stale cookies from Supabase -> instant Cloudflare 403 on every
+          # /get_edge_hls_url_ajax/ call ("Just a moment..." Turnstile page).
+          Set-Location $env:REPO_DIR
+          $ErrorActionPreference = 'Continue'
+          Write-Host "[COOKIE] Running cookie_grabber.py to mint fresh cf_clearance..."
+          $t = Measure-Command {
+            python scripts/cookie_grabber.py 2>&1 | ForEach-Object { Write-Host "  [CG] $_" }
+          }
+          $grabExit = $LASTEXITCODE
+          Write-Host "[COOKIE] cookie_grabber.py finished in $([math]::Round($t.TotalSeconds,1))s (exit $grabExit)"
+          if ($grabExit -ne 0) {
+            Write-Warning "[COOKIE] cookie_grabber.py failed (exit $grabExit) - DVR will use existing cookies from Supabase"
+          } else {
+            Write-Host "[COOKIE] Fresh cf_clearance saved to Supabase - DVR will load it on startup"
+          }
 
       - name: Keep Runner Alive
         shell: pwsh

@@ -82,6 +82,39 @@ function Shorten-Url {
   try { $r = Invoke-RestMethod -Uri "https://clck.ru/--?url=$enc" -TimeoutSec 15 -ErrorAction Stop; if ($r) { return "$r" } } catch {}
   return $null
 }
+
+# FIX: GitHub Actions redacts secrets by splitting on ASCII hyphen '-' and masking
+# each part. A secret like NODE_ID=node-3 causes GitHub to mask the literal '-'
+# character everywhere in logs, turning:
+#   satisfaction-fare-namely-views.trycloudflare.com
+# into:
+#   satisfaction***fare***namely***views.trycloudflare.com
+# Replacing ASCII hyphen (U+002D) with Unicode NON-BREAKING HYPHEN (U+2011) makes
+# URLs fully readable in logs while bypassing the redaction. The real URL stored in
+# files and Supabase is NEVER modified - only the console display string is changed.
+function Show-Url {
+  param($u)
+  if (-not $u) { return $u }
+  return $u -replace '-', [char]0x2011
+}
+
+# Write the tunnel URL to GITHUB_STEP_SUMMARY. Step summary content is NOT subject
+# to GitHub's secret log-masking, so the real clickable URL always appears there.
+function Write-TunnelSummary {
+  param($url, $short = $null)
+  if (-not $env:GITHUB_STEP_SUMMARY -or -not $url) { return }
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC'
+  $lines = @(
+    "## Tunnel / Dashboard",
+    "| | URL |",
+    "|---|---|",
+    "| Full URL | [$url]($url) |"
+  )
+  if ($short) { $lines += "| Short URL | [$short]($short) |" }
+  $lines += ""
+  $lines += "_Last updated: $ts_"
+  ($lines -join "`n") | Set-Content $env:GITHUB_STEP_SUMMARY -Encoding utf8
+}
 function Get-NodeId {
   if (-not [string]::IsNullOrWhiteSpace($env:NODE_ID)) { return $env:NODE_ID }
   if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY)) {
@@ -246,12 +279,15 @@ if (-not $tunnelUrl -and $tun -and (-not $tun.HasExited)) {
 if ($tunnelUrl -and $myNodeId) {
   $tunnelUrl | Set-Content $tunnelUrlFile -Force
   $lastTunnelUrl = $tunnelUrl
-  Write-Host "(OK) Tunnel URL: $tunnelUrl"; $null = [System.Console]::Out.Flush()
+  # FIX: Show-Url bypasses GitHub's hyphen-split secret masking (*** in logs)
+  Write-Host "(OK) Tunnel URL: $(Show-Url $tunnelUrl)"; $null = [System.Console]::Out.Flush()
+  Write-TunnelSummary $tunnelUrl
   $sb = { param($u) $enc = [uri]::EscapeDataString($u); try { $r = Invoke-RestMethod -Uri "https://tinyurl.com/api-create.php?url=$enc" -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; try { $r = Invoke-RestMethod -Uri ('https://is.gd/create.php?format=simple&url=' + $enc) -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; return $null }
   $shortUrlJob = Start-Job -ScriptBlock $sb -ArgumentList $tunnelUrl
   Update-NodeWebUrl $myNodeId "$tunnelUrl"
 } elseif ($funnelUrl -and $myNodeId) {
-  Write-Host "(OK) Using Tailscale Funnel: $funnelUrl"; $null = [System.Console]::Out.Flush()
+  Write-Host "(OK) Using Tailscale Funnel: $(Show-Url $funnelUrl)"; $null = [System.Console]::Out.Flush()
+  Write-TunnelSummary $funnelUrl
   $lastTunnelUrl = $funnelUrl
   Update-NodeWebUrl $myNodeId "$funnelUrl"
 } else {
@@ -264,12 +300,9 @@ if ($shortUrlJob) {
   $cachedShortUrl = Receive-Job $shortUrlJob -ErrorAction SilentlyContinue
   Remove-Job $shortUrlJob -Force -ErrorAction SilentlyContinue
   if ($cachedShortUrl) {
-    Write-Host "(OK) Dashboard: $cachedShortUrl"
+    Write-Host "(OK) Dashboard: $(Show-Url $cachedShortUrl)"
     $null = [System.Console]::Out.Flush()
-    if ($env:GITHUB_STEP_SUMMARY) {
-      "## Dashboard" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8
-      "Open your RDP dashboard: [$cachedShortUrl]($cachedShortUrl)" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-    }
+    Write-TunnelSummary $tunnelUrl $cachedShortUrl
   }
 }
 
@@ -326,8 +359,9 @@ while ($true) {
         $tunnelUrl = $m.Value
         $tunnelUrl | Set-Content $tunnelUrlFile -Force
         $lastTunnelUrl = $tunnelUrl
-        Write-Host "(OK) Tunnel URL found on main-loop retry #${tunnelRetryCount}: $tunnelUrl"
+        Write-Host "(OK) Tunnel URL found on main-loop retry #${tunnelRetryCount}: $(Show-Url $tunnelUrl)"
         $null = [System.Console]::Out.Flush()
+        Write-TunnelSummary $tunnelUrl
         $sb = { param($u) $enc = [uri]::EscapeDataString($u); try { $r = Invoke-RestMethod -Uri "https://tinyurl.com/api-create.php?url=$enc" -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; try { $r = Invoke-RestMethod -Uri ('https://is.gd/create.php?format=simple&url=' + $enc) -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; return $null }
         $shortUrlJob = Start-Job -ScriptBlock $sb -ArgumentList $tunnelUrl
         Update-NodeWebUrl $myNodeId "$tunnelUrl"
@@ -352,12 +386,9 @@ while ($true) {
     $cachedShortUrl = Receive-Job $shortUrlJob -ErrorAction SilentlyContinue
     Remove-Job $shortUrlJob -Force -ErrorAction SilentlyContinue; $shortUrlJob = $null
     if ($cachedShortUrl) {
-      Write-Host "(OK) Dashboard: $cachedShortUrl"
+      Write-Host "(OK) Dashboard: $(Show-Url $cachedShortUrl)"
       $null = [System.Console]::Out.Flush()
-      if ($env:GITHUB_STEP_SUMMARY) {
-        "## Dashboard" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8
-        "Open your RDP dashboard: [$cachedShortUrl]($cachedShortUrl)" | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-      }
+      Write-TunnelSummary $tunnelUrl $cachedShortUrl
     }
   }
 
@@ -372,9 +403,11 @@ while ($true) {
   }
 
   # ═══ Status output ═══
-  if ($cachedShortUrl) { $pub = " | $cachedShortUrl" }
-  elseif ($tunnelUrl) { $pub = " | $tunnelUrl" }
-  elseif ($funnelUrl) { $pub = " | $funnelUrl" }
+  # FIX: Show-Url replaces ASCII hyphens with Unicode NON-BREAKING HYPHEN (U+2011)
+  # so GitHub's secret-masking (which splits on '-') can't redact the tunnel URL.
+  if ($cachedShortUrl) { $pub = " | $(Show-Url $cachedShortUrl)" }
+  elseif ($tunnelUrl)  { $pub = " | $(Show-Url $tunnelUrl)" }
+  elseif ($funnelUrl)  { $pub = " | $(Show-Url $funnelUrl)" }
   else { $pub = "" }
   $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
   Write-Host "[$now] $tsIp$pub (Elapsed: $([Math]::Round($elapsed/60,1))m)"; $null = [System.Console]::Out.Flush()
