@@ -3,6 +3,7 @@ package site
 import (
 	"context"
 
+	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/internal"
 )
 
@@ -42,4 +43,9 @@ type Site interface {
 	// FetchLastBroadcast returns the Unix timestamp of the model's last
 	// broadcast, or 0 if unknown/unavailable.
 	FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error)
+
+	// FetchProfile scrapes the model's full public profile (followers, bio,
+	// age, location, languages, last broadcast, …). Returns nil, nil when the
+	// site exposes no profile API (callers then skip the DB write).
+	FetchProfile(ctx context.Context, req *internal.Req, username string) (*database.ChannelProfile, error)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"time"
 
@@ -37,6 +38,11 @@ func (ch *Channel) Monitor(runID uint64) {
 			ch.Update()
 		}
 	}
+
+	// On-demand full-profile scrape: piggybacks on the biocontext call above
+	// (same endpoint family) and stores the complete channel details for the
+	// archive site. Rate-limited so a fast pause/resume cycle doesn't re-scrape.
+	ch.scrapeProfileOnDemand(s, req)
 
 	// Create a new context with a cancel function; the CancelFunc is stored on
 	// the channel and invoked by Pause/Stop.
@@ -259,6 +265,43 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 	return playlist.WatchSegments(ctx, func(b []byte, duration float64) error {
 		return ch.handleSegmentForMonitor(runID, b, duration)
 	})
+}
+
+// scrapeProfileOnDemand fetches the model's full public profile via the site
+// API and persists it to the channels table for the archive site. On-demand
+// only: it runs once per monitor start, at most once per profileScrapeMin
+// minutes per channel, and never blocks recording (fire-and-forget).
+func (ch *Channel) scrapeProfileOnDemand(s site.Site, req *internal.Req) {
+	const profileScrapeMin = 30
+
+	ch.profileMu.Lock()
+	if time.Since(ch.lastProfileScrape) < profileScrapeMin*time.Minute {
+		ch.profileMu.Unlock()
+		return
+	}
+	ch.lastProfileScrape = time.Now()
+	ch.profileMu.Unlock()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC [%s] profile scrape: %v", ch.Config.Username, r)
+			}
+		}()
+		p, err := s.FetchProfile(context.Background(), req, ch.Config.Username)
+		if err != nil {
+			ch.Verbose("profile scrape for %s: %v", ch.Config.Username, err)
+			return
+		}
+		if p == nil {
+			return // site has no profile API (e.g. Stripchat)
+		}
+		if err := server.SaveChannelProfile(p); err != nil {
+			ch.Verbose("profile scrape save for %s: %v", ch.Config.Username, err)
+			return
+		}
+		ch.Verbose("profile scraped for %s", ch.Config.Username)
+	}()
 }
 
 // handleSegmentForMonitor processes and writes segment data for a specific

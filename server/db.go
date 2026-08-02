@@ -616,6 +616,17 @@ func RecordingExists(filename string) bool {
 	return err == nil
 }
 
+// SaveChannelProfile persists scraped full-profile data for a channel into the
+// existing channels table. Best-effort: failures are logged and ignored so a
+// profile scrape can never break recording.
+func SaveChannelProfile(p *database.ChannelProfile) error {
+	client := GetDBClient()
+	if client == nil {
+		return fmt.Errorf("Supabase not configured")
+	}
+	return client.SaveChannelProfile(p)
+}
+
 // SaveRecordingWithLinks saves a recording and its upload links directly to Supabase.
 // Preview URLs should be saved separately via SavePreviewLinks before calling this.
 // This function only saves the recording metadata and upload links.

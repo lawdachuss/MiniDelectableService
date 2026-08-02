@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
 )
@@ -160,6 +161,13 @@ func mouflonPDKey() string {
 // expose a last_broadcast timestamp in a usable form, so this returns 0.
 func (s *StripchatSite) FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error) {
 	return 0, nil
+}
+
+// FetchProfile implements site.Site. Stripchat's front API exposes no public
+// biocontext-style profile endpoint, so this returns nil, nil and callers skip
+// the profile DB write for Stripchat channels.
+func (s *StripchatSite) FetchProfile(ctx context.Context, req *internal.Req, username string) (*database.ChannelProfile, error) {
+	return nil, nil
 }
 
 func (s *StripchatSite) GetRoomStatus(ctx context.Context, req *internal.Req, username string) (string, error) {

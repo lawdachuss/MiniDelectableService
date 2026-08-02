@@ -1,6 +1,7 @@
 package site
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/avast/retry-go/v4"
 	"github.com/teacat/chaturbate-dvr/chaturbate"
+	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
 )
@@ -39,6 +41,82 @@ func (s *ChaturbateSite) FetchStream(ctx context.Context, req *internal.Req, use
 	}
 	si.HLSSource = stream.HLSSource
 	return si, nil
+}
+
+// biocontextResponse mirrors the site's api/biocontext/{username}/ payload.
+// The recorder only needs a handful of fields; unknown keys are ignored.
+// PhotoSets/SocialMedias are json.RawMessage because the site returns arrays
+// of objects (e.g. {id, name, cover_url, …}); they are passed through
+// verbatim into the JSONB channels columns.
+type biocontextResponse struct {
+	FollowerCount   int             `json:"follower_count"`
+	Location        string          `json:"location"`
+	RealName        string          `json:"real_name"`
+	BodyDecorations string          `json:"body_decorations"`
+	SmokeDrink      string          `json:"smoke_drink"`
+	BodyType        string          `json:"body_type"`
+	DisplayBirthday string          `json:"display_birthday"`
+	DisplayAge      int             `json:"display_age"`
+	AboutMe         string          `json:"about_me"`
+	WishList        string          `json:"wish_list"`
+	FanClubCost     int             `json:"fan_club_cost"`
+	Sex             string          `json:"sex"`
+	Subgender       string          `json:"subgender"`
+	InterestedIn    []string        `json:"interested_in"`
+	PhotoSets       json.RawMessage `json:"photo_sets"`
+	SocialMedias    json.RawMessage `json:"social_medias"`
+	LastBroadcast   string          `json:"last_broadcast"`
+	RoomStatus      string          `json:"room_status"`
+}
+
+// FetchProfile implements site.Site via the biocontext API, returning the
+// model's full public profile so the archive site can display it.
+func (s *ChaturbateSite) FetchProfile(ctx context.Context, req *internal.Req, username string) (*database.ChannelProfile, error) {
+	apiURL := fmt.Sprintf("%sapi/biocontext/%s/", server.Config.Domain, username)
+	body, err := req.Get(ctx, apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch biocontext: %w", err)
+	}
+
+	var bio biocontextResponse
+	if err := json.Unmarshal([]byte(body), &bio); err != nil {
+		return nil, fmt.Errorf("parse biocontext: %w", err)
+	}
+
+	if bio.InterestedIn == nil {
+		bio.InterestedIn = []string{}
+	}
+	// A literal `null` in the API response unmarshals into a non-nil
+	// json.RawMessage holding "null". Coerce it to nil so omitempty drops it
+	// from the PATCH body instead of writing null into a NOT NULL JSONB column.
+	if bio.PhotoSets == nil || bytes.Equal(bytes.TrimSpace(bio.PhotoSets), []byte("null")) {
+		bio.PhotoSets = nil
+	}
+	if bio.SocialMedias == nil || bytes.Equal(bytes.TrimSpace(bio.SocialMedias), []byte("null")) {
+		bio.SocialMedias = nil
+	}
+
+	return &database.ChannelProfile{
+		Username:        username,
+		FollowerCount:   bio.FollowerCount,
+		Location:        bio.Location,
+		RealName:        bio.RealName,
+		BodyDecorations: bio.BodyDecorations,
+		SmokeDrink:      bio.SmokeDrink,
+		BodyType:        bio.BodyType,
+		DisplayBirthday: bio.DisplayBirthday,
+		DisplayAge:      bio.DisplayAge,
+		AboutMe:         bio.AboutMe,
+		WishList:        bio.WishList,
+		FanClubCost:     bio.FanClubCost,
+		Sex:             bio.Sex,
+		Subgender:       bio.Subgender,
+		InterestedIn:    bio.InterestedIn,
+		PhotoSets:       bio.PhotoSets,
+		SocialMedias:    bio.SocialMedias,
+		LastBroadcast:   bio.LastBroadcast,
+		RoomStatus:      bio.RoomStatus,
+	}, nil
 }
 
 // FetchLastBroadcast implements site.Site via the biocontext API.

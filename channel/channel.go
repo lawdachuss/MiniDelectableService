@@ -65,6 +65,8 @@ type Channel struct {
 	Config         *entity.ChannelConfig
 
 	fileMu     sync.RWMutex // protects File, mp4InitSegment, Duration, Filesize, TotalDiskUsageBytes
+	profileMu  sync.Mutex
+	lastProfileScrape time.Time // when the full profile was last fetched (on-demand only)
 	monitorMu  sync.Mutex
 	monitorRunning bool
 	monitorRestartRequested bool

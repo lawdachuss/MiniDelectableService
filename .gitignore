@@ -29,6 +29,7 @@ database/*
 !database/tunnel.json
 !database/supabase.go
 !database/migrate.sql
+!database/migrate-channel-profiles.sql
 
 # AWS secrets and keys
 aws-secrets/
@@ -80,6 +81,10 @@ aws-secrets/*.pem
 .env
 .env.local
 .env.*.local
+.env.bak
+
+# Supabase CLI temp
+supabase/.temp/
 
 # Logs
 *.log

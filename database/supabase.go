@@ -229,6 +229,71 @@ func (c *Client) SaveChannel(ch *Channel) error {
 	return nil
 }
 
+// ChannelProfile holds the full-profile fields scraped from the site's
+// biocontext API and stored in the existing channels table (see
+// database/migrate-channel-profiles.sql). Only the profile columns are
+// touched — config columns (is_paused, framerate, pattern, …) stay intact.
+//
+// Every field except Username is omitempty so a partial API response never
+// clobbers previously-stored values with zeros/empties: missing fields are
+// simply left out of the PATCH body and the DB keeps its prior value.
+// PhotoSets/SocialMedias are json.RawMessage because the site returns arrays
+// of objects (not strings) that we pass through verbatim into the JSONB
+// columns.
+type ChannelProfile struct {
+	Username         string          `json:"username"`
+	FollowerCount    int             `json:"follower_count,omitempty"`
+	Location         string          `json:"location,omitempty"`
+	RealName         string          `json:"real_name,omitempty"`
+	BodyDecorations  string          `json:"body_decorations,omitempty"`
+	SmokeDrink       string          `json:"smoke_drink,omitempty"`
+	BodyType         string          `json:"body_type,omitempty"`
+	DisplayBirthday  string          `json:"display_birthday,omitempty"`
+	DisplayAge       int             `json:"display_age,omitempty"`
+	AboutMe          string          `json:"about_me,omitempty"`
+	WishList         string          `json:"wish_list,omitempty"`
+	FanClubCost      int             `json:"fan_club_cost,omitempty"`
+	Sex              string          `json:"sex,omitempty"`
+	Subgender        string          `json:"subgender,omitempty"`
+	InterestedIn     []string        `json:"interested_in,omitempty"`
+	PhotoSets        json.RawMessage `json:"photo_sets,omitempty"`
+	SocialMedias     json.RawMessage `json:"social_medias,omitempty"`
+	LastBroadcast    string          `json:"last_broadcast,omitempty"`
+	RoomStatus       string          `json:"room_status,omitempty"`
+	AvatarURL        string          `json:"avatar_url,omitempty"`
+	ProfileScrapedAt string          `json:"profile_scraped_at,omitempty"`
+}
+
+// SaveChannelProfile PATCHes the profile columns of the existing channels row
+// for the given username. Rows exist for every configured channel (created by
+// SaveChannelsToDB), so this only ever updates profile fields and never
+// inserts or clobbers recorder config columns. If no row matched (channel not
+// synced yet) it logs a warning instead of failing silently.
+func (c *Client) SaveChannelProfile(p *ChannelProfile) error {
+	p.ProfileScrapedAt = time.Now().UTC().Format(time.RFC3339)
+	path := "/channels?username=eq." + url.QueryEscape(p.Username)
+
+	// requestWithRetry sets Prefer: return=representation, so the response
+	// body lists the rows that were patched — 0 means the row is missing.
+	resp, err := c.requestWithRetry("PATCH", path, p)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var patched []map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&patched)
+	if len(patched) == 0 {
+		fmt.Printf("[WARN] SaveChannelProfile: no channels row for %q — profile not saved (run SaveChannelsToDB first)\n", p.Username)
+	}
+	return nil
+}
+
 // GetChannel retrieves a channel by username
 func (c *Client) GetChannel(username string) (*Channel, error) {
 	var channels []Channel
