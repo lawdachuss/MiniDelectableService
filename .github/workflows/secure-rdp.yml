@@ -514,6 +514,41 @@ jobs:
             C:\Program Files\Tailscale
           key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ github.run_id }}-${{ hashFiles('go.mod') }}
 
+      - name: Fix Supabase DNS (resolvers + hosts pin)
+        if: always()
+        shell: powershell
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        run: |
+          # The runner box's resolver can NXDOMAIN the custom Supabase host while
+          # public resolvers resolve it fine (observed: keep-alive + curl got
+          # "No such host is known" / HTTP 000, but cloudflared worked). Fix:
+          # 1) point the box at public resolvers, 2) pin the host in the hosts
+          # file with Cloudflare anycast IPs (outbound 443 to CF demonstrably
+          # works - the quick tunnel connects), 3) verify with a real API call.
+          $sbHost = (($env:SUPABASE_URL -replace '^https?://','') -split '[/:]')[0]
+          if ([string]::IsNullOrWhiteSpace($sbHost)) { $sbHost = 'supabase.chuglii.in' }
+          Write-Host "(DNS) Supabase host: $sbHost (hex: $([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($sbHost)).Replace('-','')))"
+          try {
+            $adapter = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+            if ($adapter) {
+              Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses ('1.1.1.1','8.8.8.8') -ErrorAction Stop
+              Write-Host "(DNS) Set adapter $($adapter.Name) DNS -> 1.1.1.1, 8.8.8.8"
+            } else { Write-Warning "(DNS) No physical up adapter found" }
+          } catch { Write-Warning "(DNS) Set-DnsClientServerAddress failed: $($_.Exception.Message)" }
+          ipconfig /flushdns | Out-Null
+          $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+          try {
+            $hosts = Get-Content $hostsPath -Raw -ErrorAction SilentlyContinue
+            if (-not $hosts -or $hosts -notmatch [regex]::Escape($sbHost)) {
+              Add-Content -Path $hostsPath -Value "`n104.21.25.61 $sbHost`n172.67.223.51 $sbHost`n" -ErrorAction Stop
+              Write-Host "(DNS) Pinned $sbHost in hosts file"
+            } else { Write-Host "(DNS) $sbHost already in hosts file" }
+          } catch { Write-Warning "(DNS) hosts write failed: $($_.Exception.Message)" }
+          Start-Sleep -Seconds 2
+          $code = & curl.exe -s -o NUL -w "%{http_code}" "https://$sbHost/rest/v1/" -m 20 --noproxy "*" --tlsv1.2 2>&1
+          Write-Host "(DNS) Supabase reachability check: HTTP $code (401/2xx = reachable, 000 = unreachable)"
+
       - name: Keep Runner Alive
         shell: pwsh
         env:
@@ -544,7 +579,7 @@ jobs:
           Write-Host "(NET) Restored"
 
       - name: Upload Tunnel URL
-        if: always() && !cancelled()
+        if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         env:

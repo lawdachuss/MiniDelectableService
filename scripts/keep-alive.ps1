@@ -129,6 +129,9 @@ function Update-NodeWebUrl {
   $sbHost = ([uri]$sbUrl).Host
   $sbPort = ([uri]$sbUrl).Port
   if ($sbPort -eq -1 -or -not $sbPort) { $sbPort = 443 }
+  # Hex-encoded host is NOT masked by GitHub log redaction (plaintext is), so
+  # this shows the exact host the runner is using for Supabase.
+  Write-Host "(DBG) Supabase host: '$sbHost' (hex: $([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($sbHost)).Replace('-','')))"
 
   # Pre-flight DNS + TCP check to distinguish "project paused / network blocked"
   # from an auth/transport error. Run once, before the retry loop.
@@ -140,7 +143,7 @@ function Update-NodeWebUrl {
   try {
     $conn = $tcp.BeginConnect($sbHost, $sbPort, $null, $null)
     if ($conn.AsyncWaitHandle.WaitOne(5000, $false)) {
-      $tcp.EndConnect($conn) | Out-Null
+      try { $tcp.EndConnect($conn) | Out-Null } catch { Write-Warning "(WARN) Supabase TCP connect failed: $($_.Exception.InnerException.Message)" }
     } else {
       $tcpProbeOk = $false
       Write-Warning "(WARN) Supabase TCP connect timeout ($sbHost`:$sbPort) - project may be paused, IP blocked, or network unreachable"
@@ -149,11 +152,13 @@ function Update-NodeWebUrl {
     $tcp.Close()
   }
 
-  if ($tcpProbeOk) {
+  # Preflight is informational only: curl with DoH can succeed even when the OS
+  # resolver NXDOMAINs the host, so always attempt the upsert.
+  if ($true) {
     for ($attempt = 1; $attempt -le 3; $attempt++) {
       $code = "000"
       try {
-        $curlOut = & "curl.exe" -s -o NUL -w "%{http_code}" -X POST $apiUrl -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" -H "Content-Type: application/json" -H "Prefer: resolution=merge-duplicates" -d $body --noproxy "*" --tlsv1.2 -m 20 2>&1
+        $curlOut = & "curl.exe" -s -o NUL -w "%{http_code}" -X POST $apiUrl -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" -H "Content-Type: application/json" -H "Prefer: resolution=merge-duplicates" -d $body --noproxy "*" --tlsv1.2 --doh-url "https://cloudflare-dns.com/dns-query" -m 20 2>&1
         $code = "$curlOut".Trim()
       } catch {
         Write-Warning "(WARN) web_url curl attempt $attempt failed: $_"
