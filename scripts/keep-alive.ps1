@@ -250,6 +250,8 @@ function Send-Notify {
   try { Invoke-RestMethod -Uri $wh -Method Post -Body $body -ContentType "application/json" -TimeoutSec 10 -ErrorAction Stop | Out-Null } catch {}
 }
 
+# ── Main keep-alive loop ─────────────────────────────────
+while ($true) {
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); $elapsed = $now - $startTime
   if ($elapsed -ge $targetDuration) { break }
   $sleepSecs = [Math]::Min($targetDuration - $elapsed, 60)
