@@ -104,37 +104,50 @@ func refreshCookies() {
 		return
 	}
 
-	// Locate the refresher script: next to the executable, then CWD.
+	fmt.Printf("🍪 Refreshing cookies from %s...\n", server.Config.Domain)
+	// 1) fast anonymous refresh (csrftoken/__cf_bm) ...
+	runCookieScript(py, pyArgs, "cookie_refresher.py")
+	// 2) ... then a real-browser grab for a fresh, IP-bound cf_clearance.
+	//    cb.xxx Turnstile-challenges datacenter IPs (e.g. GitHub runners) and
+	//    only a browser executing JS can pass, so a stale cf_clearance blocks
+	//    all API calls. Best-effort: if the browser is unavailable the DVR
+	//    continues with whatever cookies it already has.
+	runCookieScript(py, pyArgs, "cookie_grabber.py")
+}
+
+// runCookieScript locates scripts/<name> (next to the executable, then CWD)
+// and runs it with the given Python interpreter. Best-effort: failures are
+// logged but never fatal, so a missing dep can't stop the recorder.
+func runCookieScript(py string, pyArgs []string, name string) {
 	script := ""
 	if exe, exeErr := os.Executable(); exeErr == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "scripts", "cookie_refresher.py")
+		candidate := filepath.Join(filepath.Dir(exe), "scripts", name)
 		if _, statErr := os.Stat(candidate); statErr == nil {
 			script = candidate
 		}
 	}
 	if script == "" {
-		if _, statErr := os.Stat("scripts/cookie_refresher.py"); statErr == nil {
-			script = "scripts/cookie_refresher.py"
+		candidate := filepath.Join("scripts", name)
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			script = candidate
 		}
 	}
 	if script == "" {
-		fmt.Println("⚠️  scripts/cookie_refresher.py not found — skipping automatic cookie refresh")
+		fmt.Printf("⚠️  scripts/%s not found — skipping\n", name)
 		return
 	}
-
-	fmt.Printf("🍪 Refreshing cookies from %s...\n", server.Config.Domain)
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 	args := append(append([]string{}, pyArgs...), script)
 	cmd := exec.CommandContext(ctx, py, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("⚠️  Cookie refresh failed (continuing with existing cookies): %v\n", err)
+		fmt.Printf("⚠️  %s failed (continuing with existing cookies): %v\n", name, err)
 		return
 	}
-	fmt.Printf("🍪 Cookie refresh completed in %v\n", time.Since(start).Round(time.Millisecond))
+	fmt.Printf("🍪 %s completed in %v\n", name, time.Since(start).Round(time.Millisecond))
 }
 
 func main() {

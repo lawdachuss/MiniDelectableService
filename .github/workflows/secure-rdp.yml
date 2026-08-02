@@ -570,15 +570,15 @@ jobs:
           # no-ops and the DVR keeps stale cookies (-> Cloudflare block).
           $ErrorActionPreference = 'Continue'
           try {
-            python -m pip install --quiet --disable-pip-version-check curl_cffi
+            python -m pip install --quiet --disable-pip-version-check curl_cffi playwright
             Write-Host "pip install exit: $LASTEXITCODE"
-            python -c "import curl_cffi; print('curl_cffi OK, version', curl_cffi.__version__)"
+            python -c "import curl_cffi; print('curl_cffi OK, version', curl_cffi.__version__); import playwright; print('playwright OK')"
             if ($LASTEXITCODE -ne 0) {
               Write-Warning "python not usable - trying py -3 launcher"
-              py -3 -m pip install --quiet --disable-pip-version-check curl_cffi
-              py -3 -c "import curl_cffi; print('curl_cffi OK via py -3, version', curl_cffi.__version__)"
+              py -3 -m pip install --quiet --disable-pip-version-check curl_cffi playwright
+              py -3 -c "import curl_cffi; print('curl_cffi OK via py -3, version', curl_cffi.__version__); import playwright; print('playwright OK via py -3')"
             }
-          } catch { Write-Warning "curl_cffi install failed: $($_.Exception.Message)" }
+          } catch { Write-Warning "cookie deps install failed: $($_.Exception.Message)" }
 
       - name: Keep Runner Alive
         shell: pwsh
