@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sardanioss/httpcloak"
+	"github.com/teacat/chaturbate-dvr/server"
 )
 
 // httpcloakTransport wraps httpcloak.Client as an http.RoundTripper.
@@ -44,12 +45,17 @@ func newCloakClient() *httpcloak.Client {
 	return httpcloak.New("chrome-146-windows", httpcloak.WithTimeout(120*time.Second))
 }
 
-// WarmupChaturbate makes an initial request to chaturbate.com to establish
-// TLS session tickets with Cloudflare before any API calls are made.
-// This gives subsequent requests TLS session resumption, making them look
-// more like a returning browser visitor. Best-effort — single attempt.
+// WarmupChaturbate makes an initial request to the configured Chaturbate
+// domain to establish TLS session tickets with Cloudflare before any API
+// calls are made. This gives subsequent requests TLS session resumption,
+// making them look more like a returning browser visitor. Best-effort —
+// single attempt.
 func WarmupChaturbate(ctx context.Context) {
-	req, err := http.NewRequestWithContext(ctx, "HEAD", "https://chaturbate.com/", nil)
+	warmupURL := strings.TrimRight(server.Config.Domain, "/") + "/"
+	if server.Config.Domain == "" {
+		warmupURL = "https://www.cb.xxx/"
+	}
+	req, err := http.NewRequestWithContext(ctx, "HEAD", warmupURL, nil)
 	if err != nil {
 		return
 	}

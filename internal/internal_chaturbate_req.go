@@ -70,8 +70,9 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 		req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
 		req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
-		req.Header.Set("Referer", fmt.Sprintf("https://chaturbate.com/%s", username))
-		req.Header.Set("Origin", "https://chaturbate.com")
+		domain := strings.TrimRight(server.Config.Domain, "/")
+		req.Header.Set("Referer", fmt.Sprintf("%s/%s", domain, username))
+		req.Header.Set("Origin", domain)
 
 		sanitized := ""
 		if server.Config.Cookies != "" {

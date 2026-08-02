@@ -84,6 +84,52 @@ func loadDotEnv(path string) {
 	}
 }
 
+// refreshCookies runs scripts/cookie_refresher.py so the app starts with
+// fresh cookies from the site. It is best-effort: if Python or the script is
+// missing, or the refresh fails, the app continues with whatever cookies are
+// already stored in Supabase/.env.
+func refreshCookies() {
+	py, err := exec.LookPath("python")
+	if err != nil {
+		py, err = exec.LookPath("python3")
+	}
+	if err != nil {
+		fmt.Println("⚠️  Python not found — skipping automatic cookie refresh (install Python + pip install -r requirements.txt)")
+		return
+	}
+
+	// Locate the refresher script: next to the executable, then CWD.
+	script := ""
+	if exe, exeErr := os.Executable(); exeErr == nil {
+		candidate := filepath.Join(filepath.Dir(exe), "scripts", "cookie_refresher.py")
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			script = candidate
+		}
+	}
+	if script == "" {
+		if _, statErr := os.Stat("scripts/cookie_refresher.py"); statErr == nil {
+			script = "scripts/cookie_refresher.py"
+		}
+	}
+	if script == "" {
+		fmt.Println("⚠️  scripts/cookie_refresher.py not found — skipping automatic cookie refresh")
+		return
+	}
+
+	fmt.Printf("🍪 Refreshing cookies from %s...\n", server.Config.Domain)
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, py, script)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("⚠️  Cookie refresh failed (continuing with existing cookies): %v\n", err)
+		return
+	}
+	fmt.Printf("🍪 Cookie refresh completed in %v\n", time.Since(start).Round(time.Millisecond))
+}
+
 func main() {
 	loadDotEnv(".env")
 	app := &cli.App{
@@ -160,9 +206,10 @@ func main() {
 				Value:   "",
 			},
 			&cli.StringFlag{
-				Name:  "domain",
-				Usage: "Chaturbate domain to use",
-				Value: "https://chaturbate.com/",
+				Name:    "domain",
+				Usage:   "Chaturbate domain to use (set DOMAIN in .env to override)",
+				EnvVars: []string{"DOMAIN"},
+				Value:   "https://www.cb.xxx/",
 			},
 			&cli.StringFlag{
 				Name:    "ffmpeg-path",
@@ -341,6 +388,12 @@ func main() {
 				Usage: "Write full HTML responses to temp files when stream detection fails and log verbose details",
 				Value: false,
 			},
+			&cli.BoolFlag{
+				Name:    "refresh-cookies",
+				Usage:   "Automatically refresh cookies from the site at startup by running scripts/cookie_refresher.py (best-effort; requires Python + curl_cffi)",
+				EnvVars: []string{"REFRESH_COOKIES"},
+				Value:   true,
+			},
 
 			// ── Notifications ───────────────────────────────────────────────
 			&cli.StringFlag{
@@ -410,6 +463,12 @@ func start(c *cli.Context) error {
 	}
 	fmt.Printf("[startup] config loaded in %v\n", time.Since(started).Round(time.Millisecond))
 
+	// Refresh cookies from the site before loading settings so every start
+	// begins with fresh cookies (best-effort; requires Python + curl_cffi).
+	if c.Bool("refresh-cookies") {
+		refreshCookies()
+	}
+
 	// Load cookies from Supabase if available (overrides .env)
 	if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
 		fmt.Println("📦 Loading cookies from Supabase...")
@@ -429,8 +488,8 @@ func start(c *cli.Context) error {
 
 	if server.Config.Cookies == "" || server.Config.UserAgent == "" {
 		fmt.Println("⚠️  Chaturbate API requests may fail — COOKIES and USER_AGENT not set in .env or Supabase")
-		fmt.Println("   Open .env and fill in your browser cookies from chaturbate.com:")
-		fmt.Println("   Chrome 146: F12 → Application → Cookies → chaturbate.com → copy all as string")
+		fmt.Printf("   Open .env and fill in your browser cookies from %s:\n", server.Config.Domain)
+		fmt.Printf("   Chrome 146: F12 → Application → Cookies → %s → copy all as string\n", server.Config.Domain)
 		fmt.Println("   OR update cookies in Supabase via the web UI")
 		fmt.Println("   IMPORTANT: Use Chrome 146+ on Windows for cookie collection so the TLS")
 		fmt.Println("   fingerprint matches the httpcloak preset.")

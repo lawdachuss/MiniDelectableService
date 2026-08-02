@@ -170,7 +170,7 @@ Alternatively, use different Supabase projects per instance.
 **Fix:**
 1. Get fresh cookies from browser
 2. Update via Web UI
-3. See `docs/PROXY_AND_COOKIES.md` for details
+3. See the troubleshooting section below for details
 
 ### Cookies not updating
 
@@ -243,7 +243,6 @@ COOKIES="your_cookies"
 
 ## References
 
-- `docs/PROXY_AND_COOKIES.md` - Detailed cookie troubleshooting
 - `database/migrate.sql` - Full database schema
 - `server/config.go` - Cookie load/save logic
 - `server/db.go` - Supabase integration

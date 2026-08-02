@@ -1,9 +1,16 @@
 name: Secure RDP
+run-name: Secure RDP${{ github.event.inputs.triggered_by == 'workflow-watchman' && ' (watchman)' || '' }}
+
 
 on:
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'Source of the trigger'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -11,6 +18,8 @@ permissions:
 
 env:
   GH_TOKEN: ${{ github.token }}
+  # Suppress Node 20 deprecation warnings from actions that bundle older runtimes
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
 jobs:
   rdp:
@@ -18,709 +27,539 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
-
-      - name: Record Start Time and Enforce Timing Rules
+      - name: Wipe D drive
         shell: powershell
         run: |
+          Write-Host "[WIPE] Deleting everything on D: drive..."
+          Get-ChildItem D:\ -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '$Recycle.Bin' -and $_.Name -ne 'System Volume Information' -and $_.Name -ne 'a'} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "[WIPE] Done"
+
+      - uses: actions/checkout@v4
+
+      - name: Init
+        shell: powershell
+        run: |
+          # Cleanup any stale DVR/tunnel from previous runs
+          Get-Process chaturbate-dvr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          # Don't delete videos/ - they contain completed recordings
+          $repoName = ($env:GITHUB_REPOSITORY -split '/')[-1]
+          echo "REPO_DIR=D:\repos\$repoName" >> $env:GITHUB_ENV
+          Remove-Item "D:\repos\$repoName\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
           $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           echo "START_TIME=$epoch" >> $env:GITHUB_ENV
-          Write-Host "Workflow started at Unix epoch: $epoch"
-          
-          $currentRunId = "$env:GITHUB_RUN_ID"
-          if ([string]::IsNullOrEmpty($currentRunId)) {
-            Write-Host "Local testing or missing run ID. Skipping check."
-            exit 0
-          }
-          
-          # Fetch recent runs of the same workflow
-          $runsJson = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status,startedAt
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Failed to fetch run list from GitHub API. Proceeding..."
-            exit 0
-          }
-          
-          $runs = $runsJson | ConvertFrom-Json
-          $hasActiveOverlap = $false
-          
-          foreach ($run in $runs) {
-            if ($run.databaseId -ne $currentRunId -and $run.status -ne 'completed') {
-              $startedAt = [DateTime]::Parse($run.startedAt).ToUniversalTime()
-              $now = [DateTime]::UtcNow
-              $elapsedMinutes = ($now - $startedAt).TotalMinutes
-              
-              Write-Host "Found other active run: ID=$($run.databaseId), Status=$($run.status), StartedAt=$startedAt ($elapsedMinutes minutes ago)"
-              
-              # If the active run started less than 5 hours and 48 minutes ago (348 minutes to be safe with minor delays)
-              if ($elapsedMinutes -lt 348) {
-                $hasActiveOverlap = $true
-                break
-              }
-            }
-          }
-          
-          if ($hasActiveOverlap) {
-            Write-Host "Another active workflow run was started recently (less than 5 hours and 55 minutes ago)."
-            Write-Host "Cancelling this run to enforce timing rules and prevent overlap..."
-            gh run cancel $currentRunId --repo "$env:GITHUB_REPOSITORY"
-            Start-Sleep -Seconds 60
-            exit 1
-          } else {
-            Write-Host "Timing check passed. No overlapping active runs found."
-          }
+          # Export default Go cache paths so the restore step uses the same
+          # env vars as the save step (set via go env in Discover step).
+          echo "GO_MOD_CACHE=$env:USERPROFILE\go\pkg\mod" >> $env:GITHUB_ENV
+          echo "GO_BUILD_CACHE=$env:USERPROFILE\AppData\Local\go-build" >> $env:GITHUB_ENV
+          # The runner's OS env vars (USERPROFILE/HOME) are NOT visible to the
+          # ${{ env.* }} context, so cache path lists like
+          # "${{ env.USERPROFILE }}\.cache\tailscale.msi" resolve to EMPTY and
+          # silently cache to the wrong drive root. Export them explicitly so
+          # the cache restore/save steps pick up the real user profile.
+          echo "USERPROFILE=$env:USERPROFILE" >> $env:GITHUB_ENV
+          echo "HOME=$env:USERPROFILE" >> $env:GITHUB_ENV
+          $r = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status,startedAt 2>$null | ConvertFrom-Json
+          if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt 348)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
 
-      - name: Configure Windows RDP
-        shell: powershell
-        run: |
-          Write-Host "Configuring RDP..."
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ env.GO_MOD_CACHE }}
+            ${{ env.GO_BUILD_CACHE }}
+          key: ${{ github.repository }}-${{ runner.os }}-go-cache-${{ hashFiles('go.sum', 'go.mod') }}
+          restore-keys: |
+            ${{ github.repository }}-${{ runner.os }}-go-cache-${{ github.run_id }}-
+            ${{ github.repository }}-${{ runner.os }}-go-cache-
+            ${{ github.repository }}-${{ runner.os }}-gocache-
+            ${{ github.repository }}-${{ runner.os }}-cache-
+            ${{ github.repository }}-${{ runner.os }}-
+            ${{ runner.os }}-go-cache-
+            ${{ runner.os }}-gocache-
+            ${{ runner.os }}-cache-
+            ${{ runner.os }}-
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0 -Force
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ env.USERPROFILE }}\.cache\tailscale.msi
+            C:\ProgramData\chocolatey\cache
+            C:\ProgramData\chocolatey\lib\ffmpeg
+            C:\ProgramData\chocolatey\bin\ffmpeg.exe
+            C:\ProgramData\chocolatey\bin\ffprobe.exe
+            C:\cloudflared
+            C:\Program Files\Tailscale
+          key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ hashFiles('go.mod') }}
+          restore-keys: |
+            ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ github.run_id }}-
+            ${{ github.repository }}-${{ runner.os }}-tools-cache-
+            ${{ github.repository }}-${{ runner.os }}-tools-
+            ${{ github.repository }}-${{ runner.os }}-cache-
+            ${{ github.repository }}-${{ runner.os }}-
+            ${{ runner.os }}-tools-cache-
+            ${{ runner.os }}-tools-
+            ${{ runner.os }}-cache-
+            ${{ runner.os }}-
 
-          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
-          Stop-Service -Name mpssvc -Force -ErrorAction SilentlyContinue
-          Set-Service -Name mpssvc -StartupType Disabled -ErrorAction SilentlyContinue
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
 
-          Restart-Service TermService -Force
-          Start-Sleep -Seconds 5
-
-          Write-Host "[OK] RDP configured and listening on port 3389"
-
-      - name: Create RDP User
-        shell: powershell
-        run: |
-          $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
-          $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { Remove-LocalUser -Name "RDP" }
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "[OK] RDP user created"
-
-      - name: Install Tailscale
-        shell: powershell
-        run: |
-          Write-Host "Installing Tailscale..."
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait
-          Remove-Item $installer -Force
-          Write-Host "[OK] Tailscale installed"
-
-      - name: Install FFmpeg
-        shell: powershell
-        run: |
-          Write-Host "Installing FFmpeg via Chocolatey..."
-          choco install ffmpeg -y --no-progress
-          Write-Host "[OK] FFmpeg installed"
-          refreshenv
-          $ffver = & ffmpeg.exe -version 2>&1
-          Write-Host "Version: $($ffver | Select-Object -First 1)"
-
-      - name: Check Tailscale Auth Key
+      - name: Parallel Setup
         shell: powershell
         env:
+          MINI_ENV: ${{ secrets.MINI_ENV }}
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
+          NODE_ID: ${{ secrets.NODE_ID }}
+          SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
+          VIDHIDE_API_KEY: ${{ secrets.VIDHIDE_API_KEY }}
+          STREAMWISH_API_KEY: ${{ secrets.STREAMWISH_API_KEY }}
+          UPNSHARE_KEY: ${{ secrets.UPNSHARE_KEY }}
+          DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
+          VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
+          VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+          AFFILIATE_WM: ${{ secrets.AFFILIATE_WM }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            Write-Error "TAILSCALE_AUTH_KEY secret is EMPTY or NOT SET"
-            Write-Host "Go to: https://github.com/lawdachuss/rdp-goondvr/settings/secrets/actions"
-            exit 1
+          $repoDir = "$env:REPO_DIR"
+          $rdpPassFile = "$env:TEMP\_rdppass"
+          $tailscaleOk = "$env:TEMP\_ts_ok"
+          $tailscaleIpFile = "$env:TEMP\_ts_ip"
+
+          # Capture env vars for $using: in jobs (Start-Job can't see $env: directly)
+          $mTsAuthKey = $env:TAILSCALE_AUTH_KEY
+          $mRunId = $env:GITHUB_RUN_ID
+
+
+
+          # ========== JOB: RDP Config + User ==========
+          $rdpJob = Start-Job -Name rdp -ScriptBlock {
+            param($pf)
+            Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0 -Force
+            Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' UserAuthentication 0 -Force
+            Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' fSingleSessionPerUser 0 -Force
+            Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
+            Stop-Service mpssvc -Force -ErrorAction SilentlyContinue; Set-Service mpssvc -StartupType Disabled -ErrorAction SilentlyContinue
+            if ((Get-Service TermService).Status -ne 'Running') { Restart-Service TermService -Force }
+            $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
+            $p = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+            $sp = ConvertTo-SecureString $p -AsPlainText -Force
+            if (Get-LocalUser "RDP" -ErrorAction SilentlyContinue) { Remove-LocalUser "RDP" }
+            New-LocalUser "RDP" -Password $sp -AccountNeverExpires -PasswordNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+            $p | Set-Content $pf -Force
+          } -ArgumentList $rdpPassFile
+
+          # ========== JOB: Tailscale Install (cached MSI, skip if already installed) ==========
+          $tsInstallJob = Start-Job -Name tsi -ScriptBlock {
+            $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+            $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+            if ($svc -and (Test-Path $tsExe)) {
+              Write-Host "[TAILSCALE] Already installed (service + files found)"
+              return
+            }
+            # Files restored from cache but service not registered — register it manually.
+            # IMPORTANT: the daemon binary is tailscaled.exe (it runs svc.Run and detects
+            # service mode via svc.IsWindowsService). Registering tailscale.exe (the CLI)
+            # as the service makes Start-Service fail with "Cannot start service".
+            if (-not $svc -and (Test-Path $tsExe)) {
+              Write-Host "[TAILSCALE] Files found, registering service (tailscaled daemon)..."
+              $tsd = "C:\Program Files\Tailscale\tailscaled.exe"
+              if (Test-Path $tsd) {
+                $null = & $tsd install-system-daemon 2>&1
+                $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+                if (-not $svc) {
+                  New-Service -Name Tailscale -BinaryPathName "`"$tsd`"" -StartupType Automatic -DisplayName "Tailscale" -ErrorAction SilentlyContinue
+                  $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+                }
+              } else {
+                New-Service -Name Tailscale -BinaryPathName "`"$tsExe`" --service" -StartupType Automatic -DisplayName "Tailscale" -ErrorAction SilentlyContinue
+                $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+              }
+              if ($svc) { Write-Host "[TAILSCALE] Service registered (binary: $((Get-CimInstance Win32_Service -Filter "Name='Tailscale'").PathName))"; return }
+            }
+            $msiDir = "$env:USERPROFILE\.cache"
+            New-Item -ItemType Directory -Force -Path $msiDir | Out-Null
+            $i = "$msiDir\tailscale.msi"
+            if (-not (Test-Path $i) -or ((Get-Item $i).Length -lt 5MB)) {
+              Write-Host "[TAILSCALE] Downloading MSI..."
+              $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+              Invoke-WebRequest -Uri $url -OutFile $i -UseBasicParsing -TimeoutSec 60
+            } else {
+              Write-Host "[TAILSCALE] Using cached MSI"
+            }
+            Write-Host "[TAILSCALE] Installing..."
+            $t = Measure-Command { Start-Process msiexec.exe -ArgumentList "/i `"$i`" /qn /norestart" -Wait }
+            Write-Host "[TAILSCALE] Installed in $([math]::Round($t.TotalSeconds,1))s"
           }
-          Write-Host "[OK] TAILSCALE_AUTH_KEY is set (length: $($env:TAILSCALE_AUTH_KEY.Length))"
 
-      - name: Connect Tailscale
-        shell: powershell
-        run: |
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
-          if ($null -eq $svc) { Write-Error "Tailscale service not found"; exit 1 }
-          if ($svc.Status -ne 'Running') { Start-Service Tailscale -ErrorAction Stop }
-
-          Write-Host "Waiting for Tailscale daemon..."
-          $ready = $false
-          for ($i = 0; $i -lt 15; $i++) {
-            try {
-              $out = & $tailscale status 2>&1
-              if ($LASTEXITCODE -eq 0 -or ($out -match "Logged out|NeedsLogin|Running|stopped")) { $ready = $true; break }
-            } catch {}
-            Start-Sleep -Seconds 2
+          # ========== JOB: FFmpeg Install (cached by choco) ==========
+          $ffJob = Start-Job -Name ffmpeg -ScriptBlock {
+            Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+            $env:NO_PROXY = "community.chocolatey.org,chocolatey.org"
+            if ((Test-Path "C:\ProgramData\chocolatey\bin\ffmpeg.exe") -and (Test-Path "C:\ProgramData\chocolatey\bin\ffprobe.exe")) {
+              Write-Host "[FFMPEG] Using cached binaries"
+            } else {
+              Write-Host "[FFMPEG] Installing..."
+              $t = Measure-Command { choco install ffmpeg -y --no-progress 2>&1 | Out-Null }
+              Write-Host "[FFMPEG] Done in $([math]::Round($t.TotalSeconds,1))s"
+            }
           }
-          if (-not $ready) { Write-Error "Tailscale daemon not ready after 30s"; exit 1 }
 
-          Write-Host "Authenticating Tailscale..."
-          & $tailscale up `
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
-            --hostname="github-rdp-${{ github.run_id }}" `
-            --accept-routes `
-            --accept-dns=false `
-            --timeout=60s `
-            --reset
-          if ($LASTEXITCODE -ne 0) { Write-Error "tailscale up failed"; exit 1 }
+          # ========== JOB: Clone + Build (skip if cached) ==========
+          $buildJob = Start-Job -Name build -ScriptBlock {
+            param($d)
+            New-Item -ItemType Directory -Force -Path "D:\repos" | Out-Null
+            if (-not (Test-Path "$d\chaturbate-dvr.exe")) {
+              New-Item -ItemType Directory -Force -Path $d | Out-Null
+              Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination $d -Recurse -Force -ErrorAction SilentlyContinue
+              Set-Location $d
+              Write-Host "(BUILD) Building Go binaries..."
+              $sa = $env:ALL_PROXY; Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+              $env:GOPROXY = "https://proxy.golang.org,direct"
+              foreach ($bin in @("chaturbate-dvr.exe .")) {
+                $parts = $bin -split ' ', 2
+                $name = $parts[0]; $pkg = $parts[1]
+                $ok = $false
+                for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                  $t = [Diagnostics.Stopwatch]::StartNew()
+                  $out = go build -ldflags="-s -w" -o $name $pkg 2>&1
+                  $t.Stop(); $exit = $LASTEXITCODE
+                  if ($exit -eq 0) { Write-Host "(BUILD) $($name): $([math]::Round($t.Elapsed.TotalSeconds,1))s"; $ok = $true; break }
+                  Write-Host "(BUILD) $name attempt $($attempt+1) failed (exit $exit), retrying..."
+                  Start-Sleep -Seconds 2
+                }
+                if (-not $ok) { Write-Error "(BUILD) $name failed after 3 attempts" }
+              }
+              if ($sa) { $env:ALL_PROXY = $sa; $env:all_proxy = $sa }
+            } else { Write-Host "(BUILD) Using cached binaries" }
+          } -ArgumentList $repoDir
 
-          Write-Host "-------- TAILSCALE STATUS --------"
-          & $tailscale status
+          Write-Host "[MAIN] Waiting for RDP, Tailscale..."; $null = [System.Console]::Out.Flush()
+          $null = $rdpJob, $tsInstallJob | Wait-Job -Timeout 60
+          $rdpPassword = Receive-Job $rdpJob -ErrorAction SilentlyContinue
+          if ($rdpPassword) { echo "RDP_PASSWORD=$rdpPassword" >> $env:GITHUB_ENV; Write-Host "(OK) RDP user created" } else { Write-Warning "(RDP) No password received" }
+          Receive-Job $tsInstallJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "(TS) $_" }
+          Remove-Job $rdpJob, $tsInstallJob -Force -ErrorAction SilentlyContinue
 
-          $ip = $null
-          for ($i = 0; $i -lt 15; $i++) {
-            try {
-              $candidate = (& $tailscale ip -4 2>&1 | Select-Object -First 1).Trim()
-              if ($candidate -match '^\d+\.\d+\.\d+\.\d+$') { $ip = $candidate; break }
-            } catch {}
+          # ========== WAIT for FFmpeg (dedicated budget, no proxy needed) ==========
+          # Give ffmpeg its own generous wait so a slow choco install is never
+          # force-killed by the RDP/Tailscale 60s budget. Verify the choco shims
+          # actually exist; if install is still running, keep waiting.
+          function Resolve-FFmpegBin {
+            param([string]$name)
+            $cands = @("C:\ProgramData\chocolatey\bin\$name.exe", "C:\Program Files\ffmpeg\bin\$name.exe", "C:\Program Files\FFmpeg\bin\$name.exe", "$env:LOCALAPPDATA\Microsoft\WinGet\Links\$name.exe")
+            foreach ($c in $cands) { if (Test-Path $c) { return $c } }
+            $gc = Get-Command $name -ErrorAction SilentlyContinue
+            if ($gc) { return $gc.Source }
+            $hit = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Recurse -Filter "$name.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { return $hit.FullName }
+            return $null
+          }
+          Write-Host "[MAIN] Waiting for FFmpeg..."; $null = [System.Console]::Out.Flush()
+          $ffShim = "C:\ProgramData\chocolatey\bin\ffmpeg.exe"
+          $fpShim = "C:\ProgramData\chocolatey\bin\ffprobe.exe"
+          for ($i = 0; $i -lt 60; $i++) {
+            if ($ffJob.State -eq 'Completed' -or ((Test-Path $ffShim) -and (Test-Path $fpShim))) { break }
+            if ($ffJob.State -eq 'Failed' -or $ffJob.State -eq 'Stopped') { break }
             Start-Sleep -Seconds 3
           }
-          if (-not $ip) { Write-Error "No Tailscale IP assigned after 45s"; exit 1 }
+          Receive-Job $ffJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+          if ($ffJob.State -ne 'Running') { Remove-Job $ffJob -Force -ErrorAction SilentlyContinue }
 
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "[OK] Tailscale IP: $ip"
+          # Locate the real binaries anywhere choco placed them (shims can be
+          # missing even when the package installed), then materialize the shim
+          # paths the keep-alive/DVR rely on.
+          $ffResolved = Resolve-FFmpegBin "ffmpeg"
+          $fpResolved = Resolve-FFmpegBin "ffprobe"
+          if ($ffResolved) { Write-Host "[FFMPEG] Found ffmpeg: $ffResolved" }
+          if ($fpResolved) { Write-Host "[FFMPEG] Found ffprobe: $fpResolved" }
 
-      - name: Verify Tailscale
-        shell: powershell
-        run: |
-          Write-Host "=== TAILSCALE ==="
-          if ($env:TAILSCALE_IP) { Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue | Select-Object ComputerName, TcpTestSucceeded }
-
-      - name: Verify RDP via Tailscale
-        shell: powershell
-        run: |
-          Write-Host "Checking RDP on $env:TAILSCALE_IP:3389..."
-          $success = $false
-          for ($i = 0; $i -lt 10; $i++) {
-            $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-            if ($test.TcpTestSucceeded) { $success = $true; break }
-            Write-Host "Attempt $($i+1)/10 failed, retrying in 10s..."
-            Start-Sleep -Seconds 10
+          # If choco did not install (or binaries absent), retry choco once.
+          if (-not $ffResolved -or -not $fpResolved) {
+            Write-Host "[FFMPEG] Binary missing, retrying install..."
+            Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+            $env:NO_PROXY = "community.chocolatey.org,chocolatey.org"
+            $retry = Measure-Command { choco install ffmpeg -y --no-progress 2>&1 | Out-Null }
+            Write-Host "[FFMPEG] Retry done in $([math]::Round($retry.TotalSeconds,1))s"
+            $ffResolved = Resolve-FFmpegBin "ffmpeg"; $fpResolved = Resolve-FFmpegBin "ffprobe"
           }
-          if (-not $success) { Write-Error "RDP port 3389 not reachable on $env:TAILSCALE_IP after 100s"; exit 1 }
-          Write-Host "[OK] RDP reachable via Tailscale."
 
-      - name: Clone MiniDelectableService to D:\
-        shell: powershell
-        run: |
-          $repoDir = "D:\repos\MiniDelectableService"
-          New-Item -ItemType Directory -Force -Path "D:\repos" | Out-Null
-          if (Test-Path $repoDir) { Remove-Item -Recurse -Force $repoDir }
-          Write-Host "Using checked-out repo code (commit: $(git rev-parse --short HEAD))..."
-          
-          # Use the already-checked-out code from actions/checkout
-          # This ensures CI always uses the latest code from this repo
-          New-Item -ItemType Directory -Force -Path $repoDir | Out-Null
-          Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination $repoDir -Recurse -Force
-          Write-Host "[OK] Copied local repo to $repoDir"
-
-      - name: Refresh Chaturbate Cookies via Scrapling
-        shell: powershell
-        env:
-          MINI_ENV: ${{ secrets.env }}
-        run: |
-          $repoDir = "D:\repos\MiniDelectableService"
-          if (-not (Test-Path $repoDir)) { Write-Error "Repo not found"; exit 1 }
-          if (-not [string]::IsNullOrWhiteSpace($env:MINI_ENV)) {
-            [System.IO.File]::WriteAllText("$repoDir\.env", $env:MINI_ENV, (New-Object System.Text.UTF8Encoding($false)))
-            Write-Host "[OK] Wrote .env for cookie refresher"
-          }
-          $skipRefresh = $false
-          Write-Host "Installing curl_cffi for cookie refresh (lightweight, no browser needed)..."
-          pip install --default-timeout=60 curl_cffi
-          # Step 2: Verify binary exists
-          $dvrExe = "$repoDir\chaturbate-dvr.exe"
-          if (-not (Test-Path $dvrExe)) { Write-Error "Binary not found: $dvrExe"; exit 1 }
-          Write-Host "[OK] Binary exists at $dvrExe ($((Get-Item $dvrExe).Length) bytes)"
-
-          Write-Host "=== Binary validation ==="
-          $v = & $dvrExe --version 2>&1
-          Write-Host "Version: $v"
-          Write-Host "[OK] DVR binary is ready"
-
-          # Create a scheduled task that starts DVR (accessible from all sessions and persists)
-          Write-Host "=== Creating system-wide DVR scheduled task ==="
-          $taskName = "ChaturbateDVR"
-          
-          # Create videos directory on D: drive (150GB temp storage)
-          $videosDir = "D:\videos"
-          New-Item -ItemType Directory -Force -Path $videosDir | Out-Null
-          Write-Host "[OK] Created videos directory: $videosDir"
-          
-          # Remove existing task if present
-          Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-          
-          # Create a wrapper script so the scheduled task can set env vars
-          # (scheduled tasks don't inherit environment variables)
-          $wrapperScript = "$repoDir\start-dvr.ps1"
-
-          # Use PowerShell method (cleaner than schtasks with complex paths/arguments)
-          # CRITICAL: Set WorkingDirectory to ensure .env is found
-          Write-Host "DVR will run from working directory: $repoDir"
-          Write-Host "DVR will save videos to: $videosDir"
-          Write-Host ".env file location: $repoDir\.env"
-
-          # Add output redirection to wrapper script for debugging
-          $wrapperLines = @(
-            "# DVR Wrapper Script",
-            "`$logFile = `"$repoDir\dvr-wrapper.log`"",
-            "Start-Transcript -Path `$logFile -Append",
-            "",
-            "# Pooled mode env vars (distributed shards)",
-            "`$env:CHANNEL_POOL_MODE = `"${{ secrets.CHANNEL_POOL_MODE }}`"",
-            "`$env:NODE_ID = `"${{ secrets.NODE_ID }}`"",
-            "`$env:USER_AGENT = `"$env:USER_AGENT`"",
-            "",
-            "Write-Host `"[DVR Wrapper] Starting chaturbate-dvr.exe`"",
-            "Write-Host `"[DVR Wrapper] Working Directory: $repoDir`"",
-            "Write-Host `"[DVR Wrapper] Videos Directory: $videosDir`"",
-            "Write-Host `"[DVR Wrapper] Time: `$(Get-Date)`""
-            "",
-            "Set-Location `"$repoDir`"",
-            "",
-            "# Check if .env exists",
-            "if (Test-Path `".env`") {",
-            "    Write-Host `"[DVR Wrapper] .env file found`"",
-            "} else {",
-            "    Write-Host `"[DVR Wrapper] WARNING: .env file NOT found`"",
-            "}",
-            "",
-            "Write-Host `"[DVR Wrapper] Starting DVR binary...`"",
-            "Stop-Transcript",
-            "",
-            "# Start DVR process",
-            "# Redirect stdout/stderr to a log file so we can debug crashes",
-            "`$dvrLog = `"$repoDir\dvr-output.log`"",
-            "& `"$dvrExe`" --no-tunnel --output-dir `"$videosDir`" *>&1 | Tee-Object -FilePath `"$dvrLog`" -Append"
-          )
-          $wrapperContent = $wrapperLines -join "`r`n"
-          Set-Content -Path $wrapperScript -Value $wrapperContent -Force
-          Write-Host "[OK] Created DVR wrapper script with logging: $wrapperScript"
-          
-          # Run PowerShell wrapper script instead of DVR directly
-          # Use -NoExit to keep PowerShell window open for debugging
-          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -NoProfile -File `"$wrapperScript`"" -WorkingDirectory $repoDir
-          $trigger = New-ScheduledTaskTrigger -AtStartup
-          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Hours 0)
-          
-          Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-          Write-Host "[OK] DVR scheduled task created"
-          
-          # Verify task was created
-          $taskExists = schtasks /Query /TN $taskName 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Verified task exists in Task Scheduler"
-          } else {
-            Write-Warning "Task may not have been created successfully"
-          }
-          
-          Write-Host "[OK] DVR scheduled task created"
-          Write-Host "=== Setting up Cloudflare tunnel ==="
-          
-          # Download cloudflared to repo directory
-          $cloudflaredPath = "$repoDir\cloudflared.exe"
-          
-          Write-Host "Downloading cloudflared..."
-          $downloadSuccess = $false
-          $maxRetries = 3
-          
-          for ($retry = 1; $retry -le $maxRetries; $retry++) {
+          # Last resort: deterministic static build (no choco shim dependency).
+          if (-not $ffResolved -or -not $fpResolved) {
+            Write-Host "[FFMPEG] Static build fallback (BtbN ffmpeg-master-latest-win64-gpl)..."
+            Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+            $zip = "D:\ffmpeg-static.zip"
             try {
-              Write-Host "Download attempt $retry/$maxRetries..."
-              $ProgressPreference = 'SilentlyContinue'
-              Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cloudflaredPath -UseBasicParsing -TimeoutSec 30
-              
-              if (Test-Path $cloudflaredPath) {
-                $size = (Get-Item $cloudflaredPath).Length
-                if ($size -gt 1MB) {
-                  Write-Host "[OK] Cloudflared downloaded successfully ($([math]::Round($size/1MB, 2)) MB)"
-                  $downloadSuccess = $true
-                  break
-                } else {
-                  Write-Warning "Downloaded file is too small ($size bytes), retrying..."
-                  Remove-Item $cloudflaredPath -Force -ErrorAction SilentlyContinue
-                }
+              Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile $zip -UseBasicParsing -TimeoutSec 240
+              New-Item -ItemType Directory -Force -Path "D:\ffmpeg" | Out-Null
+              Expand-Archive -Path $zip -DestinationPath "D:\ffmpeg" -Force
+              $dir = Get-ChildItem "D:\ffmpeg" -Directory | Select-Object -First 1
+              $bin = "$($dir.FullName)\bin"
+              Copy-Item "$bin\ffmpeg.exe" "C:\ProgramData\chocolatey\bin\" -Force -ErrorAction SilentlyContinue
+              Copy-Item "$bin\ffprobe.exe" "C:\ProgramData\chocolatey\bin\" -Force -ErrorAction SilentlyContinue
+              $ffResolved = Resolve-FFmpegBin "ffmpeg"; $fpResolved = Resolve-FFmpegBin "ffprobe"
+            } catch { Write-Warning "(WARN) ffmpeg static download failed: $_" }
+          }
+
+          # Ensure keep-alive/DVR pick up the real paths via env.
+          if ($ffResolved) { echo "FFMPEG_PATH=$ffResolved" >> $env:GITHUB_ENV }
+          if ($fpResolved) { echo "FFPROBE_PATH=$fpResolved" >> $env:GITHUB_ENV }
+          if ($ffResolved -and $fpResolved) {
+            Write-Host "(OK) ffmpeg: $ffResolved / $fpResolved"
+            if (-not (Test-Path $ffShim)) { Copy-Item $ffResolved $ffShim -Force -ErrorAction SilentlyContinue }
+            if (-not (Test-Path $fpShim)) { Copy-Item $fpResolved $fpShim -Force -ErrorAction SilentlyContinue }
+          }
+          else { Write-Warning "(WARN) ffmpeg shims missing - muxing/thumbnails may fail" }
+
+
+          # ========== JOB: Tailscale Connect (depends on install) ==========
+          $tsDiagFile = "$env:TEMP\_ts_diag"
+          $tsConnectJob = Start-Job -Name tsc -ArgumentList $tailscaleIpFile, $tsDiagFile, $mTsAuthKey, $mRunId -ScriptBlock {
+            param($ipFile, $diagFile, $authKey, $runId)
+            function diag { param($m) $d = (Get-Content $diagFile -Raw -ErrorAction SilentlyContinue); "$d`n$m" | Set-Content $diagFile -Force }
+            diag "authKey set: $(-not [string]::IsNullOrWhiteSpace($authKey))  authKey length: $($authKey.Length)"
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            $tsd = "$env:ProgramFiles\Tailscale\tailscaled.exe"
+            $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+            if (-not $svc) { diag "FAIL: Tailscale service not found"; return }
+            $bin = (Get-CimInstance Win32_Service -Filter "Name='Tailscale'").PathName
+            diag "service binary: $bin"
+            diag "service status: $($svc.Status)"
+            $daemonUp = $false
+            if ($svc.Status -eq 'Running') { $daemonUp = $true }
+            else {
+              try { Start-Service Tailscale -ErrorAction Stop; diag "service started"; $daemonUp = $true } catch { diag "WARN: Start-Service: $_" }
+            }
+            # Fallback: if the Windows service won't start (SCM issues on runners), run
+            # tailscaled directly as a background process. It owns the same named pipe,
+            # so the CLI works identically. Use --state in ProgramData like the MSI.
+            if (-not $daemonUp) {
+              diag "fallback: running tailscaled directly (bypassing SCM)"
+              $stateDir = "$env:ProgramData\Tailscale"
+              New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+              $stateFile = Join-Path $stateDir "server-state.conf"
+              $p = Start-Process -FilePath $tsd -ArgumentList "--state=`"$stateFile`"" -WindowStyle Hidden -PassThru -RedirectStandardError "$env:TEMP\_tsd_err" -RedirectStandardOutput "$env:TEMP\_tsd_out"
+              diag "tailscaled launched pid=$($p.Id)"
+              for ($i = 0; $i -lt 15; $i++) {
+                Start-Sleep -Seconds 2
+                $st = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+                if (-not $st) { diag "WARN: tailscaled pid $($p.Id) exited early"; break }
+                try { $out = (& $ts status 2>&1) -join ' '; if ($LASTEXITCODE -eq 0 -or ($out -match "Logged out|NeedsLogin|Running|stopped|failed")) { diag "direct daemon ready (exit $LASTEXITCODE): $($out.Substring(0, [Math]::Min(120, $out.Length)))"; $daemonUp = $true; break } } catch { diag "direct status $i threw: $_" }
               }
-            } catch {
-              Write-Warning "Download attempt $retry failed: $_"
+              if (-not $daemonUp) { diag "FAIL: direct tailscaled not responsive; stderr tail: $((Get-Content "$env:TEMP\_tsd_err" -Tail 5 -ErrorAction SilentlyContinue) -join ' | ')" }
+            }
+            for ($i = 0; $i -lt 15; $i++) {
+              try { $out = (& $ts status 2>&1) -join ' '; $ec = $LASTEXITCODE; if ($ec -eq 0 -or ($out -match "Logged out|NeedsLogin|Running|stopped")) { diag "status ready (exit $ec): $($out.Substring(0, [Math]::Min(120, $out.Length)))"; break } } catch { diag "status call $i threw: $_" }
               Start-Sleep -Seconds 2
             }
-          }
-          
-          if (-not $downloadSuccess) {
-            Write-Error "Failed to download cloudflared after $maxRetries attempts"
-            Write-Host "DVR will still be accessible at http://localhost:8080"
-            $cloudflaredPath = $null
-          }
-          
-          if ($cloudflaredPath -and (Test-Path $cloudflaredPath)) {
-            Write-Host "Creating cloudflared wrapper script (with auto-reconnect)..."
-            
-            # Create a PowerShell wrapper script (like DVR's wrapper) with restart loop
-            $tunnelWrapperScript = "$repoDir\start-tunnel.ps1"
-            $tunnelLogPath = "$repoDir\tunnel.log"
-            $tunnelUrlFile = "$repoDir\tunnel-url.txt"
-            
-            $tunnelWrapperLines = @(
-              "# Cloudflared tunnel wrapper with auto-reconnect",
-              "`$logFile = `"$tunnelLogPath`"",
-              "`$tunnelUrlFile = `"$tunnelUrlFile`"",
-              "`$cloudflared = `"$cloudflaredPath`"",
-              "`$repoDir = `"$repoDir`"",
-              "",
-              "while (`$true) {",
-              "    Write-Host `"[Tunnel Wrapper] Starting cloudflared tunnel at `$(Get-Date)`"",
-              "    `$stderrFile = Join-Path `$repoDir `"cloudflared-stderr.log`"",
-              "    if (Test-Path `$stderrFile) { Remove-Item `$stderrFile -Force }",
-              "",
-              "    `$args = `"tunnel --url http://localhost:8080 --protocol http2`"",
-              "    `$proc = Start-Process -FilePath `$cloudflared -ArgumentList `$args -WorkingDirectory `$repoDir -NoNewWindow -RedirectStandardError `$stderrFile -PassThru",
-              "",
-              "    # Poll stderr file for tunnel URL (cloudflared prints it to stderr)",
-              "    `$urlFound = `$false",
-              "    for (`$i = 0; `$i -lt 30; `$i++) {",
-              "        Start-Sleep -Seconds 2",
-              "        if (-not (Test-Path `$stderrFile)) { continue }",
-              "        `$content = Get-Content `$stderrFile -Raw -ErrorAction SilentlyContinue",
-              "        if (`$content -match 'https://[a-z0-9\\-]+\\.trycloudflare\\.com') {",
-              "            `$url = `$urlMatch.Value",
-              "            `$url | Set-Content -Path `$tunnelUrlFile -Force",
-              "            `$url | Out-File -FilePath `$logFile -Append",
-              "            Write-Host `"[Tunnel Wrapper] Tunnel URL: `$url`"",
-              "            `$urlFound = `$true",
-              "            break",
-              "        }",
-              "    }",
-              "",
-              "    if (-not `$urlFound) {",
-              "        `$errContent = Get-Content `$stderrFile -Raw -ErrorAction SilentlyContinue",
-              "        if (`$errContent) { `$errContent | Out-File -FilePath `$logFile -Append }",
-              "        Write-Host `"[Tunnel Wrapper] No URL found, restarting in 10s...`"",
-              "    }",
-              "",
-              "    # Wait for process to exit (tunnel disconnected)",
-              "    `$proc.WaitForExit()",
-              "    Write-Host `"[Tunnel Wrapper] Tunnel disconnected, restarting in 10s...`"",
-              "    Start-Sleep -Seconds 10",
-              "}"
-            )
-            $tunnelWrapperContent = $tunnelWrapperLines -join "`r`n"
-            Set-Content -Path $tunnelWrapperScript -Value $tunnelWrapperContent -Force
-            Write-Host "[OK] Created cloudflared wrapper script: $tunnelWrapperScript"
-            
-            # Remove existing task if present
-            Unregister-ScheduledTask -TaskName "CloudflareTunnel" -Confirm:$false -ErrorAction SilentlyContinue
-            
-            # Create scheduled task that runs the wrapper
-            $tunnelAction = New-ScheduledTaskAction `
-              -Execute "powershell.exe" `
-              -Argument "-ExecutionPolicy Bypass -NoProfile -File `"$tunnelWrapperScript`"" `
-              -WorkingDirectory $repoDir
-            $tunnelTrigger = New-ScheduledTaskTrigger -AtStartup
-            $tunnelTrigger.Delay = "PT30S"
-            $tunnelPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-            $tunnelSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Days 0)
-            
-            Register-ScheduledTask -TaskName "CloudflareTunnel" -Action $tunnelAction -Trigger $tunnelTrigger -Principal $tunnelPrincipal -Settings $tunnelSettings -Force | Out-Null
-            Write-Host "[OK] Cloudflared tunnel scheduled task created"
-            
-            # Verify cloudflared task was created
-            try {
-              $cfTask = Get-ScheduledTask -TaskName "CloudflareTunnel" -ErrorAction Stop
-              Write-Host "[OK] Verified cloudflared task exists in Task Scheduler (State: $($cfTask.State))"
-            } catch {
-              Write-Error "Failed to verify cloudflared scheduled task: $_"
-              $cfTaskExists = schtasks /Query /TN "CloudflareTunnel" 2>&1
-              if ($LASTEXITCODE -ne 0) {
-                Write-Error "Cloudflared task was not created successfully"
-              }
+            diag "running: ts up --authkey=*** --hostname=github-rdp-$runId --accept-routes --accept-dns=false --timeout=120s --reset"
+            $upArgs = @("up","--authkey=$authKey","--hostname=github-rdp-$runId","--accept-routes","--accept-dns=false","--timeout=120s","--reset")
+            $upOut = (& $ts @upArgs 2>&1) -join ' '
+            $upEc = $LASTEXITCODE
+            diag "ts up exit: $upEc  output: $upOut"
+            if ($upEc -ne 0) {
+              diag "retrying ts up with --tun=userspace-networking (WinTun driver often unavailable on runners)"
+              $upOut = (& $ts @upArgs --tun=userspace-networking 2>&1) -join ' '
+              $upEc = $LASTEXITCODE
+              diag "ts up userspace exit: $upEc  output: $upOut"
+              if ($upEc -ne 0) { return }
             }
-            
-            Write-Host "[OK] Cloudflared tunnel scheduled task created (for reboot persistence)"
+            # NOTE: ts ip -4 writes failures to stderr which PowerShell wraps as
+            # ErrorRecord; pipe through Out-String so .Trim() works on a string.
+            function Get-TsIP { (& $ts ip -4 2>&1 | Out-String).Trim() }
+            # TAILSCALE_IP is informational only (RDP display in keep-alive.ps1),
+            # NOT used for uploads. On GitHub runners the WinTun driver is usually
+            # unavailable so the daemon stays "NoState" and ts up exits 0 without
+            # ever producing an IP. Bound the poll tightly so a flaky daemon can
+            # never block the DVR path; the --tun=userspace-networking CLI flag
+            # is absent in this Tailscale build, so it is not retried.
+            $deadline = (Get-Date).AddSeconds(45)
+            $ip = ""
+            while ((Get-Date) -lt $deadline) {
+              $ip = Get-TsIP
+              if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+              Start-Sleep -Seconds 3
+            }
+            if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
+              diag "IP obtained: $ip"
+              $ip | Set-Content $ipFile -Force
+            } else {
+              diag "FAIL: no IPv4 after 45s (WinTun likely missing); ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
+            }
           }
 
-      - name: Show Connection Details
-        shell: powershell
+          $stJob = Start-Job -Name tasks -ArgumentList $repoDir -ScriptBlock {
+            param($d)
+            $cfCache = "C:\cloudflared\cloudflared.exe"
+            New-Item -ItemType Directory -Force -Path "C:\cloudflared" | Out-Null
+            if (-not (Test-Path $cfCache) -or ((Get-Item $cfCache).Length -lt 1MB)) {
+              Write-Host "[CLOUDFLARED] Downloading..."
+              for ($r = 1; $r -le 3; $r++) { try { Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfCache -UseBasicParsing -TimeoutSec 30; break } catch { Start-Sleep -Seconds 2 } }
+            } else { Write-Host "[CLOUDFLARED] Using cached binary" }
+            Copy-Item $cfCache "$d\cloudflared.exe" -Force
+            New-Item -ItemType Directory -Force -Path "D:\videos" | Out-Null
+          }
+
+          # ========== WAIT for Build ==========
+          Write-Host "[MAIN] Waiting for build..."; $null = [System.Console]::Out.Flush()
+          $null = $buildJob | Wait-Job -Timeout 90
+          Receive-Job $buildJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+          Remove-Job $buildJob -Force -ErrorAction SilentlyContinue
+          if (-not (Test-Path "$repoDir\chaturbate-dvr.exe")) { Write-Error "(FATAL) DVR binary not built"; exit 1 }
+          Write-Host "(OK) chaturbate-dvr.exe: $((Get-Item "$repoDir\chaturbate-dvr.exe").Length / 1MB) MB"
+
+
+          # ========== .env (runs parallel with stJob) ==========
+          Write-Host "[MAIN] Writing .env..."
+          Set-Location $repoDir
+          if (-not [string]::IsNullOrWhiteSpace($env:MINI_ENV)) {
+            [System.IO.File]::WriteAllText("$repoDir\.env", $env:MINI_ENV, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "[.env] Written from secret ($($env:MINI_ENV.Length) chars)"
+            $ev = Get-Content "$repoDir\.env" -Raw
+            if (-not [string]::IsNullOrWhiteSpace($env:VOESX_API_KEY)) {
+              if ($ev -match '(?m)^VOESX_API_KEY=') { $ev = $ev -replace '(?m)^VOESX_API_KEY=.*$', "VOESX_API_KEY=$env:VOESX_API_KEY" } else { $ev = $ev.TrimEnd("`r","`n") + "`nVOESX_API_KEY=$env:VOESX_API_KEY`n" } }
+            if (-not [string]::IsNullOrWhiteSpace($env:VIDARA_API_KEY)) {
+              if ($ev -match '(?m)^VIDARA_KEY=') { $ev = $ev -replace '(?m)^VIDARA_KEY=.*$', "VIDARA_KEY=$env:VIDARA_API_KEY" } else { $ev = $ev.TrimEnd("`r","`n") + "`nVIDARA_KEY=$env:VIDARA_API_KEY`n" } }
+            if (-not [string]::IsNullOrWhiteSpace($env:AFFILIATE_WM)) {
+              if ($ev -match '(?m)^AFFILIATE_WM=') { $ev = $ev -replace '(?m)^AFFILIATE_WM=.*$', "AFFILIATE_WM=$env:AFFILIATE_WM" } else { $ev = $ev.TrimEnd("`r","`n") + "`nAFFILIATE_WM=$env:AFFILIATE_WM`n" } }
+          } else { Write-Warning "[.env] MINI_ENV secret is empty" }
+          $freshEnv = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
+          $envCookies = if ($freshEnv -match '(?m)^COOKIES=(.*)$') { $matches[1] } else { $null }
+          $envUA = if ($freshEnv -match '(?m)^USER_AGENT=(.*)$') { $matches[1] } else { $null }
+          if ($envCookies) {
+            $c = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
+            if ($c) {
+              $c = $c -replace '(?m)^COOKIES=.*$', "COOKIES=$envCookies"
+              if ($envUA) { $c = $c -replace '(?m)^USER_AGENT=.*$', "USER_AGENT=$envUA" }
+              [System.IO.File]::WriteAllText("$repoDir\.env", $c, (New-Object System.Text.UTF8Encoding($false)))
+            }
+          }
+          # Merge Supabase credentials
+          if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_URL)) {
+            $sb = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
+            if ($sb -eq $null) { $sb = "" }
+            function SetOrAdd($k, $v) { if ($sb -match "(?m)^$k=") { $script:sb = $sb -replace "(?m)^$k=.*`$", "$k=$v" } else { $script:sb = $sb.TrimEnd("`r","`n") + "`n$k=$v`n" } }
+            SetOrAdd "SUPABASE_URL" $env:SUPABASE_URL; SetOrAdd "SUPABASE_API_KEY" $env:SUPABASE_API_KEY; SetOrAdd "SUPABASE_SERVICE_ROLE_KEY" $env:SUPABASE_SERVICE_ROLE_KEY; SetOrAdd "DATABASE_PASSWORD" $env:DATABASE_PASSWORD
+            [System.IO.File]::WriteAllText("$repoDir\.env", $sb, (New-Object System.Text.UTF8Encoding($false)))
+          }
+
+
+          # ========== WAIT for TS Connect + Cloudflared (parallel with builds + .env) ==========
+          Write-Host "[MAIN] Waiting for Tailscale connect + cloudflared..."; $null = [System.Console]::Out.Flush()
+          $null = $stJob | Wait-Job -Timeout 60
+          $null = $tsConnectJob | Wait-Job -Timeout 300
+          $tsIp = Receive-Job $tsConnectJob -ErrorAction SilentlyContinue
+          if (Test-Path $tailscaleIpFile) { $tsIp = Get-Content $tailscaleIpFile; echo "TAILSCALE_IP=$tsIp" >> $env:GITHUB_ENV; Write-Host "(OK) Tailscale: $tsIp" } else { Write-Warning "(TS) No Tailscale IP"; if (Test-Path $tsDiagFile) { Get-Content $tsDiagFile | ForEach-Object { Write-Host "(TS) $_" } } }
+          Receive-Job $stJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+          Remove-Job $tsConnectJob, $stJob -Force -ErrorAction SilentlyContinue
+          $setupElapsed = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$env:START_TIME
+          Write-Host "[MAIN] === Parallel setup complete in $setupElapsed s ==="
+
+
+      - name: Discover Go cache paths and create directories
+        if: always()
+        continue-on-error: true
+        shell: pwsh
         run: |
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "  RDP VIA TAILSCALE"
-          Write-Host "========================================"
-          Write-Host ""
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "HOW TO CONNECT:"
-          Write-Host ""
-          Write-Host "1. Make sure Tailscale is running on your PC"
-          Write-Host ""
-          Write-Host "2. Open Remote Desktop Connection:"
-          Write-Host "   mstsc /v:$env:TAILSCALE_IP"
-          Write-Host ""
-          Write-Host "3. Enter RDP credentials:"
-          Write-Host "   Username: RDP"
-          Write-Host "   Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "  DVR and tunnel will start in next step"
-          Write-Host "========================================"
-          $LASTEXITCODE = 0
+          $goMod = $(go env GOMODCACHE)
+          $goBuild = $(go env GOCACHE)
+          Write-Host "GOMODCACHE=$goMod"
+          Write-Host "GOCACHE=$goBuild"
+          New-Item -ItemType Directory -Force -Path $goMod | Out-Null
+          New-Item -ItemType Directory -Force -Path $goBuild | Out-Null
+          echo "GO_MOD_CACHE=$goMod" >> $env:GITHUB_ENV
+          echo "GO_BUILD_CACHE=$goBuild" >> $env:GITHUB_ENV
+
+      - name: Save Go cache (before 6h loop, so cancelled runs still save)
+        if: always()
+        continue-on-error: true
+        # Keep cache HTTP traffic on the direct connection.
+        env:
+          ALL_PROXY: ''
+          HTTP_PROXY: ''
+          HTTPS_PROXY: ''
+          SOCKS_PROXY: ''
+          PROXY_URL: ''
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ${{ env.GO_MOD_CACHE }}
+            ${{ env.GO_BUILD_CACHE }}
+          key: ${{ github.repository }}-${{ runner.os }}-go-cache-${{ github.run_id }}-${{ hashFiles('go.sum', 'go.mod') }}
+
+      - name: Save Tools cache (before 6h loop, so cancelled runs still save)
+        if: always()
+        continue-on-error: true
+        env:
+          ALL_PROXY: ''
+          HTTP_PROXY: ''
+          HTTPS_PROXY: ''
+          SOCKS_PROXY: ''
+          PROXY_URL: ''
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ${{ env.USERPROFILE }}\.cache\tailscale.msi
+            C:\ProgramData\chocolatey\cache
+            C:\ProgramData\chocolatey\lib\ffmpeg
+            C:\ProgramData\chocolatey\bin\ffmpeg.exe
+            C:\ProgramData\chocolatey\bin\ffprobe.exe
+            C:\cloudflared
+            C:\Program Files\Tailscale
+          key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ github.run_id }}-${{ hashFiles('go.mod') }}
 
       - name: Keep Runner Alive
-        shell: powershell
+        shell: pwsh
         env:
           CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
           NODE_ID: ${{ secrets.NODE_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
+          VIDHIDE_API_KEY: ${{ secrets.VIDHIDE_API_KEY }}
+          STREAMWISH_API_KEY: ${{ secrets.STREAMWISH_API_KEY }}
+          UPNSHARE_KEY: ${{ secrets.UPNSHARE_KEY }}
+          DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
+          VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
+          VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+          AFFILIATE_WM: ${{ secrets.AFFILIATE_WM }}
+        run: pwsh ./scripts/keep-alive.ps1
+      - name: Restore Network for Upload
+        if: always()
+        shell: powershell
         run: |
-          $repoDir = "D:\repos\MiniDelectableService"
-          $dvrExe = "$repoDir\chaturbate-dvr.exe"
-          $videosDir = "D:\videos"
-          $cloudflaredPath = "$repoDir\cloudflared.exe"
-          $dvrLog = "$repoDir\dvr-output.log"
-          $tunnelLogPath = "$repoDir\tunnel.log"
-          $tunnelUrlFile = "$repoDir\tunnel-url.txt"
-          
-          # ====== START DVR ======
-          Write-Host "=== Starting DVR ==="
-          Set-Location $repoDir
-          
-          # Verify .env exists before starting DVR
-          if (Test-Path "$repoDir\.env") {
-            $envSize = (Get-Item "$repoDir\.env").Length
-            Write-Host "[OK] .env file found ($envSize bytes)"
-          } else {
-            Write-Warning ".env file NOT found at $repoDir\.env"
-          }
-          
-          $dvrProcess = Start-Process -FilePath $dvrExe -ArgumentList "--no-tunnel --output-dir `"$videosDir`"" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
-          Write-Host "[OK] DVR PID: $($dvrProcess.Id)"
-          
-          Write-Host "Waiting for DVR to listen on port 8080..."
-          $dvrReady = $false
-          for ($i = 0; $i -lt 90; $i++) {
-            if ($dvrProcess.HasExited) {
-              Write-Host "[ERROR] DVR process exited unexpectedly (code: $($dvrProcess.ExitCode))"
-              Write-Host "=== DVR stdout ==="
-              Get-Content $dvrLog -ErrorAction SilentlyContinue
-              Write-Host "=== DVR stderr ==="
-              Get-Content "$repoDir\dvr-err.log" -ErrorAction SilentlyContinue
-              break
-            }
-            try {
-              $listener = Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue
-              if ($listener) {
-                Write-Host "[OK] DVR is listening on port 8080"
-                $dvrReady = $true
-                break
-              }
-            } catch {}
-            Start-Sleep -Seconds 2
-          }
-          
-          if (-not $dvrReady) {
-            Write-Error "DVR not detected on port 8080 after 180 seconds"
-            exit 1
-          }
-          
-          # Verify HTTP response
-          Write-Host "Verifying DVR HTTP response..."
-          $dvrResponding = $false
-          for ($i = 0; $i -lt 10; $i++) {
-            try {
-              $response = Invoke-WebRequest -Uri "http://localhost:8080" -Method GET -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
-              Write-Host "[OK] DVR is responding (Status: $($response.StatusCode))"
-              $dvrResponding = $true
-              break
-            } catch {
-              if ($_.Exception.Response.StatusCode -eq 404) {
-                Write-Host "[OK] DVR is responding (Status: 404 - DVR is running)"
-                $dvrResponding = $true
-                break
-              }
-              Start-Sleep -Seconds 2
-            }
-          }
-          
-          if (-not $dvrResponding) {
-            Write-Error "DVR not responding to HTTP requests"
-            exit 1
-          }
-          
-          # ====== START CLOUDFLARE TUNNEL ======
-          Write-Host "=== Starting Cloudflare tunnel ==="
-          $tunnelUrl = $null
-          if (Test-Path $cloudflaredPath) {
-            # Run cloudflared directly - capture stderr for tunnel URL
-            $cloudflaredStderr = "$repoDir\cloudflared-stderr.log"
-            if (Test-Path $cloudflaredStderr) { Remove-Item $cloudflaredStderr -Force }
-            
-            $tunnelProc = Start-Process -FilePath $cloudflaredPath `
-              -ArgumentList "tunnel --url http://localhost:8080 --protocol http2" `
-              -WorkingDirectory $repoDir `
-              -NoNewWindow `
-              -RedirectStandardError $cloudflaredStderr `
-              -PassThru
-            Write-Host "[OK] cloudflared started (PID: $($tunnelProc.Id))"
-            
-            # Poll stderr for tunnel URL (cloudflared prints it to stderr)
-            Write-Host "Waiting for tunnel URL..."
-            for ($i = 0; $i -lt 45; $i++) {
-              Start-Sleep -Seconds 1
-              if (Test-Path $cloudflaredStderr) {
-                $errContent = Get-Content $cloudflaredStderr -Raw -ErrorAction SilentlyContinue
-                $urlMatch = [regex]::Match($errContent, 'https://[a-z0-9\-]+\.trycloudflare\.com')
-                if ($urlMatch.Success) {
-                  $tunnelUrl = $urlMatch.Value
-                  $tunnelUrl | Set-Content -Path $tunnelUrlFile -Force
-                  Write-Host "[OK] Tunnel URL found: $tunnelUrl"
-                  break
-                }
-              }
-              if ($i % 10 -eq 0 -and $i -gt 0) {
-                Write-Host "  Still waiting... ($i/45 seconds)"
-              }
-            }
-            if (-not $tunnelUrl) {
-              $stderrLog = if (Test-Path $cloudflaredStderr) { Get-Content $cloudflaredStderr -Raw } else { "(no file)" }
-              Write-Warning "Tunnel URL not found after 45 seconds"
-              Write-Warning "cloudflared stderr: $stderrLog"
-            }
+          Write-Host "(NET) Restoring Windows Firewall..."
+          Start-Service mpssvc -ErrorAction SilentlyContinue
+          Set-Service mpssvc -StartupType Automatic -ErrorAction SilentlyContinue
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
+          Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Write-Host "(NET) Restored"
 
-            # Report the tunnel URL to the DVR so it can persist it to Supabase
-            # (nodes.web_url + tunnels table).  The admin panel's per-node "Visit"
-            # link reads nodes.web_url, so this must run every session.
-            function Report-TunnelUrl([string]$url) {
-              if (-not $url) { return }
-              for ($t = 0; $t -lt 10; $t++) {
-                try {
-                  $body = @{ url = $url } | ConvertTo-Json
-                  Invoke-RestMethod -Uri "http://localhost:8080/api/tunnel" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5 -ErrorAction Stop | Out-Null
-                  Write-Host "[OK] Reported tunnel URL to DVR: $url"
-                  return
-                } catch {
-                  Start-Sleep -Seconds 3
-                }
-              }
-              Write-Warning "[WARN] Could not report tunnel URL to DVR after 10 attempts"
-            }
-            Report-TunnelUrl $tunnelUrl
-          } else {
-            Write-Host "[SKIP] cloudflared not found - DVR accessible via Tailscale only"
-          }
-          
-          # ====== SHOW CONNECTION INFO ======
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "  DVR ACCESS"
-          Write-Host "========================================"
-          Write-Host ""
-          Write-Host "PID: $($dvrProcess.Id)"
-          Write-Host "Access from inside RDP: http://localhost:8080"
-          Write-Host "Access from your PC: http://$env:TAILSCALE_IP`:8080"
-          if ($tunnelUrl) {
-            Write-Host "PUBLIC ACCESS: $tunnelUrl"
-          }
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host ""
-          
-          # ====== KEEP-ALIVE LOOP ======
-          # Clear any stale flag from a previous session before we start
-          $uploadFlag = "$repoDir\upload-complete.flag"
-          Remove-Item $uploadFlag -Force -ErrorAction SilentlyContinue
+      - name: Upload Tunnel URL
+        if: always() && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        env:
+          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
+        with:
+          name: tunnel-url
+          path: ${{ env.REPO_DIR }}\tunnel-url.txt
+          if-no-files-found: ignore
 
-          Write-Host "Keeping runner alive for up to 5 hours and 55 minutes..."
-          if ($tunnelUrl) {
-            Write-Host "Tunnel URL: $tunnelUrl"
-          }
-          Write-Host ""
-          
-          $startTime = if ($env:START_TIME) { [int64]$env:START_TIME } else { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
-          $targetDuration = 355 * 60
-          
-          while ($true) {
-            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-            $elapsed = $now - $startTime
-            if ($elapsed -ge $targetDuration) {
-              Write-Host "Session timeout reached ($elapsed seconds)."
-              break
-            }
-            
-            $remaining = $targetDuration - $elapsed
-            $sleepSecs = [Math]::Min($remaining, 60)
-            if ($sleepSecs -le 0) { break }
-            
-            # Restart DVR if it crashed
-            if ($dvrProcess.HasExited) {
-              Write-Host "[WARNING] DVR process exited (code: $($dvrProcess.ExitCode)) - restarting..."
-              # Pass remaining session time so the restarted DVR stops recordings at the right moment.
-              # Session ends at 5h20m from workflow start; subtract elapsed time to get what's left.
-              $sessionTotalSecs = 5 * 3600 + 20 * 60
-              $remainingSessionSecs = [Math]::Max(60, $sessionTotalSecs - $elapsed)
-              $remainingMins = [Math]::Floor($remainingSessionSecs / 60)
-              $remainingSecs2 = $remainingSessionSecs % 60
-              $env:SESSION_DURATION = "${remainingMins}m${remainingSecs2}s"
-              Write-Host "[INFO] Restarting DVR with SESSION_DURATION=$env:SESSION_DURATION"
-              $dvrProcess = Start-Process -FilePath $dvrExe -ArgumentList "--no-tunnel --output-dir `"$videosDir`"" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
-              $env:SESSION_DURATION = ""
-            }
-            
-            # Restart cloudflared if it crashed
-            if ($tunnelProc -and $tunnelProc.HasExited) {
-              Write-Host "[WARNING] cloudflared exited - restarting..."
-              $cloudflaredStderr = "$repoDir\cloudflared-stderr.log"
-              if (Test-Path $cloudflaredStderr) { Remove-Item $cloudflaredStderr -Force }
-              $tunnelProc = Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel --url http://localhost:8080 --protocol http2" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardError $cloudflaredStderr -PassThru
-              # Re-read tunnel URL from stderr after restart
-              Start-Sleep -Seconds 10
-              if (Test-Path $cloudflaredStderr) {
-                $errContent = Get-Content $cloudflaredStderr -Raw -ErrorAction SilentlyContinue
-                $urlMatch = [regex]::Match($errContent, 'https://[a-z0-9\-]+\.trycloudflare\.com')
-                if ($urlMatch.Success) {
-                  $tunnelUrl = $urlMatch.Value
-                  $tunnelUrl | Set-Content -Path $tunnelUrlFile -Force
-                  Write-Host "[OK] New tunnel URL: $tunnelUrl"
-                  # URL changed on reconnect — re-report so admin panel stays current
-                  Report-TunnelUrl $tunnelUrl
-                }
-              }
-            }
-            
-            $status = if ($tunnelUrl) { " | PUBLIC: $tunnelUrl" } else { "" }
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Tailscale: $env:TAILSCALE_IP$status (Elapsed: $([Math]::Round($elapsed/60, 1))m, Remaining: $([Math]::Round($remaining/60, 1))m)"
-            
-            Start-Sleep -Seconds $sleepSecs
-          }
-          
-          # ====== WAIT FOR UPLOADS TO COMPLETE ======
-          Write-Host "Keep-alive loop ended. Waiting for DVR to finish all uploads..."
-          $waitStart = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          $maxWaitSecs = 240  # wait up to 4 minutes (leaves ~1 min buffer before 6h limit)
-          while (-not (Test-Path $uploadFlag)) {
-            $waited = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $waitStart
-            if ($waited -ge $maxWaitSecs) {
-              Write-Host ("[WARNING] Upload wait timeout ($maxWaitSecs s) - proceeding anyway. Some uploads may still be in progress.")
-              break
-            }
-            Write-Host ("[{0}] Waiting for upload-complete.flag... ({1} s elapsed)" -f (Get-Date -Format 'HH:mm:ss'), $waited)
-            Start-Sleep -Seconds 15
-          }
-          if (Test-Path $uploadFlag) {
-            Write-Host "[OK] DVR finished all upload processing. Check dvr-output.log for per-file results."
-            Remove-Item $uploadFlag -Force -ErrorAction SilentlyContinue
-          }
-
-          Write-Host "Session timeout reached - triggering next workflow run..."
-          $branch = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "main" }
-          gh workflow run secure-rdp.yml --repo $env:GITHUB_REPOSITORY --ref $branch
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Next workflow triggered"
-          } else {
-            Write-Host "[WARNING] Failed to auto-trigger. Cron schedule will handle it."
-          }
-          Write-Host "NOTE: DVR and Cloudflare tunnel will continue running via scheduled tasks"
-          exit 0
+      - name: Cleanup on Cancel
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "[CLEANUP] Killing DVR and tunnel processes..."
+          Get-Process chaturbate-dvr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:REPO_DIR\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
+          Write-Host "[CLEANUP] Done"

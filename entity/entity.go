@@ -86,7 +86,7 @@ type ChannelInfo struct {
 	RoomStatus     string // public, private, group, away, offline, hidden
 	Username       string
 	Site           string // "chaturbate" or "stripchat"
-	SiteDomain     string // domain for channel link, e.g. "https://chaturbate.com/"
+	SiteDomain     string // domain for channel link, e.g. "https://www.cb.xxx/"
 	LiveThumbURL   string // live-updating thumbnail; empty = use platform default
 	Duration       string
 	Filesize       string

@@ -98,17 +98,22 @@ if (Test-Path "videos") {
 
 # Check 5: Internet Connectivity
 Write-Host "[5/6] Checking internet connectivity..." -ForegroundColor Yellow
+$siteDomain = "https://www.cb.xxx/"
+if (Test-Path ".env") {
+    $dom = (Get-Content ".env" | Where-Object { $_ -match '^DOMAIN=' } | Select-Object -First 1)
+    if ($dom) { $siteDomain = $dom -replace '^DOMAIN=', '' }
+}
 try {
-    $chaturbateResponse = Invoke-WebRequest -Uri "https://chaturbate.com" -Method GET -TimeoutSec 10 -ErrorAction Stop
-    Write-Host "  ✅ Can reach chaturbate.com" -ForegroundColor Green
+    $chaturbateResponse = Invoke-WebRequest -Uri $siteDomain -Method GET -TimeoutSec 10 -ErrorAction Stop
+    Write-Host "  ✅ Can reach $siteDomain" -ForegroundColor Green
     
     if ($chaturbateResponse.Content -match "Just a moment") {
-        $warnings += "Chaturbate returned challenge page (need fresh cookies)"
+        $warnings += "$siteDomain returned challenge page (need fresh cookies)"
         Write-Host "  ⚠️  Challenge page detected" -ForegroundColor Yellow
     }
 } catch {
-    $issues += "Cannot reach chaturbate.com (check internet/firewall)"
-    Write-Host "  ❌ Cannot reach chaturbate.com" -ForegroundColor Red
+    $issues += "Cannot reach $siteDomain (check internet/firewall)"
+    Write-Host "  ❌ Cannot reach $siteDomain" -ForegroundColor Red
     Write-Host "     Error: $($_.Exception.Message)" -ForegroundColor Red
 }
 

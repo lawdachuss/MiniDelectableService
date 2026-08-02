@@ -155,9 +155,8 @@ if ($withoutThumbnails -gt 0) {
     Write-Host "   Solution: Check logs for 'thumbnail upload' errors" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "3. Videos were recorded before thumbnail feature was added" -ForegroundColor Gray
-    Write-Host "   Solution: Run the preview generation script to fix existing recordings:" -ForegroundColor Cyan
-    Write-Host "   Command: .\scripts\generate_previews.exe" -ForegroundColor Cyan
-    Write-Host "   (downloads videos from hosts, generates thumbnails, updates Supabase)" -ForegroundColor Gray
+    Write-Host "   Solution: Re-record or manually re-upload the affected videos; thumbnails" -ForegroundColor Cyan
+    Write-Host "   are generated automatically on the next successful upload." -ForegroundColor Cyan
     Write-Host ""
 } elseif ($totalVideos -eq 0) {
     Write-Host "💡 NO VIDEOS FOUND" -ForegroundColor Yellow

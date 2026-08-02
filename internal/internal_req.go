@@ -260,12 +260,15 @@ func SetRequestHeaders(req *http.Request) {
 	if isMediaRequest(req) {
 		ref := mediaReferer(req)
 		if ref == "" {
-			ref = "https://chaturbate.com/"
+			ref = strings.TrimRight(server.Config.Domain, "/") + "/"
+			if server.Config.Domain == "" {
+				ref = "https://www.cb.xxx/"
+			}
 		}
 		req.Header.Set("Referer", ref)
 		req.Header.Set("Origin", strings.TrimRight(ref, "/"))
 	} else {
-		// X-Requested-With helps bypass Cloudflare on chaturbate.com page fetches.
+		// X-Requested-With helps bypass Cloudflare on site page fetches.
 		// Do NOT send it to CDN media hosts (mmcdn.com) as it may cause rejection.
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 

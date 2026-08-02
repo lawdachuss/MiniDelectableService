@@ -14,8 +14,6 @@ Requires .env with SUPABASE_URL, SUPABASE_API_KEY.
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
@@ -35,23 +33,35 @@ def load_dotenv(path=".env"):
 
 
 def supabase_request(method, url, api_key, data=None):
-    body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, method=method)
-    req.add_header("apikey", api_key)
-    req.add_header("Authorization", f"Bearer {api_key}")
-    if body:
-        req.add_header("Content-Type", "application/json")
+    """Talk to Supabase via curl_cffi with a Chrome TLS fingerprint.
+
+    The Supabase instance sits behind Cloudflare, which rejects Python's
+    default urllib TLS/JA3 signature with HTTP 403 error code 1010. curl_cffi
+    impersonates a real browser handshake so the requests pass.
+    """
+    from curl_cffi import requests as cffi_requests
+
+    headers = {"apikey": api_key, "Authorization": f"Bearer {api_key}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     if method == "PATCH":
-        req.add_header("Prefer", "return=representation")
+        headers["Prefer"] = "return=representation"
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else None
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode() if e.fp else ""
-        print(f"  [WARN] Supabase {method} HTTP {e.code}: {error_body[:300]}")
-        return None
-    except (urllib.error.URLError, TimeoutError) as e:
+        resp = cffi_requests.request(
+            method,
+            url,
+            json=data,
+            headers=headers,
+            impersonate="chrome124",
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            print(f"  [WARN] Supabase {method} HTTP {resp.status_code}: {resp.text[:300]}")
+            return None
+        if not resp.text:
+            return None
+        return resp.json()
+    except Exception as e:
         print(f"  [WARN] Supabase {method} failed: {e}")
         return None
 
@@ -100,10 +110,12 @@ def try_refresh_with_curl_cffi(user_agent):
     session_cookies = {}
 
 
-    # First: visit chaturbate.com to get initial cookies
+    # First: visit the configured site domain to get initial cookies
+    # (DOMAIN from .env; defaults to https://www.cb.xxx/).
+    site_domain = os.environ.get("DOMAIN", "https://www.cb.xxx/").rstrip("/") + "/"
     try:
         resp = cffi_requests.get(
-            "https://chaturbate.com",
+            site_domain,
             impersonate=impersonate,
             timeout=60,
             headers={"User-Agent": user_agent} if user_agent else None,
