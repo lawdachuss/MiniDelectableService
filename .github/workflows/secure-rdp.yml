@@ -565,6 +565,7 @@ jobs:
           NODE_ID: ${{ secrets.NODE_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
           VIDHIDE_API_KEY: ${{ secrets.VIDHIDE_API_KEY }}

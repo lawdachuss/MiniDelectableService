@@ -92,12 +92,15 @@ function Update-NodeWebUrl {
   if ([string]::IsNullOrWhiteSpace($nodeId)) { Write-Warning "(WARN) nodeId is empty - skipping web_url update"; return }
   # Resolve Supabase credentials. Prefer the runner env (GitHub secrets),
   # then fall back to the .env file written earlier in the pipeline.
+  # The service-role key is REQUIRED for the node upsert: the anon key is
+  # RLS-blocked from writing the nodes table (HTTP 401 / 42501).
   $sbUrl = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_URL)) { $env:SUPABASE_URL.Trim() } else { $null }
-  $sbKey = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_API_KEY)) { $env:SUPABASE_API_KEY.Trim() } else { $null }
+  $sbKey = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_SERVICE_ROLE_KEY)) { $env:SUPABASE_SERVICE_ROLE_KEY.Trim() } else { $null }
   if (-not $sbUrl -or -not $sbKey) {
     $sb = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
     if ($sb) {
       if (-not $sbUrl -and ($sb -match '(?m)^SUPABASE_URL=(.+)$')) { $sbUrl = $matches[1].Trim() }
+      if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_SERVICE_ROLE_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
       if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_API_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
     }
   }
@@ -109,7 +112,8 @@ function Update-NodeWebUrl {
     $sbUrl = $null; $sbKey = $null
     if ($sb) {
       if ($sb -match '(?m)^SUPABASE_URL=(.+)$') { $sbUrl = $matches[1].Trim() }
-      if ($sb -match '(?m)^SUPABASE_API_KEY=(.+)$') { $sbKey = $matches[1].Trim() }
+      if ($sb -match '(?m)^SUPABASE_SERVICE_ROLE_KEY=(.+)$') { $sbKey = $matches[1].Trim() }
+      if (-not $sbKey -and $sb -match '(?m)^SUPABASE_API_KEY=(.+)$') { $sbKey = $matches[1].Trim() }
     }
   }
   if ([string]::IsNullOrWhiteSpace($sbUrl)) { Write-Warning "(WARN) SUPABASE_URL missing (no secret, no .env) - cannot update web_url"; return }
