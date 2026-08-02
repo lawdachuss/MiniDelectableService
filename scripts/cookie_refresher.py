@@ -243,42 +243,46 @@ def main():
     print(f"UA_EXTRACTED={user_agent}")
 
     old = parse_cookies(cookie_str)
-    print(f"  Loaded {len(old)} cookies")
+    print(f"  Loaded {len(old)} stored cookies")
     print(f"  sessionid: {'[OK]' if 'sessionid' in old else '[NO]'}")
     print(f"  csrftoken: {'[OK]' if 'csrftoken' in old else '[NO]'}")
     print(f"  cf_clearance: {'[OK]' if 'cf_clearance' in old else '[NO]'}")
     print("  Proxy: [NO] (direct connection)")
+
+    # --- CLEAR all stored cookies first, so every start fetches fresh. ---
+    # cf_clearance is IP-bound: a clearance minted for another IP (or stale)
+    # makes Cloudflare MORE suspicious. Start from a clean slate every time.
+    print("\n[1.5/3] Clearing stored cookies...")
+    clear_value = {"cookies": "", "user_agent": user_agent or ""}
+    for key in ("sessionid", "csrftoken", "cf_clearance", "__cf_bm"):
+        clear_value[key] = ""
+    save_to_supabase(rest, supabase_key, clear_value)
 
     # --- Try to refresh cookies ---
     print("\n[2/3] Refreshing cookies...")
 
     new_cookies = try_refresh_with_curl_cffi(user_agent)
 
-    # --- Merge and save ---
+    # --- Merge and save (fresh first; never resurrect stale cf_clearance) ---
     print("\n[3/3] Merging cookies...")
 
-    merged = dict(old)
-    refreshed = False
-
     if new_cookies:
-        for key in ("cf_clearance", "__cf_bm", "__cfruid", "sessionid", "csrftoken"):
-            if key in new_cookies and new_cookies[key]:
-                old_val = merged.get(key, "")
-                new_val = new_cookies[key]
-                if new_val != old_val:
-                    merged[key] = new_val
-                    refreshed = True
-
-        old_cf = old.get("cf_clearance", "")
-        new_cf = merged.get("cf_clearance", "")
-        if new_cf and new_cf != old_cf:
-            print(f"  cf_clearance refreshed: ...{new_cf[-20:]}")
-        elif new_cf:
-            print(f"  cf_clearance unchanged (still valid)")
-        else:
-            print(f"  [INFO] No new cf_clearance from curl_cffi")
+        merged = dict(new_cookies)
+        refreshed = True
+        print(f"  Fresh cookies fetched: {len(merged)}")
+        # Keep csrftoken/sessionid from old only if the fresh fetch didn't
+        # provide them (they are not IP-bound and stay valid).
+        for key in ("csrftoken", "sessionid"):
+            if key not in merged and key in old and old[key]:
+                merged[key] = old[key]
+                print(f"  Kept old {key} (fresh fetch had none)")
+        # Never keep an old cf_clearance - it is IP-bound and would block us.
+        merged.pop("cf_clearance", None)
+        print("  cf_clearance: [NO] (cleared - browser grabber will mint a fresh one)")
     else:
-        print("  [INFO] Keeping existing cookies (no new cookies obtained)")
+        merged = {}
+        refreshed = False
+        print("  [INFO] No fresh cookies obtained - storing empty (browser grabber will follow)")
 
     print(f"  Total cookies: {len(merged)}")
     print(f"  sessionid: {'[OK]' if 'sessionid' in merged else '[NO]'}")

@@ -11,9 +11,9 @@ Strategy (defeats the managed Turnstile challenge):
      printed by Cloudflare and get stuck on the challenge. The GitHub runner
      has an interactive RDP desktop, so headed works there. Falls back to
      headless only if headed cannot open a window.
-  2. Seed the browser with stored cookies EXCEPT the IP-bound Cloudflare ones
-     (cf_clearance / __cf_bm) - seeding stale ones from another IP poisons the
-     challenge. csrftoken & site cookies are safe to keep.
+  2. Start with a FULLY CLEAN browser (no stored cookies seeded - the refresher
+     clears them first). A clean slate every start avoids stale, IP-bound
+     cf_clearance cookies that raise the challenge difficulty.
   3. Navigate to the site. When the Turnstile checkbox appears, click it ONCE
      and then wait *quietly* (no spam clicks, no reloads) for Cloudflare to run
      its proof-of-work and auto-redirect to the real site with a fresh
@@ -21,7 +21,7 @@ Strategy (defeats the managed Turnstile challenge):
   4. Verify the clearance actually works: fetch a real API endpoint from
      *inside* the browser context (it carries the fresh cookies). HTTP 200
      means the Go client with the same cookies will pass too.
-  5. Merge the browser cookie set with the stored one and save to Supabase.
+  5. Save the fresh browser cookie set to Supabase (no stale merge).
 
 Best-effort: on any failure it exits non-zero and the DVR continues with the
 cookies it already has.
@@ -74,18 +74,6 @@ AGE_BUTTONS = [
 ]
 
 DEFAULT_TIMEOUT = int(os.environ.get("GRAB_TIMEOUT", "150"))  # seconds
-
-# Cloudflare cookies are IP-bound: never seed them from a previous session.
-CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfruid", "cf_chl_", "cf_")
-
-
-def is_cf_cookie(name):
-    n = name.lower()
-    for c in CF_COOKIE_NAMES:
-        if n == c or n.startswith(c):
-            return True
-    return False
-
 
 STEALTH_JS = """
 // Reduce automation fingerprints that Cloudflare's bot score uses.
@@ -291,7 +279,7 @@ def main():
             if not user_agent:
                 user_agent = val.get("user_agent", "") or ""
     old = parse_cookies(old_str)
-    print(f"  Existing cookies: {len(old)}")
+    print(f"  Existing cookies: {len(old)} (will be replaced by a fresh set)")
 
     # --- Launch browser and visit the site ---
     print("\n[2/4] Launching browser...")
@@ -309,26 +297,11 @@ def main():
             )
             ctx.add_init_script(STEALTH_JS)
 
-            # Seed ONLY non-CF cookies (csrftoken, site cookies). Never seed
-            # cf_clearance/__cf_bm - they're IP-bound and stale ones poison the
-            # challenge.
-            seedable = {k: v for k, v in old.items() if v and not is_cf_cookie(k)}
-            try:
-                ctx.add_cookies(
-                    [
-                        {
-                            "name": k,
-                            "value": v,
-                            "domain": ".cb.xxx",
-                            "path": "/",
-                            "secure": True,
-                        }
-                        for k, v in seedable.items()
-                    ]
-                )
-                print(f"  [OK] Seeded {len(seedable)} non-CF cookies (skipped {len(old) - len(seedable)} CF cookies)")
-            except Exception as e:
-                print(f"  [WARN] cookie seeding failed ({str(e)[:80]})")
+            # FULLY CLEAN start: the refresher already cleared all stored
+            # cookies in Supabase, so we seed nothing at all. Every start the
+            # browser mints a completely fresh set (csrftoken, __cf_bm, and an
+            # IP-bound cf_clearance) - stale cookies only raise the challenge
+            # difficulty.
 
             page = ctx.new_page()
             print(f"  Visiting {site_domain} ...")
@@ -371,10 +344,10 @@ def main():
             print(f"  __cf_bm: {'[OK]' if browser_cookies.get('__cf_bm') else '[NO]'}")
             print(f"  sessionid: {'[OK]' if browser_cookies.get('sessionid') else '[NO]'}")
 
-            # --- Merge: browser cookies win for the CF-critical keys ---
-            merged = dict(old)
-            merged.update(browser_cookies)
-            print(f"\n[4/4] Merged cookies: {len(merged)}")
+            # --- Merge: browser cookies ARE the fresh set. We deliberately do
+            # NOT merge old stored cookies back in (they're stale/IP-bound).
+            merged = dict(browser_cookies)
+            print(f"\n[4/4] Fresh cookie set: {len(merged)}")
 
             new_cookie_str = join_cookies(merged)
             settings_value = {
