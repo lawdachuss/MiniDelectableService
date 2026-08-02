@@ -558,6 +558,28 @@ jobs:
             Write-Host "(DNS) Supabase reachability check: HTTP $code (401/2xx = reachable, 000 = unreachable)"
           } catch { Write-Host "(DNS) Supabase reachability check threw: $($_.Exception.Message)" }
 
+      - name: Install cookie refresher deps (curl_cffi)
+        if: always()
+        continue-on-error: true
+        shell: powershell
+        run: |
+          # The DVR refreshes cookies at startup via scripts/cookie_refresher.py,
+          # which requires curl_cffi (browser TLS impersonation) for BOTH the
+          # Supabase calls and the cb.xxx refresh. GitHub-hosted runners ship
+          # Python but NOT curl_cffi - without this step the refresh silently
+          # no-ops and the DVR keeps stale cookies (-> Cloudflare block).
+          $ErrorActionPreference = 'Continue'
+          try {
+            python -m pip install --quiet --disable-pip-version-check curl_cffi
+            Write-Host "pip install exit: $LASTEXITCODE"
+            python -c "import curl_cffi; print('curl_cffi OK, version', curl_cffi.__version__)"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "python not usable - trying py -3 launcher"
+              py -3 -m pip install --quiet --disable-pip-version-check curl_cffi
+              py -3 -c "import curl_cffi; print('curl_cffi OK via py -3, version', curl_cffi.__version__)"
+            }
+          } catch { Write-Warning "curl_cffi install failed: $($_.Exception.Message)" }
+
       - name: Keep Runner Alive
         shell: pwsh
         env:
