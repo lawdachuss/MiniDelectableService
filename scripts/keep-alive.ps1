@@ -105,8 +105,20 @@ function Update-NodeWebUrl {
   if ([string]::IsNullOrWhiteSpace($sbKey)) { Write-Warning "(WARN) SUPABASE_API_KEY missing (no secret, no .env) - cannot update web_url"; return }
   if ($sbUrl -notmatch '^https?://') { $sbUrl = 'https://' + $sbUrl }
   $sbUrl = $sbUrl.TrimEnd('/')
-  $body = @{ web_url = $url } | ConvertTo-Json -Compress
-  $apiUrl = "$sbUrl/rest/v1/nodes?node_id=eq.$([uri]::EscapeDataString($nodeId))"
+  # UPSERT the node row (POST + on_conflict=node_id) so web_url lands even if the
+  # Go DVR (which only self-registers in coordinator mode) hasn't created the row
+  # yet. A PATCH on a non-existent row is a silent no-op (HTTP 200, 0 rows updated).
+  $instanceLabel = if (-not [string]::IsNullOrWhiteSpace($env:INSTANCE_LABEL)) { $env:INSTANCE_LABEL } else { $env:GITHUB_RUN_ID }
+  $payload = @{
+    node_id        = $nodeId
+    web_url        = $url
+    status         = "online"
+    hostname       = $env:COMPUTERNAME
+    instance_label = $instanceLabel
+    current_load   = 0
+  }
+  $body = $payload | ConvertTo-Json -Compress
+  $apiUrl = "$sbUrl/rest/v1/nodes?on_conflict=node_id"
   # Force TLS 1.2 (the default protocol on the runner causes
   # "The underlying connection was closed" against Supabase).
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -141,13 +153,13 @@ function Update-NodeWebUrl {
     for ($attempt = 1; $attempt -le 3; $attempt++) {
       $code = "000"
       try {
-        $curlOut = & "curl.exe" -s -o NUL -w "%{http_code}" -X PATCH $apiUrl -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" -H "Content-Type: application/json" -d $body --noproxy "*" --tlsv1.2 -m 20 2>&1
+        $curlOut = & "curl.exe" -s -o NUL -w "%{http_code}" -X POST $apiUrl -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" -H "Content-Type: application/json" -H "Prefer: resolution=merge-duplicates" -d $body --noproxy "*" --tlsv1.2 -m 20 2>&1
         $code = "$curlOut".Trim()
       } catch {
         Write-Warning "(WARN) web_url curl attempt $attempt failed: $_"
       }
       if ($code -match '^(2\d\d)$') {
-        Write-Host "(OK) Updated node $nodeId web_url via curl.exe (attempt $attempt, HTTP $code)"
+        Write-Host "(OK) Upserted node $nodeId web_url via curl.exe (attempt $attempt, HTTP $code)"
         $ok = $true; break
       }
       Write-Warning "(WARN) web_url curl attempt $attempt returned HTTP $code"
@@ -161,8 +173,8 @@ function Update-NodeWebUrl {
       $savedAllProxy = $env:ALL_PROXY
       Remove-Item Env:ALL_PROXY -ErrorAction SilentlyContinue
       Remove-Item Env:all_proxy -ErrorAction SilentlyContinue
-      Invoke-RestMethod -Uri $apiUrl -Method Patch -Body $body -ContentType "application/json" -Headers @{ "apikey" = $sbKey; "Authorization" = "Bearer $sbKey" } -TimeoutSec 25 -ErrorAction Stop | Out-Null
-      Write-Host "(OK) Updated node $nodeId web_url via Invoke-RestMethod"
+      Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/json" -Headers @{ "apikey" = $sbKey; "Authorization" = "Bearer $sbKey"; "Prefer" = "resolution=merge-duplicates" } -TimeoutSec 25 -ErrorAction Stop | Out-Null
+      Write-Host "(OK) Upserted node $nodeId web_url via Invoke-RestMethod"
       $ok = $true
     } catch {
       $errMsg = $_.Exception.Message
