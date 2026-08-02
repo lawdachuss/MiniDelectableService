@@ -308,24 +308,36 @@ def main():
     print("\n[1/4] Loading current cookies from Supabase...")
     settings = supabase_request("GET", get_url, api_key)
     old_str = ""
+    stored_val = {}
     if settings and len(settings) > 0:
-        val = settings[0].get("value", {})
-        if isinstance(val, dict):
-            old_str = val.get("cookies", "") or ""
+        stored_val = settings[0].get("value", {}) or {}
+        if isinstance(stored_val, dict):
+            old_str = stored_val.get("cookies", "") or ""
     old = parse_cookies(old_str)
     print(f"  Existing cookies: {len(old)}")
 
-    # Fast path: if a valid cf_clearance is already present in Supabase (e.g. minted
-    # by the workflow step right before DVR boot), skip launching the browser again.
+    # Fast path: skip browser solve ONLY if this specific runner already minted a
+    # fresh cf_clearance during this same workflow run.  cf_clearance is IP-bound —
+    # a token from a previous run (different runner IP) will cause 403.
     import sys
     sys.stdout.flush()
-    if "cf_clearance" in old and len(old.get("cf_clearance", "")) > 20:
-        print(f"  [OK] Valid cf_clearance already in Supabase (len {len(old['cf_clearance'])}) — skipping browser solve")
+    current_run_id = os.environ.get("GITHUB_RUN_ID", "")
+    stored_run_id = stored_val.get("github_run_id", "") if isinstance(stored_val, dict) else ""
+    cf_val = old.get("cf_clearance", "")
+    print(f"  github_run_id: current={current_run_id!r}  stored={stored_run_id!r}")
+    print(f"  cf_clearance: {'len ' + str(len(cf_val)) if cf_val else '[NO]'}")
+    sys.stdout.flush()
+
+    if cf_val and len(cf_val) > 20 and current_run_id and current_run_id == stored_run_id:
+        print(f"  [OK] cf_clearance from THIS run (run_id={current_run_id}) — skipping browser solve")
         print(f"  sessionid: {'[OK]' if 'sessionid' in old else '[NO]'}")
         print(f"  csrftoken: {'[OK]' if 'csrftoken' in old else '[NO]'}")
         sys.stdout.flush()
         return 0
-    print(f"  [INFO] No valid cf_clearance in Supabase (cf_clearance len={len(old.get('cf_clearance',''))}) — launching browser")
+    if cf_val and len(cf_val) > 20 and stored_run_id != current_run_id:
+        print(f"  [INFO] cf_clearance is from a DIFFERENT run (stored={stored_run_id!r}) — must mint fresh one for this runner's IP")
+    elif not cf_val or len(cf_val) <= 20:
+        print(f"  [INFO] No valid cf_clearance found — launching browser")
     sys.stdout.flush()
 
     # CRITICAL: the DVR presents these cookies over httpcloak's
@@ -416,6 +428,10 @@ def main():
             for key in ("sessionid", "csrftoken", "cf_clearance", "__cf_bm"):
                 if key in merged and merged[key]:
                     settings_value[key] = merged[key]
+            # Tag with run_id so the fast-path can confirm this cf_clearance was
+            # minted during THIS workflow run (i.e. by THIS runner's IP).
+            if current_run_id:
+                settings_value["github_run_id"] = current_run_id
 
             ok = save_to_supabase(rest, api_key, settings_value)
             if ok:

@@ -281,7 +281,26 @@ if ($tunnelUrl -and $myNodeId) {
   $lastTunnelUrl = $tunnelUrl
   # FIX: Show-Url bypasses GitHub's hyphen-split secret masking (*** in logs)
   Write-Host "(OK) Tunnel URL: $(Show-Url $tunnelUrl)"; $null = [System.Console]::Out.Flush()
+  # Write real (unmasked) URL to Step Summary — clickable markdown link
   Write-TunnelSummary $tunnelUrl
+  # Also emit as a GitHub Actions ::notice annotation (appears in the Annotations tab)
+  # and write to GITHUB_OUTPUT so it's accessible from other steps/jobs.
+  if ($env:GITHUB_OUTPUT) {
+    "tunnel_url=$tunnelUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+  }
+  if ($env:GITHUB_STEP_SUMMARY) {
+    # Extra prominent banner at the very top of the step summary
+    $bannerLines = @(
+      "# 🌐 Tunnel / Dashboard",
+      "",
+      "> **Click the link below to open the DVR web UI:**",
+      "",
+      "## [$tunnelUrl]($tunnelUrl)",
+      "",
+      "_Runner: ``$env:GITHUB_RUN_ID`` | Updated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')_"
+    )
+    ($bannerLines -join "`n") | Set-Content $env:GITHUB_STEP_SUMMARY -Encoding utf8
+  }
   $sb = { param($u) $enc = [uri]::EscapeDataString($u); try { $r = Invoke-RestMethod -Uri "https://tinyurl.com/api-create.php?url=$enc" -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; try { $r = Invoke-RestMethod -Uri ('https://is.gd/create.php?format=simple&url=' + $enc) -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; return $null }
   $shortUrlJob = Start-Job -ScriptBlock $sb -ArgumentList $tunnelUrl
   Update-NodeWebUrl $myNodeId "$tunnelUrl"

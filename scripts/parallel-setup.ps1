@@ -233,18 +233,60 @@ $tsConnectJob = Start-Job -Name tsc -ArgumentList $tailscaleIpFile, $tsDiagFile,
     $ip | Set-Content $ipFile -Force
   } else {
     diag "WARNING: no IPv4 after 45s (WinTun driver likely missing) — restarting tailscaled daemon with --tun=userspace-networking..."
+    # Kill ALL existing tailscale daemon instances, then start fresh userspace one.
     Stop-Service Tailscale -Force -ErrorAction SilentlyContinue
     Get-Process tailscaled -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    $stateDir = "$env:ProgramData\Tailscale"
+    Start-Sleep -Seconds 3  # let SCM fully release the named pipe
+
+    # Use a SEPARATE state file so the userspace daemon doesn't conflict with
+    # the Windows service state.
+    $stateDir = "$env:TEMP\TailscaleUS"
     New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
     $stateFile = Join-Path $stateDir "server-state.conf"
-    $p = Start-Process -FilePath $tsd -ArgumentList "--state=`"$stateFile`" --tun=userspace-networking" -WindowStyle Hidden -PassThru -RedirectStandardError "$env:TEMP\_tsd_err" -RedirectStandardOutput "$env:TEMP\_tsd_out"
+    $p = Start-Process -FilePath $tsd `
+      -ArgumentList "--state=`"$stateFile`" --tun=userspace-networking --no-logs-to-stderr" `
+      -WindowStyle Hidden -PassThru `
+      -RedirectStandardError "$env:TEMP\_tsd_err" `
+      -RedirectStandardOutput "$env:TEMP\_tsd_out"
     diag "userspace tailscaled launched pid=$($p.Id)"
-    Start-Sleep -Seconds 5
+
+    # Poll until the new daemon responds to 'tailscale status' (up to 30s)
+    $daemonReady = $false
+    for ($j = 0; $j -lt 15; $j++) {
+      Start-Sleep -Seconds 2
+      if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
+        diag "WARN: userspace tailscaled (pid $($p.Id)) already exited; stderr: $((Get-Content `"$env:TEMP\_tsd_err`" -Tail 3 -ErrorAction SilentlyContinue) -join ' | ')"
+        break
+      }
+      $st2 = (& $ts status 2>&1) -join ' '
+      if ($LASTEXITCODE -ne 255 -or ($st2 -match "Logged out|NeedsLogin|Running|NoState|starting")) {
+        diag "userspace daemon responsive (exit $LASTEXITCODE, attempt $j): $($st2.Substring(0,[Math]::Min(80,$st2.Length)))"
+        $daemonReady = $true
+        break
+      }
+    }
+    if (-not $daemonReady) {
+      diag "WARN: userspace daemon did not respond in 30s — proceeding anyway"
+    }
+
+    # Now call tailscale up against the userspace daemon
     $upOutUS = (& $ts @upArgs 2>&1) -join ' '
-    diag "userspace ts up exit: $LASTEXITCODE  output: $upOutUS"
-    $deadline2 = (Get-Date).AddSeconds(60)
+    $upEcUS = $LASTEXITCODE
+    diag "userspace ts up exit: $upEcUS  output: $upOutUS"
+
+    # If up returned 0 but state is still NoState, retry once after 10s
+    if ($upEcUS -eq 0) {
+      Start-Sleep -Seconds 10
+      $st3 = (& $ts status 2>&1) -join ' '
+      if ($st3 -match "NoState|starting") {
+        diag "State still NoState — retrying ts up..."
+        $upOutUS2 = (& $ts @upArgs 2>&1) -join ' '
+        diag "ts up retry exit: $LASTEXITCODE  output: $upOutUS2"
+      }
+    }
+
+    # Wait up to 120s for IP (userspace tunnel takes longer to negotiate)
+    $deadline2 = (Get-Date).AddSeconds(120)
     while ((Get-Date) -lt $deadline2) {
       $ip = Get-TsIP
       if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
@@ -254,7 +296,7 @@ $tsConnectJob = Start-Job -Name tsc -ArgumentList $tailscaleIpFile, $tsDiagFile,
       diag "IP obtained via userspace-networking: $ip"
       $ip | Set-Content $ipFile -Force
     } else {
-      diag "FAIL: no IPv4 after userspace-networking fallback; ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
+      diag "FAIL: no IPv4 after userspace-networking fallback; ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim().Substring(0,[Math]::Min(200,($(&$ts status 2>&1)|Out-String).Trim().Length)))'"
     }
   }
 }
