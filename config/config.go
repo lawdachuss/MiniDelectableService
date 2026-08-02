@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"time"
@@ -255,14 +256,18 @@ func New(c *cli.Context) (*entity.Config, error) {
 		SetFFmpegPath(path)
 	}
 
-	sessionDuration := c.String("session-duration")
+	sessionDuration := strings.TrimSpace(c.String("session-duration"))
 	if sessionDuration == "" {
 		sessionDuration = "5h20m0s"
 	}
 	if sessionDuration != "0" {
 		parsed, err := time.ParseDuration(sessionDuration)
 		if err != nil {
-			return nil, fmt.Errorf("parse session-duration %q: %w", sessionDuration, err)
+			// A bad SESSION_DURATION (e.g. trailing newline in a GitHub secret)
+			// must never kill the recorder. Warn and fall back to the default.
+			fmt.Printf("⚠️  Invalid session-duration %q: %v — using default 5h20m0s\n", sessionDuration, err)
+			sessionDuration = "5h20m0s"
+			parsed, _ = time.ParseDuration(sessionDuration)
 		}
 		cfg.SessionDuration = sessionDuration
 		cfg.SessionDurationParsed = parsed

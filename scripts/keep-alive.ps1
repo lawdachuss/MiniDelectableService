@@ -54,7 +54,12 @@ if (Test-Path $cloudflaredPath) {
 if ($dvrPid -ne "?") { Write-Host "(OK) DVR PID: $dvrPid" }
 for ($i = 0; $i -lt 60; $i++) {
   if (-not $dvr) { break }
-  if ($dvr.HasExited) { Write-Host "(ERROR) DVR exited (code: $($dvr.ExitCode))"; Get-Content $dvrLog -Tail 10; break }
+  if ($dvr.HasExited) {
+    Write-Host "(ERROR) DVR exited (code: $($dvr.ExitCode))"
+    Write-Host "--- DVR stdout tail ---"; Get-Content $dvrLog -Tail 15 -ErrorAction SilentlyContinue
+    Write-Host "--- DVR stderr tail ---"; Get-Content "$repoDir\dvr-err.log" -Tail 15 -ErrorAction SilentlyContinue
+    break
+  }
   if (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue) { break }
   Start-Sleep -Seconds 3
 }
@@ -98,6 +103,8 @@ function Update-NodeWebUrl {
   }
   if ([string]::IsNullOrWhiteSpace($sbUrl)) { Write-Warning "(WARN) SUPABASE_URL missing (no secret, no .env) - cannot update web_url"; return }
   if ([string]::IsNullOrWhiteSpace($sbKey)) { Write-Warning "(WARN) SUPABASE_API_KEY missing (no secret, no .env) - cannot update web_url"; return }
+  if ($sbUrl -notmatch '^https?://') { $sbUrl = 'https://' + $sbUrl }
+  $sbUrl = $sbUrl.TrimEnd('/')
   $body = @{ web_url = $url } | ConvertTo-Json -Compress
   $apiUrl = "$sbUrl/rest/v1/nodes?node_id=eq.$([uri]::EscapeDataString($nodeId))"
   # Force TLS 1.2 (the default protocol on the runner causes
