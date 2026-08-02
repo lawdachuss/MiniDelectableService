@@ -1,7 +1,6 @@
 package channel
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,16 +21,19 @@ import (
 // Proof of real processing: the pipeline must land in History (a live worker
 // ran it), NOT merely be absent from the queue (which the stopped-recovery
 // branch also satisfies — that would be a false positive).
+//
+// Hermetic by design: the pipelines are fed paths that do not exist on disk,
+// so the upload stage fails immediately with "file not found" instead of
+// making a real network call to the configured hosts (GoFile is always
+// available and its API can be slow or rate-limited from CI/datacenter IPs,
+// which used to hang this test for minutes). A fast failure still lands the
+// pipeline in History, which is what proves the worker ran.
 func TestPipelineQueueRestartableAfterStop(t *testing.T) {
 	oldConfig := server.Config
 	defer func() { server.Config = oldConfig }()
 	server.Config = &entity.Config{}
 
 	dir := t.TempDir()
-	path := filepath.Join(dir, "alice_2025-01-01_12-00-00.mp4")
-	if err := os.WriteFile(path, []byte("video"), 0o666); err != nil {
-		t.Fatalf("write: %v", err)
-	}
 
 	ch := &Channel{
 		Config:   &entity.ChannelConfig{Username: "alice"},
@@ -41,15 +43,11 @@ func TestPipelineQueueRestartableAfterStop(t *testing.T) {
 	pq := NewPipelineQueue(ch)
 
 	// First lifecycle: enqueue, let it run, then stop.
-	pq.EnqueueFile(path)
+	pq.EnqueueFile(filepath.Join(dir, "alice_2025-01-01_12-00-00.mp4"))
 	pq.Stop()
 
 	// Second lifecycle: the same queue must relaunch its worker and process.
-	path2 := filepath.Join(dir, "alice_2025-01-02_13-00-00.mp4")
-	if err := os.WriteFile(path2, []byte("video2"), 0o666); err != nil {
-		t.Fatalf("write2: %v", err)
-	}
-	pq.EnqueueFile(path2)
+	pq.EnqueueFile(filepath.Join(dir, "alice_2025-01-02_13-00-00.mp4"))
 
 	// A relaunched worker will run the pipeline to completion/failure and push
 	// it into History.  Poll History for the second filename.

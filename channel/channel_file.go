@@ -15,8 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/teacat/chaturbate-dvr/chaturbate"
 	"github.com/teacat/chaturbate-dvr/config"
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
@@ -53,293 +55,491 @@ const (
 	CloseQueue                    // close files only, defer processing to ProcessPending (session stop)
 )
 
-// NextFile prepares the next file to be created, by cleaning up the last file and generating a new one
-func (ch *Channel) NextFile() error {
-	if err := ch.Cleanup(CloseProcess); err != nil {
+// NextFile prepares the next file to be created, by cleaning up the last file
+// and generating a new one. ext is the file extension to use (e.g. ".ts" or ".mp4").
+func (ch *Channel) NextFile(ext string) error {
+	ch.fileMu.Lock()
+	defer ch.fileMu.Unlock()
+
+	if err := ch.cleanupLocked(); err != nil {
 		return err
 	}
-	filename, err := ch.GenerateFilename()
+	filename, err := ch.generateFilenameLocked()
 	if err != nil {
 		return err
 	}
-	ch.stateMu.Lock()
-	ch.CurrentFilename = filename
-	ch.videoSegmentCount = 0
-	ch.audioSegmentCount = 0
-	ch.stateMu.Unlock()
-
-	if err := ch.CreateNewFile(filename); err != nil {
+	if err := ch.createNewFileLocked(filename, ext); err != nil {
 		return err
 	}
 
-	// Increment the sequence number for the next file
+	// Increment the sequence number for the next file.
 	ch.Sequence++
 	return nil
 }
 
-// Cleanup closes any open recording files.
-// CloseProcess: also mux/compress/upload pending files asynchronously (rotation, pause, stream error).
-// CloseQueue:   only close and queue files; caller must call ProcessPending() later (session stop).
+// Cleanup closes any open recording files and queues them for post-processing.
+// CloseProcess also starts processing the queue immediately (rotation, pause,
+// stream error); CloseQueue defers processing to ProcessPending (session stop).
 func (ch *Channel) Cleanup(mode CloseMode) error {
-	ch.cleanupMu.Lock()
-	defer ch.cleanupMu.Unlock()
-
-	if ch.File == nil && ch.AudioFile == nil && len(ch.pendingFiles) == 0 {
-		return nil
+	ch.fileMu.Lock()
+	err := ch.cleanupLocked()
+	ch.fileMu.Unlock()
+	if err != nil {
+		return err
 	}
 
-	// Close any open files and add them to the pending queue (or remove empty ones).
-	// Errors from closeTrackedFile are logged but not returned — aborting
-	// would strand ALL previously queued pendingFiles permanently.
-	if ch.File != nil || ch.AudioFile != nil {
-		videoPath, _, err := closeTrackedFile(ch.File)
-		if err != nil {
-			ch.Error("cleanup: video file close: %s", err.Error())
-		}
-		audioPath, _, err := closeTrackedFile(ch.AudioFile)
-		if err != nil {
-			ch.Error("cleanup: audio file close: %s", err.Error())
-		}
-
-		ch.stateMu.Lock()
-		ch.File = nil
-		ch.AudioFile = nil
-		ch.CurrentFilename = ""
-		ch.Filesize = 0
-		ch.Duration = 0
-		hasVideo := ch.videoSegmentCount > 0
-		hasAudio := ch.audioSegmentCount > 0
-		ch.stateMu.Unlock()
-
-		// Remove files that contain only init segments with no media data.
-		if ch.HasSeparateAudio && !hasVideo && !hasAudio {
-			if videoPath != "" {
-				os.Remove(videoPath)
-			}
-			if audioPath != "" {
-				os.Remove(audioPath)
-			}
-		} else if !ch.HasSeparateAudio && !hasVideo {
-			if videoPath != "" {
-				os.Remove(videoPath)
-			}
-			if mode == CloseQueue && len(ch.pendingFiles) > 10 {
-				ch.Warn("cleanup: %d pending files accumulated during rotation — will be processed when recording ends", len(ch.pendingFiles))
-			}
-		} else {
-			ch.stateMu.Lock()
-			hasSeparateAudio := ch.HasSeparateAudio
-			ch.stateMu.Unlock()
-			ch.pendingFiles = append(ch.pendingFiles, pendingFile{
-				videoPath:        videoPath,
-				audioPath:        audioPath,
-				hasSeparateAudio: hasSeparateAudio,
-				skipMinDuration:  ch.Config.IsPaused.Load(),
-			})
-			if videoPath != "" {
-				ch.Info("cleanup: queued %s for post-processing (%d pending)", filepath.Base(videoPath), len(ch.pendingFiles))
-			} else if audioPath != "" {
-				ch.Info("cleanup: queued %s for post-processing (%d pending)", filepath.Base(audioPath), len(ch.pendingFiles))
-			}
-		}
-	}
-
-	if mode == CloseProcess && len(ch.pendingFiles) > 0 {
-		files := ch.pendingFiles
-		ch.pendingFiles = nil
-		ch.pendingWg.Add(1)
-		go func() {
-			defer ch.pendingWg.Done()
-			for _, pf := range files {
-				ch.processPendingFile(pf)
-			}
-		}()
+	if mode == CloseProcess {
+		ch.flushPending()
 	}
 	return nil
 }
 
-// processPendingQueue processes all pending files: mux A/V if needed, move to
-// output dir, generate previews, upload, save metadata, and delete local files.
-// Must be called with cleanupMu held.
+// flushPending starts async post-processing of all currently queued pending files.
+func (ch *Channel) flushPending() {
+	ch.cleanupMu.Lock()
+	files := ch.pendingFiles
+	ch.pendingFiles = nil
+	ch.cleanupMu.Unlock()
+
+	if len(files) == 0 {
+		return
+	}
+	ch.Info("cleanup: processing %d pending file(s)", len(files))
+	ch.pendingWg.Add(1)
+	go func() {
+		defer ch.pendingWg.Done()
+		for _, pf := range files {
+			ch.processPendingFile(pf)
+		}
+	}()
+}
+
+// processPendingQueue processes all pending files synchronously.
+// Caller must hold cleanupMu (see ProcessPending in channel.go).
 func (ch *Channel) processPendingQueue() {
 	if len(ch.pendingFiles) == 0 {
 		return
 	}
 	ch.Info("cleanup: processing %d pending file(s)", len(ch.pendingFiles))
-
-	for _, pf := range ch.pendingFiles {
+	files := ch.pendingFiles
+	ch.pendingFiles = nil
+	for _, pf := range files {
 		ch.processPendingFile(pf)
 	}
-	ch.pendingFiles = nil
 }
 
+// processPendingFile finalizes a closed recording (seek index or ffmpeg),
+// optionally relocates it to the completed dir, and routes it through the
+// output pipeline (preview → upload → metadata → cleanup).
 func (ch *Channel) processPendingFile(pf pendingFile) {
 	videoPath := pf.videoPath
-	audioPath := pf.audioPath
-
-	if pf.hasSeparateAudio {
-		ch.processPendingMuxPair(videoPath, audioPath, pf.skipMinDuration)
+	if _, err := os.Stat(videoPath); err != nil {
 		return
 	}
 
-	// Single-stream file — move to output dir (triggers preview + upload).
-	if _, err := os.Stat(videoPath); err == nil {
-		if ch.Config.Compress {
-			if !pf.skipMinDuration && ch.handleMinDurationAndMerge(videoPath) {
-				return // video was deferred to pending or merged+uploaded
-			}
-			ch.CompressFile(videoPath)
-			return
-		} else if !pf.skipMinDuration && ch.handleMinDurationAndMerge(videoPath) {
-			return // video was deferred to pending or merged+uploaded
+	// goondvr-style finalization: BuildSeekIndex or ffmpeg remux/transcode.
+	finalPath, err := ch.finalizeRecordingFile(videoPath)
+	if err != nil {
+		ch.Error("finalize %s: %s — keeping original recording", filepath.Base(videoPath), err.Error())
+		finalPath = videoPath
+	} else if finalPath != videoPath {
+		// The finalizer produced a new file (e.g. .ts -> .mp4); drop the original.
+		if rmErr := os.Remove(videoPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			ch.Error("remove original after finalization `%s`: %s", filepath.Base(videoPath), rmErr.Error())
+		}
+	}
+
+	if _, err := os.Stat(finalPath); err != nil {
+		return
+	}
+
+	// If no output dir is configured, recordings can be relocated to the
+	// completed dir (goondvr semantics) before the pipeline runs in place.
+	if server.Config.OutputDir == "" && server.Config.CompletedDir != "" {
+		if dst, err := moveRecordingToDir(finalPath, recordingDirFromPattern(ch.Config.Pattern), server.Config.CompletedDir); err != nil {
+			ch.Error("move completed recording `%s`: %s", finalPath, err.Error())
 		} else {
-			// Normalize fMP4 timestamps: Stripchat's LL-HLS segments carry
-			// absolute server timestamps (e.g. start at 5044s), making the
-			// file appear hours long.  A fast ffmpeg stream-copy remux resets
-			// the timeline.
-			normalized, _ := normalizeFMP4Timestamps(videoPath)
-			ch.MoveToOutputDir(normalized)
+			finalPath = dst
 		}
 	}
-}
-
-func (ch *Channel) processPendingMuxPair(videoPath, audioPath string, skipMinDuration bool) {
-	videoInfo, _ := os.Stat(videoPath)
-	audioInfo, _ := os.Stat(audioPath)
-
-	switch {
-	case videoInfo == nil && audioInfo == nil:
-		return
-	case videoInfo == nil:
-		if muxedFileFromSidecar(audioPath) != "" {
-			ch.Info("mux: stale audio sidecar %s (muxed version exists) — removing", filepath.Base(audioPath))
-			os.Remove(audioPath)
-			return
-		}
-		ch.Info("mux: video track missing; preserving audio-only file %s", filepath.Base(audioPath))
-		if !skipMinDuration && ch.handleMinDurationAndMerge(audioPath) {
-			return
-		}
-		if ch.Config.Compress {
-			ch.CompressFile(audioPath)
-		} else {
-			ch.MoveToOutputDir(audioPath)
-		}
-		return
-	case audioInfo == nil:
-		if muxedFileFromSidecar(videoPath) != "" {
-			ch.Info("mux: stale video sidecar %s (muxed version exists) — removing", filepath.Base(videoPath))
-			os.Remove(videoPath)
-			return
-		}
-		ch.Info("mux: audio track missing; preserving video-only file %s", filepath.Base(videoPath))
-		if !skipMinDuration && ch.handleMinDurationAndMerge(videoPath) {
-			return
-		}
-		if ch.Config.Compress {
-			ch.CompressFile(videoPath)
-		} else {
-			ch.MoveToOutputDir(videoPath)
-		}
-		return
-	}
-
-	// Both tracks exist — mux them together.
-	finalOutput := strings.TrimSuffix(videoPath, filepath.Ext(videoPath)) + ".muxed.mp4"
-	if err := ch.MuxAV(videoPath, audioPath, finalOutput); err != nil {
-		ch.Info("mux: ffmpeg mux failed, trying native fallback: %s", err.Error())
-		if nativeErr := ch.MuxAVNative(videoPath, audioPath, finalOutput); nativeErr != nil {
-			ch.Error("mux failed for %s: %v — uploading tracks separately", filepath.Base(videoPath), nativeErr)
-			_ = os.Remove(finalOutput)
-			ch.MoveToOutputDir(videoPath)
-			ch.MoveToOutputDir(audioPath)
-			return
-		}
-	}
-
-	if ok, reason := muxOutputLooksValid(finalOutput, videoInfo, audioInfo); !ok {
-		ch.Error("mux: output looks corrupt (%s); uploading sidecars %s and %s separately", reason, filepath.Base(videoPath), filepath.Base(audioPath))
-		_ = os.Remove(finalOutput)
-		ch.MoveToOutputDir(videoPath)
-		ch.MoveToOutputDir(audioPath)
-		return
-	}
-
-	_ = os.Remove(videoPath)
-	_ = os.Remove(audioPath)
-	ch.Info("delete: removed sidecar %s", filepath.Base(videoPath))
-	ch.Info("delete: removed sidecar %s", filepath.Base(audioPath))
 
 	if ch.Config.Compress {
-		if !skipMinDuration && ch.handleMinDurationAndMerge(finalOutput) {
-			return // video was deferred to pending or merged+uploaded
+		if !pf.skipMinDuration && ch.handleMinDurationAndMerge(finalPath) {
+			return
 		}
-		ch.CompressFile(finalOutput)
-	} else if !skipMinDuration && ch.handleMinDurationAndMerge(finalOutput) {
-		return // video was deferred to pending or merged+uploaded
+		ch.CompressFile(finalPath)
+	} else if !pf.skipMinDuration && ch.handleMinDurationAndMerge(finalPath) {
+		return
 	} else {
-		// The muxed output was created with -copyts, which preserves the
-		// original fMP4 absolute timestamps (e.g. PTS=5044s).  Normalize
-		// so the file plays correctly from the start.
-		normalizeFMP4Timestamps(finalOutput)
-		ch.MoveToOutputDir(finalOutput)
+		ch.MoveToOutputDir(finalPath)
 	}
+
+	// Refresh the disk-usage counter after finalization changes file sizes.
+	go ch.ScanTotalDiskUsage()
 }
 
-// muxOutputLooksValid returns true if the muxed MP4 exists and contains data.
-// With `-c copy -shortest` the output is intentionally truncated to the shorter
-// track's duration, so we cannot compare file sizes against the input sum.
-// Trust ffmpeg's exit code — if it returned 0 the file is valid.
-func muxOutputLooksValid(outputPath string, _ /*videoInfo*/, _ /*audioInfo*/ os.FileInfo) (bool, string) {
-	finalInfo, err := os.Stat(outputPath)
-	if err != nil {
-		return false, fmt.Sprintf("stat: %s", err.Error())
-	}
-	if finalInfo.Size() == 0 {
-		return false, "empty output"
-	}
-	return true, ""
-}
-
-// muxedFileFromSidecar checks if a .video.muxed.mp4 file exists for the
-// given sidecar path (.video.mp4 or .audio.mp4).  Returns the muxed path if
-// it exists, or "" otherwise.
-func muxedFileFromSidecar(sidecarPath string) string {
-	base := sidecarPath
-	// Strip .video.mp4 or .audio.mp4 suffix.
-	for _, suf := range []string{".video.mp4", ".audio.mp4"} {
-		if strings.HasSuffix(base, suf) {
-			muxedPath := strings.TrimSuffix(base, suf) + ".video.muxed.mp4"
-			if _, err := os.Stat(muxedPath); err == nil {
-				return muxedPath
+// finalizeRecordingFile post-processes a closed recording according to the
+// configured FinalizeMode:
+//   - "none":      only build the in-place seek index for fMP4 files
+//   - "remux":     ffmpeg stream-copy remux (+faststart)
+//   - "transcode": ffmpeg re-encode with the configured encoder/quality
+func (ch *Channel) finalizeRecordingFile(filename string) (string, error) {
+	if server.Config.FinalizeMode == "none" {
+		if strings.HasSuffix(filename, ".mp4") {
+			if err := chaturbate.BuildSeekIndex(filename); err != nil {
+				ch.Error("seek index %s: %v", filename, err)
 			}
-			return ""
+		}
+		return filename, nil
+	}
+	return ch.runFFmpegFinalizer(filename)
+}
+
+// cleanupLocked closes the active recording file, removes empty files, and
+// queues non-empty files for post-processing. Callers must hold fileMu.
+func (ch *Channel) cleanupLocked() error {
+	if ch.File == nil {
+		return nil
+	}
+	filename := ch.File.Name()
+
+	defer func() {
+		ch.Filesize = 0
+		ch.Duration = 0
+	}()
+
+	// Sync the file to ensure data is written to disk.
+	if err := ch.File.Sync(); err != nil && !errors.Is(err, os.ErrClosed) {
+		return fmt.Errorf("sync file: %w", err)
+	}
+	if err := ch.File.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		return fmt.Errorf("close file: %w", err)
+	}
+	ch.File = nil
+	ch.CurrentFilename = ""
+
+	// Delete the empty file.
+	fileInfo, err := os.Stat(filename)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat file delete zero file: %w", err)
+	}
+	if fileInfo != nil && fileInfo.Size() == 0 {
+		if err := os.Remove(filename); err != nil {
+			return fmt.Errorf("remove zero file: %w", err)
+		}
+		go ch.ScanTotalDiskUsage()
+	} else if fileInfo != nil {
+		ch.cleanupMu.Lock()
+		ch.pendingFiles = append(ch.pendingFiles, pendingFile{
+			videoPath:       filename,
+			skipMinDuration: ch.Config.IsPaused.Load(),
+		})
+		ch.cleanupMu.Unlock()
+		ch.Info("cleanup: queued %s for post-processing", filepath.Base(filename))
+	}
+
+	return nil
+}
+
+// GenerateFilename creates a filename based on the configured pattern and the current timestamp.
+func (ch *Channel) GenerateFilename() (string, error) {
+	ch.fileMu.RLock()
+	defer ch.fileMu.RUnlock()
+
+	return ch.generateFilenameLocked()
+}
+
+func (ch *Channel) generateFilenameLocked() (string, error) {
+	var buf bytes.Buffer
+
+	// Parse the filename pattern defined in the channel's config.
+	tpl, err := template.New("filename").Parse(ch.Config.Pattern)
+	if err != nil {
+		return "", fmt.Errorf("filename pattern error: %w", err)
+	}
+
+	// Get the current time based on the Unix timestamp when the stream was started.
+	t := time.Unix(ch.StreamedAt, 0)
+	pattern := &Pattern{
+		Username: ch.Config.Username,
+		Sequence: ch.Sequence,
+		Year:     t.Format("2006"),
+		Month:    t.Format("01"),
+		Day:      t.Format("02"),
+		Hour:     t.Format("15"),
+		Minute:   t.Format("04"),
+		Second:   t.Format("05"),
+	}
+
+	if err := tpl.Execute(&buf, pattern); err != nil {
+		return "", fmt.Errorf("template execution error: %w", err)
+	}
+	return buf.String(), nil
+}
+
+// CreateNewFile creates a new file for the channel using the given filename and extension.
+func (ch *Channel) CreateNewFile(filename, ext string) error {
+	ch.fileMu.Lock()
+	defer ch.fileMu.Unlock()
+
+	return ch.createNewFileLocked(filename, ext)
+}
+
+func (ch *Channel) createNewFileLocked(filename, ext string) error {
+	// Ensure the directory exists before creating the file.
+	if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
+		return fmt.Errorf("mkdir all: %w", err)
+	}
+
+	// Open the file in append mode, create it if it doesn't exist.
+	file, err := os.OpenFile(filename+ext, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0777)
+	if err != nil {
+		return fmt.Errorf("cannot open file: %s: %w", filename, err)
+	}
+
+	ch.File = file
+	ch.CurrentFilename = filename
+	return nil
+}
+
+// recordingDirFromPattern extracts the base directory from a filename pattern
+// like "videos/{{.Username}}_..._..." → "videos".
+func recordingDirFromPattern(pattern string) string {
+	idx := strings.Index(pattern, "{{")
+	if idx == -1 {
+		return "."
+	}
+	dir := filepath.Dir(pattern[:idx])
+	if dir == "" || dir == "." {
+		return "."
+	}
+	return dir
+}
+
+func finalOutputExt(filename string) string {
+	if server.Config.FFmpegContainer == "mkv" {
+		return ".mkv"
+	}
+	if server.Config.FinalizeMode == "none" {
+		return filepath.Ext(filename)
+	}
+	return ".mp4"
+}
+
+func finalOutputPath(filename string) string {
+	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	return base + finalOutputExt(filename)
+}
+
+// ScanTotalDiskUsage calculates the total bytes of all recordings for this
+// channel by walking the recording directory for files whose name starts with
+// the username. The result is stored in TotalDiskUsageBytes.
+func (ch *Channel) ScanTotalDiskUsage() {
+	recordingDir := filepath.Clean(recordingDirFromPattern(ch.Config.Pattern))
+	prefix := ch.Config.Username
+	var total int64
+	_ = filepath.WalkDir(recordingDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(filepath.Base(path), prefix) {
+			if info, err2 := d.Info(); err2 == nil {
+				total += info.Size()
+			}
+		}
+		return nil
+	})
+	ch.fileMu.Lock()
+	ch.TotalDiskUsageBytes = total
+	ch.fileMu.Unlock()
+}
+
+// ShouldSwitchFile determines whether a new file should be created.
+func (ch *Channel) ShouldSwitchFile() bool {
+	ch.fileMu.RLock()
+	defer ch.fileMu.RUnlock()
+
+	return ch.shouldSwitchFileLocked()
+}
+
+func (ch *Channel) shouldSwitchFileLocked() bool {
+	maxFilesizeBytes := ch.Config.MaxFilesize * 1024 * 1024
+	maxDurationSeconds := ch.Config.MaxDuration * 60
+
+	return (ch.Duration >= float64(maxDurationSeconds) && ch.Config.MaxDuration > 0) ||
+		(ch.Filesize >= maxFilesizeBytes && ch.Config.MaxFilesize > 0)
+}
+
+// isMP4InitSegment reports whether b looks like an fMP4 init segment containing
+// top-level ftyp/moov boxes and no media fragments yet.
+func isMP4InitSegment(b []byte) bool {
+	var hasFtyp bool
+	var hasMoov bool
+
+	for pos := 0; pos+8 <= len(b); {
+		size := int(uint32(b[pos])<<24 | uint32(b[pos+1])<<16 | uint32(b[pos+2])<<8 | uint32(b[pos+3]))
+		if size < 8 || pos+size > len(b) {
+			return false
+		}
+
+		switch string(b[pos+4 : pos+8]) {
+		case "ftyp":
+			hasFtyp = true
+		case "moov":
+			hasMoov = true
+		case "moof", "mdat", "mfra":
+			return false
+		}
+		pos += size
+	}
+
+	return hasFtyp && hasMoov
+}
+
+func moveRecordingToDir(src, recordingRoot, completedDir string) (string, error) {
+	dstDir := completedDir
+
+	srcDir := filepath.Dir(src)
+	cleanRoot := filepath.Clean(recordingRoot)
+	cleanSrcDir := filepath.Clean(srcDir)
+	if relDir, err := filepath.Rel(cleanRoot, cleanSrcDir); err == nil && relDir != ".." && !strings.HasPrefix(relDir, ".."+string(os.PathSeparator)) {
+		if relDir != "." {
+			dstDir = filepath.Join(completedDir, relDir)
 		}
 	}
-	return ""
+
+	if err := os.MkdirAll(dstDir, 0777); err != nil {
+		return "", fmt.Errorf("mkdir completed dir: %w", err)
+	}
+
+	dst := filepath.Join(dstDir, filepath.Base(src))
+	if src == dst {
+		return dst, nil
+	}
+
+	if err := os.Rename(src, dst); err == nil {
+		return dst, nil
+	} else if !isCrossDeviceRename(err) {
+		return "", fmt.Errorf("rename completed file: %w", err)
+	}
+
+	if err := copyFile(src, dst); err != nil {
+		return "", err
+	}
+	if err := os.Remove(src); err != nil {
+		return "", fmt.Errorf("remove source after copy: %w", err)
+	}
+	return dst, nil
 }
 
-// videoExt returns true if the extension is a known video extension.
-func videoExt(name string) bool {
-	ext := strings.ToLower(filepath.Ext(name))
-	return ext == ".mp4" || ext == ".mkv"
+func isCrossDeviceRename(err error) bool {
+	linkErr := &os.LinkError{}
+	return errors.As(err, &linkErr) && errors.Is(linkErr.Err, syscall.EXDEV)
 }
 
-// isSidecar returns true if the filename appears to be a sidecar/preview file.
-// Note: .video.muxed.mp4 is the final muxed output (not a sidecar), while
-// .video.mp4 and .audio.mp4 are raw A/V track files (sidecars).
-func isSidecar(name string) bool {
-	return strings.HasSuffix(name, ".thumb.webp") ||
-		strings.HasSuffix(name, ".thumb.jpg") ||
-		strings.HasSuffix(name, ".sprite.webp") ||
-		strings.HasSuffix(name, ".sprite.jpg") ||
-		strings.HasSuffix(name, ".preview.webp") ||
-		strings.HasSuffix(name, ".preview.mp4") ||
-		strings.HasSuffix(name, ".thumb") ||
-		strings.HasSuffix(name, ".sprite") ||
-		strings.HasSuffix(name, ".video.mp4") ||
-		strings.HasSuffix(name, ".audio.mp4")
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open source file: %w", err)
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source file: %w", err)
+	}
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+	if err != nil {
+		return fmt.Errorf("create destination file: %w", err)
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("copy file: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("sync destination file: %w", err)
+	}
+	return nil
 }
+
+func (ch *Channel) runFFmpegFinalizer(filename string) (string, error) {
+	outExt := finalOutputExt(filename)
+	finalPath := finalOutputPath(filename)
+	tempOutput := strings.TrimSuffix(filename, filepath.Ext(filename)) + ".finalizing" + outExt
+	_ = os.Remove(tempOutput)
+
+	args := []string{"-nostdin", "-y", "-i", filename}
+	switch server.Config.FinalizeMode {
+	case "remux":
+		args = append(args, "-c", "copy")
+		if outExt == ".mp4" {
+			args = append(args, "-movflags", "+faststart")
+		}
+	case "transcode":
+		encoder := strings.TrimSpace(server.Config.FFmpegEncoder)
+		if encoder == "" {
+			encoder = "libx264"
+		}
+		args = append(args, "-c:v", encoder)
+		args = append(args, qualityArgsForEncoder(encoder, server.Config.FFmpegQuality)...)
+		if preset := strings.TrimSpace(server.Config.FFmpegPreset); preset != "" {
+			args = append(args, "-preset", preset)
+		}
+		args = append(args, "-c:a", "copy")
+		if outExt == ".mp4" {
+			args = append(args, "-movflags", "+faststart")
+		}
+	default:
+		return "", fmt.Errorf("unsupported finalization mode %q", server.Config.FinalizeMode)
+	}
+	args = append(args, tempOutput)
+
+	ch.Info("running ffmpeg %s for `%s`", server.Config.FinalizeMode, filepath.Base(filename))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	config.AcquireFFmpegHeavy()
+	defer config.ReleaseFFmpegHeavy()
+
+	outputBytes, err := config.FFmpegCommandContext(ctx, args...).CombinedOutput()
+	if err != nil {
+		_ = os.Remove(tempOutput)
+		msg := strings.TrimSpace(string(outputBytes))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("%s", msg)
+	}
+	if finalPath == filename {
+		if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+			_ = os.Remove(tempOutput)
+			return "", fmt.Errorf("remove original before replace: %w", err)
+		}
+	}
+	if err := os.Rename(tempOutput, finalPath); err != nil {
+		_ = os.Remove(tempOutput)
+		return "", fmt.Errorf("rename finalized output: %w", err)
+	}
+	return finalPath, nil
+}
+
+func qualityArgsForEncoder(encoder string, quality int) []string {
+	if quality <= 0 {
+		quality = 23
+	}
+	lower := strings.ToLower(strings.TrimSpace(encoder))
+	switch {
+	case strings.Contains(lower, "nvenc"):
+		return []string{"-cq", fmt.Sprintf("%d", quality)}
+	case strings.Contains(lower, "qsv"), strings.Contains(lower, "vaapi"), strings.Contains(lower, "amf"):
+		return []string{"-global_quality", fmt.Sprintf("%d", quality)}
+	default:
+		return []string{"-crf", fmt.Sprintf("%d", quality)}
+	}
+}
+
+// ─── Output pipeline (MoveToOutputDir → thumbnail → upload → metadata → cleanup) ───
 
 // MoveToOutputDir relocates a finalized recording into server.Config.OutputDir.
 // Errors are non-fatal: the recording is already safely written at srcPath.
@@ -493,125 +693,9 @@ func moveFile(src, dest string) error {
 	return fmt.Errorf("could not remove source after copy: %w", os.Remove(src))
 }
 
-// GenerateFilename creates a filename based on the configured pattern and the current timestamp
-func (ch *Channel) GenerateFilename() (string, error) {
-	var buf bytes.Buffer
+// ─── Min-duration pending segments ─────────────────────────────────────────
 
-	// Parse the filename pattern defined in the channel's config
-	tpl, err := template.New("filename").Parse(ch.Config.Pattern)
-	if err != nil {
-		return "", fmt.Errorf("filename pattern error: %w", err)
-	}
-
-	// Get the current time based on the Unix timestamp when the stream was started
-	t := time.Unix(ch.StreamedAt, 0)
-	pattern := &Pattern{
-		Username: ch.Config.Username,
-		Sequence: ch.Sequence,
-		Year:     t.Format("2006"),
-		Month:    t.Format("01"),
-		Day:      t.Format("02"),
-		Hour:     t.Format("15"),
-		Minute:   t.Format("04"),
-		Second:   t.Format("05"),
-	}
-
-	if err := tpl.Execute(&buf, pattern); err != nil {
-		return "", fmt.Errorf("template execution error: %w", err)
-	}
-	return buf.String(), nil
-}
-
-// CreateNewFile creates a new file for the channel using the given filename
-func (ch *Channel) CreateNewFile(filename string) error {
-	// Ensure the directory exists before creating the file
-	if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
-		return fmt.Errorf("mkdir all: %w", err)
-	}
-
-	videoPath := ch.videoPath(filename)
-	file, err := os.OpenFile(videoPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0777)
-	if err != nil {
-		return fmt.Errorf("cannot open file: %s: %w", filename, err)
-	}
-	ch.File = file
-
-	if len(ch.InitSegment) > 0 {
-		n, err := ch.File.Write(ch.InitSegment)
-		if err != nil {
-			ch.File.Close()
-			ch.File = nil
-			return fmt.Errorf("write init segment: %w", err)
-		}
-		ch.stateMu.Lock()
-		ch.Filesize += n
-		ch.stateMu.Unlock()
-	}
-
-	if ch.HasSeparateAudio {
-		audioPath := ch.audioPath(filename)
-		audioFile, err := os.OpenFile(audioPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0777)
-		if err != nil {
-			_ = ch.File.Close()
-			ch.File = nil
-			return fmt.Errorf("cannot open audio file: %s: %w", filename, err)
-		}
-		ch.AudioFile = audioFile
-
-		if len(ch.AudioInitSegment) > 0 {
-			if _, err := ch.AudioFile.Write(ch.AudioInitSegment); err != nil {
-				_ = ch.File.Close()
-				_ = ch.AudioFile.Close()
-				ch.File = nil
-				ch.AudioFile = nil
-				return fmt.Errorf("write audio init segment: %w", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (ch *Channel) videoPath(filename string) string {
-	if ch.HasSeparateAudio {
-		return filename + ".video.mp4"
-	}
-	return filename + ".mp4"
-}
-
-func (ch *Channel) audioPath(filename string) string {
-	return filename + ".audio.mp4"
-}
-
-func closeTrackedFile(file *os.File) (string, os.FileInfo, error) {
-	if file == nil {
-		return "", nil, nil
-	}
-
-	filename := file.Name()
-	if err := file.Sync(); err != nil && !errors.Is(err, os.ErrClosed) {
-		file.Close()
-		return filename, nil, fmt.Errorf("sync file: %w", err)
-	}
-	if err := file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-		return filename, nil, fmt.Errorf("close file: %w", err)
-	}
-
-	fileInfo, err := os.Stat(filename)
-	if err != nil && !os.IsNotExist(err) {
-		return filename, nil, fmt.Errorf("stat file: %w", err)
-	}
-	if fileInfo != nil && fileInfo.Size() == 0 {
-		if err := os.Remove(filename); err != nil {
-			return filename, nil, fmt.Errorf("remove zero file: %w", err)
-		}
-		fileInfo = nil
-	}
-
-	return filename, fileInfo, nil
-}
-
-// maybeDeferToPending checks whether min-duration is enabled and, if so,
+// MaybeDeferToPending checks whether min-duration is enabled and, if so,
 // whether filePath is short enough to be deferred.  When the file should be
 // deferred (or on probe failure — we'd rather be safe) it is moved into
 // .pending/<user>/ and the function returns true so callers skip upload.
@@ -898,6 +982,7 @@ func removeFileWithRetry(path string) error {
 }
 
 // muxVideoAudio combines a separate video and audio file into a single MP4.
+// Used only for recovering legacy split A/V sidecars from previous versions.
 // Uses a 5-minute timeout so a hung ffmpeg cannot leak the caller's goroutine.
 func muxVideoAudio(videoPath, audioPath, outputPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -910,43 +995,6 @@ func muxVideoAudio(videoPath, audioPath, outputPath string) error {
 		outputPath,
 	)
 	return cmd.Run()
-}
-
-// normalizeFMP4Timestamps remuxes an fMP4 recording to reset the timeline.
-// Stripchat's LL-HLS segments carry absolute server timestamps (e.g. start at
-// 5044s), which makes the file appear hours long.  A fast stream-copy remux
-// with -movflags +faststart normalises the timestamps and moves the moov atom
-// to the front for immediate playback.  The original file is replaced.
-func normalizeFMP4Timestamps(videoPath string) (string, error) {
-	tmpPath := videoPath + ".normalized.mp4"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	config.AcquireFFmpeg()
-	defer config.ReleaseFFmpeg()
-
-	// Use -fflags +genpts to regenerate PTS from DTS, and -fflags +igndts
-	// so any lingering broken decode timestamps from LL-HLS fragments do not
-	// cascade into the output PTS.  Combined with -c copy this is a fast remux
-	// that gives every player clean, zero-based timestamps.
-	err := config.FFmpegCommandContext(ctx,
-		"-y",
-		"-fflags", "+genpts+igndts",
-		"-i", videoPath,
-		"-c", "copy",
-		"-fflags", "+genpts",
-		"-movflags", "+faststart",
-		tmpPath,
-	).Run()
-	if err != nil {
-		os.Remove(tmpPath)
-		return videoPath, err
-	}
-	if err := os.Rename(tmpPath, videoPath); err != nil {
-		os.Remove(tmpPath)
-		return videoPath, err
-	}
-	return videoPath, nil
 }
 
 // dateSeparatorRe matches the "_YYYY-MM-DD_" / "_YYYY-MM-DD-" timestamp separator
@@ -1825,16 +1873,24 @@ func processAllPendingSegments() {
 	}
 }
 
-// ShouldSwitchFile determines whether a new file should be created.
-func (ch *Channel) ShouldSwitchFile() bool {
-	maxFilesizeBytes := ch.Config.MaxFilesize * 1024 * 1024
-	maxDurationSeconds := ch.Config.MaxDuration * 60
+// videoExt returns true if the extension is a known video extension.
+func videoExt(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".mp4" || ext == ".mkv"
+}
 
-	ch.stateMu.Lock()
-	dur := ch.Duration
-	fsize := ch.Filesize
-	ch.stateMu.Unlock()
-
-	return (dur >= float64(maxDurationSeconds) && ch.Config.MaxDuration > 0) ||
-		(fsize >= maxFilesizeBytes && ch.Config.MaxFilesize > 0)
+// isSidecar returns true if the filename appears to be a sidecar/preview file.
+// Note: .video.muxed.mp4 is the final muxed output (not a sidecar), while
+// .video.mp4 and .audio.mp4 are raw A/V track files (sidecars).
+func isSidecar(name string) bool {
+	return strings.HasSuffix(name, ".thumb.webp") ||
+		strings.HasSuffix(name, ".thumb.jpg") ||
+		strings.HasSuffix(name, ".sprite.webp") ||
+		strings.HasSuffix(name, ".sprite.jpg") ||
+		strings.HasSuffix(name, ".preview.webp") ||
+		strings.HasSuffix(name, ".preview.mp4") ||
+		strings.HasSuffix(name, ".thumb") ||
+		strings.HasSuffix(name, ".sprite") ||
+		strings.HasSuffix(name, ".video.mp4") ||
+		strings.HasSuffix(name, ".audio.mp4")
 }

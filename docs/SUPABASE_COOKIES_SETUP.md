@@ -231,7 +231,7 @@ COOKIES="your_cookies"
 2. **Keep .env as fallback** - In case Supabase is down
 3. **Rotate cookies regularly** - Especially `cf_clearance` and `__cf_bm`
 4. **Monitor logs** - Watch for cookie expiration warnings
-5. **Use fresh cookies** - Get from browser through proxy if using VPN
+5. **Use fresh cookies** - Get them from a browser using the same IP/VPN the DVR runs on
 
 ## Security Notes
 

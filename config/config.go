@@ -213,9 +213,6 @@ func New(c *cli.Context) (*entity.Config, error) {
 		Cookies:                 c.String("cookies"),
 		UserAgent:               c.String("user-agent"),
 		Domain:                  c.String("domain"),
-		ProxyURL:                c.String("proxy-url"),
-		ProxyUsername:           c.String("proxy-username"),
-		ProxyPassword:           c.String("proxy-password"),
 		OutputDir:               c.String("output-dir"),
 		PerModelFolder:          c.Bool("per-model-folder"),
 		DeleteLocalAfterUpload:  c.Bool("delete-local-after-upload"),
@@ -234,6 +231,22 @@ func New(c *cli.Context) (*entity.Config, error) {
 		SupabaseURL:    c.String("supabase-url"),
 		SupabaseAPIKey: c.String("supabase-api-key"),
 		StripchatPDKey: c.String("stripchat-pdkey"),
+
+		CompletedDir:       c.String("completed-dir"),
+		FinalizeMode:       entity.NormalizeFinalizeMode(c.String("finalize-mode")),
+		FFmpegEncoder:      c.String("ffmpeg-encoder"),
+		FFmpegContainer:    c.String("ffmpeg-container"),
+		FFmpegQuality:      c.Int("ffmpeg-quality"),
+		FFmpegPreset:       c.String("ffmpeg-preset"),
+		Debug:              c.Bool("debug"),
+		NtfyURL:            c.String("ntfy-url"),
+		NtfyTopic:          c.String("ntfy-topic"),
+		NtfyToken:          c.String("ntfy-token"),
+		DiscordWebhookURL:  c.String("discord-webhook-url"),
+		CFChannelThreshold: c.Int("cf-channel-threshold"),
+		CFGlobalThreshold:  c.Int("cf-global-threshold"),
+		NotifyCooldownHours: c.Int("notify-cooldown-hours"),
+		NotifyStreamOnline: c.Bool("notify-stream-online"),
 	}
 
 	// If user provided a custom ffmpeg path, set it globally

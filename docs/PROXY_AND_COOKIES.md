@@ -21,7 +21,7 @@
 This error occurs when:
 1. **Cookies expired** - Cloudflare cookies expire quickly (minutes to hours)
 2. **Geo-restrictions** - Some models restrict certain regions
-3. **IP/Cookie mismatch** - Cookies from one region, requests from another (proxy/VPN)
+3. **IP/Cookie mismatch** - Cookies collected from one IP/region, requests made from another
 
 ## Why Some Channels Work and Others Don't
 
@@ -55,23 +55,6 @@ WHERE key = 'dvr_settings';
 ```
 
 4. **Restart the app** to reload
-
-### Option 3: Configure Proxy (If Using Region Change)
-
-If using a proxy/VPN to change regions:
-
-1. **Add to .env**:
-```env
-PROXY_URL="http://proxy.example.com:8080"
-PROXY_USERNAME="your_username"  # Optional
-PROXY_PASSWORD="your_password"  # Optional
-```
-
-2. **Get fresh cookies THROUGH the proxy**:
-   - Connect to proxy/VPN first
-   - Open browser → visit chaturbate.com → log in
-   - Get cookies (F12 → Application → Cookies)
-   - Update via Web UI or Supabase
 
 ## How to Get Fresh Cookies
 
@@ -121,7 +104,7 @@ SUPABASE_API_KEY="your-api-key"
 
 ### Some channels work, others don't:
 → **Geo-restrictions vary per model**
-→ Try different proxy region or contact model about restrictions
+→ Check the model's region restrictions or contact them
 
 ### Cookies expire frequently:
 → **Cloudflare's `__cf_bm` expires every 30 minutes**

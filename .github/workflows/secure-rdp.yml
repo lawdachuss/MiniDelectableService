@@ -70,163 +70,6 @@ jobs:
             Write-Host "Timing check passed. No overlapping active runs found."
           }
 
-      - name: Connect Netherlands Proxy (SOCKS5)
-        shell: powershell
-        run: |
-          function log {
-            param($m)
-            Write-Host $m
-            [System.Console]::Out.Flush()
-          }
-
-          function Fetch-Proxies($url) {
-            try {
-              $raw = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -ErrorAction Stop
-              $list = @()
-              foreach ($line in ($raw -split "`n")) {
-                $line = $line.Trim()
-                if ($line -ne "" -and $line -notmatch '^#') {
-                  if ($line -match '^socks5://') { $list += $line }
-                  elseif ($line -match '^(\d+\.\d+\.\d+\.\d+):(\d+)$') { $list += "socks5://$line" }
-                }
-              }
-              return $list
-            } catch { return @() }
-          }
-
-          function Test-Proxy($proxyUrl) {
-            try {
-              $ip = curl.exe -x $proxyUrl -s -m 8 https://api.ipify.org 2>$null
-              if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { return $ip.Trim() }
-            } catch {}
-            return $null
-          }
-
-          log "=== Fetching live SOCKS5 proxies ==="
-          $allProxies = @()
-
-          # Source 1: ProxyScrape API - Netherlands SOCKS5
-          log "Fetching NL proxies from ProxyScrape API..."
-          $allProxies += Fetch-Proxies "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&format=text&protocol=socks5&country=nl"
-          log "  Got $($allProxies.Count) NL proxies from API"
-
-          # Source 2: jsDelivr CDN mirror of ProxyScrape - Netherlands SOCKS5
-          log "Fetching NL proxies from CDN mirror..."
-          $allProxies += Fetch-Proxies "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/nl/socks5/data.txt"
-          log "  Total: $($allProxies.Count) NL proxies"
-
-          # Source 3: ProxyScrape API - India SOCKS5 (fallback region)
-          log "Fetching IN proxies from ProxyScrape API..."
-          $allProxies += Fetch-Proxies "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&format=text&protocol=socks5&country=in"
-          log "  Total: $($allProxies.Count) proxies (NL + IN)"
-
-          # Source 4: All regions SOCKS5 from CDN mirror (broad fallback)
-          log "Fetching all-region proxies from CDN mirror..."
-          $allProxies += Fetch-Proxies "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/socks5/data.txt"
-          
-          # Remove duplicates
-          $allProxies = $allProxies | Select-Object -Unique
-          log "Total unique proxies to test: $($allProxies.Count)"
-
-          if ($allProxies.Count -eq 0) {
-            log "WARNING: No proxies fetched from APIs. Using emergency fallback list."
-            $allProxies = @(
-              "socks5://5.255.117.250:1080",
-              "socks5://185.233.184.165:1080",
-              "socks5://5.255.113.177:1080",
-              "socks5://103.139.106.174:1080",
-              "socks5://103.139.106.200:1080",
-              "socks5://103.139.107.14:1080"
-            )
-          }
-
-          $selected = $null
-          $selectedIp = $null
-          $fallbackProxy = $null
-          $fallbackIp = $null
-          $tested = 0
-          $lastLogAt = 0
-
-          log ""
-          log "=== Testing proxies (prefer NL/IN, accept any as last resort) ==="
-          foreach ($p in $allProxies) {
-            $tested++
-            if ($tested -ge $lastLogAt + 100) {
-              log "  Tested $tested/$($allProxies.Count) proxies..."
-              $lastLogAt = $tested
-            }
-            $ip = Test-Proxy $p
-            if (-not $ip) { continue }
-
-            try {
-              $locRaw = curl.exe -x $p -s -m 8 https://ipinfo.io/json 2>$null
-              if ($locRaw) {
-                $loc = $locRaw | ConvertFrom-Json -ErrorAction Stop
-                $country = $loc.country
-                if ($country -eq "NL" -or $country -eq "IN") {
-                  $selected = $p
-                  $selectedIp = $ip
-                  log ""
-                  log "WORKING: $p"
-                  log "   IP: $ip / Country: $country ($($loc.org))"
-                  break
-                }
-              }
-            } catch {}
-            if (-not $fallbackProxy) {
-              $fallbackProxy = $p
-              $fallbackIp = $ip
-              log "  Fallback candidate: $p (IP: $ip) - will use if no NL/IN found"
-            }
-          }
-
-          if (-not $selected -and $fallbackProxy) {
-            $selected = $fallbackProxy
-            $selectedIp = $fallbackIp
-            log ""
-            log "No NL/IN proxy found - using fallback: $selected (IP: $selectedIp)"
-          }
-
-          if (-not $selected) {
-            Write-Error "No working SOCKS5 proxy found after testing all sources."
-            log ""
-            log "TROUBLESHOOTING:"
-            log "1. GitHub Actions runners are in US/VA - Chaturbate requires NL or IN IP"
-            log "2. The ProxyScrape free proxy list may be empty or all proxies are dead"
-            log "3. To fix this permanently, set up a PROXY_URL secret with working SOCKS5 proxies"
-            log "   e.g., PROXY_URLS=socks5://user:pass@your-proxy.com:1080"
-            log ""
-            log "Workaround: Use a free proxy provider like Webshare (10 free proxies)"
-            log "Sign up at https://www.webshare.io/ and add your proxies to GitHub secrets"
-            exit 1
-          }
-
-          $regionLabel = ""
-          try {
-            $loc = curl.exe -x $selected -s -m 8 https://ipinfo.io/json 2>$null | ConvertFrom-Json
-            $regionLabel = " / $($loc.country) - $($loc.org)"
-          } catch {}
-
-          echo "ALL_PROXY=$selected" >> $env:GITHUB_ENV
-          echo "all_proxy=$selected" >> $env:GITHUB_ENV
-          echo "SOCKS_PROXY=$selected" >> $env:GITHUB_ENV
-
-          & git config --global http.proxy $selected
-          & git config --global https.proxy $selected
-          log "[OK] Git configured to use $selected$regionLabel"
-          log "[OK] Proxy configured for Git operations"
-
-          log "Verifying proxy egress..."
-          try {
-            $ip = curl.exe -x $selected -s -m 10 https://api.ipify.org 2>$null
-            $LASTEXITCODE = 0
-            $loc = curl.exe -x $selected -s -m 10 https://ipinfo.io/json 2>$null | ConvertFrom-Json
-            $LASTEXITCODE = 0
-            log "Public IP: $ip / $($loc.country) - $($loc.org)"
-          } catch { log "Verification failed: $_" }
-          $LASTEXITCODE = 0
-          log "[OK] SOCKS5 proxy configured."
-
       - name: Configure Windows RDP
         shell: powershell
         run: |
@@ -338,13 +181,9 @@ jobs:
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
           Write-Host "[OK] Tailscale IP: $ip"
 
-      - name: Verify Proxy + Tailscale
+      - name: Verify Tailscale
         shell: powershell
         run: |
-          Write-Host "=== PROXY SETTINGS ==="
-          Write-Host "ALL_PROXY=$env:ALL_PROXY"
-          Write-Host "GIT proxy: $(git config --global http.proxy)"
-          Write-Host ""
           Write-Host "=== TAILSCALE ==="
           if ($env:TAILSCALE_IP) { Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue | Select-Object ComputerName, TcpTestSucceeded }
 
@@ -388,86 +227,8 @@ jobs:
             Write-Host "[OK] Wrote .env for cookie refresher"
           }
           $skipRefresh = $false
-          # Install PySocks so pip can handle ALL_PROXY=socks5:// natively
-          Write-Host "Installing PySocks (needed for pip SOCKS5 support)..."
-          $pysocksWheel = "$env:TEMP\PySocks-1.7.1-py3-none-any.whl"
-          curl.exe --noproxy "*" -sSfL --max-time 30 -o $pysocksWheel "https://files.pythonhosted.org/packages/8d/59/b4572118e098ac8e46e399a1dd0f2d85403ce8bbaad9ec79373ed6badaf9/PySocks-1.7.1-py3-none-any.whl"
-          if ($LASTEXITCODE -eq 0 -and (Test-Path $pysocksWheel)) {
-            pip install --disable-pip-version-check $pysocksWheel
-            Write-Host "[OK] PySocks installed"
-          } else {
-            Write-Warning "PySocks download failed - pip may have SOCKS issues"
-          }
-          # ALL_PROXY stays set - but exclude PyPI from proxy (unreliable over SOCKS5)
           Write-Host "Installing curl_cffi for cookie refresh (lightweight, no browser needed)..."
-          $env:NO_PROXY = "pypi.org,files.pythonhosted.org,*.pythonhosted.org"
-          $env:no_proxy = "pypi.org,files.pythonhosted.org,*.pythonhosted.org"
           pip install --default-timeout=60 curl_cffi
-          Remove-Item Env:NO_PROXY -ErrorAction SilentlyContinue
-          Remove-Item Env:no_proxy -ErrorAction SilentlyContinue
-          if ($LASTEXITCODE -ne 0) { Write-Warning "curl_cffi install failed, skipping cookie refresh"; $skipRefresh = $true }
-          if (-not $skipRefresh) {
-            Write-Host "Running cookie refresher..."
-            Set-Location $repoDir
-            $refresherLog = "$repoDir\cookie-refresher.log"
-            $refresherErr = "$repoDir\cookie-refresher-err.log"
-            python scripts/cookie_refresher.py 1>$refresherLog 2>$refresherErr
-            $refresherOutput = Get-Content $refresherLog -ErrorAction SilentlyContinue
-            $refresherErrors = Get-Content $refresherErr -ErrorAction SilentlyContinue
-            $refresherOutput | ForEach-Object { Write-Host $_ }
-            if ($refresherErrors) {
-              Write-Host "--- STDERR ---"
-              $refresherErrors | ForEach-Object { Write-Host $_ }
-            }
-            $uaLine = $refresherOutput | Where-Object { $_ -match '^UA_EXTRACTED=(.+)' }
-            if ($uaLine -and $uaLine -match '^UA_EXTRACTED=(.+)') {
-              $ua = $matches[1]
-              Write-Host "[OK] Extracted User-Agent: $ua"
-              $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-              echo "USER_AGENT=$ua" >> $env:GITHUB_ENV
-            }
-            Write-Host "[OK] Cookie refresh step completed"
-          }
-
-      - name: Write .env + install deps + create scheduled tasks
-        shell: powershell
-        env:
-          MINI_ENV: ${{ secrets.env }}
-        run: |
-          $repoDir = "D:\repos\MiniDelectableService"
-          if (-not (Test-Path $repoDir)) { Write-Error "Repo not found"; exit 1 }
-
-          if ([string]::IsNullOrWhiteSpace($env:MINI_ENV)) {
-            Write-Warning "Secret 'env' is empty - skipping .env file"
-          } else {
-            # Write .env to repo directory
-            [System.IO.File]::WriteAllText("$repoDir\.env", $env:MINI_ENV, (New-Object System.Text.UTF8Encoding($false)))
-            Write-Host "[OK] Wrote .env file to $repoDir\.env"
-            
-            # Verify .env was written
-            if (Test-Path "$repoDir\.env") {
-              $envSize = (Get-Item "$repoDir\.env").Length
-              Write-Host "[OK] Verified .env exists ($envSize bytes)"
-            } else {
-              Write-Error ".env file was not created"
-              exit 1
-            }
-          }
-
-          Set-Location $repoDir
-
-          # Run setup.bat - exclude PyPI from proxy so pip can download deps
-          $env:NO_PROXY = "pypi.org,files.pythonhosted.org,*.pythonhosted.org"
-          $env:no_proxy = "pypi.org,files.pythonhosted.org,*.pythonhosted.org"
-          if (Test-Path ".\setup.bat") {
-            Write-Host "=== Running setup.bat with -NoAppStart ==="
-            cmd /c ".\setup.bat -NoAppStart"
-            if ($LASTEXITCODE -ne 0) { Write-Error "setup.bat failed"; exit 1 }
-            Write-Host "[OK] setup.bat completed"
-          }
-          Remove-Item Env:NO_PROXY -ErrorAction SilentlyContinue
-          Remove-Item Env:no_proxy -ErrorAction SilentlyContinue
-
           # Step 2: Verify binary exists
           $dvrExe = "$repoDir\chaturbate-dvr.exe"
           if (-not (Test-Path $dvrExe)) { Write-Error "Binary not found: $dvrExe"; exit 1 }
@@ -490,53 +251,31 @@ jobs:
           # Remove existing task if present
           Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
           
-          # CRITICAL: Create wrapper script that sets proxy environment variables
-          # Scheduled tasks don't inherit environment variables, so we need a wrapper
-          $wrapperScript = "$repoDir\start-dvr-with-proxy.ps1"
-          $proxyUrl = $env:ALL_PROXY
-          
-          # Wrapper script will be created below with logging support
-          
+          # Create a wrapper script so the scheduled task can set env vars
+          # (scheduled tasks don't inherit environment variables)
+          $wrapperScript = "$repoDir\start-dvr.ps1"
+
           # Use PowerShell method (cleaner than schtasks with complex paths/arguments)
           # CRITICAL: Set WorkingDirectory to ensure .env is found
           Write-Host "DVR will run from working directory: $repoDir"
           Write-Host "DVR will save videos to: $videosDir"
           Write-Host ".env file location: $repoDir\.env"
-          Write-Host "DVR proxy: $proxyUrl"
-          
+
           # Add output redirection to wrapper script for debugging
           $wrapperLines = @(
-            "# DVR Wrapper Script - Sets proxy environment variables before starting DVR",
+            "# DVR Wrapper Script",
             "`$logFile = `"$repoDir\dvr-wrapper.log`"",
             "Start-Transcript -Path `$logFile -Append",
             "",
-            "`$env:ALL_PROXY = `"$proxyUrl`"",
-            "`$env:all_proxy = `"$proxyUrl`"",
-            "# NOTE: Do NOT set HTTP_PROXY/HTTPS_PROXY to a SOCKS5 URL!",
-            "# Go's http.DefaultTransport uses these for outgoing requests",
-            "# and expects an HTTP proxy, not SOCKS5. The DVR uses PROXY_URL",
-            "# (via httpcloak) which handles SOCKS5 natively.",
-            "`$env:SOCKS_PROXY = `"$proxyUrl`"",
-            "`$env:PROXY_URL = `"$proxyUrl`"",
-            "`$env:PROXY_SERVER = `"$proxyUrl`"",
             "# Pooled mode env vars (distributed shards)",
             "`$env:CHANNEL_POOL_MODE = `"${{ secrets.CHANNEL_POOL_MODE }}`"",
             "`$env:NODE_ID = `"${{ secrets.NODE_ID }}`"",
             "`$env:USER_AGENT = `"$env:USER_AGENT`"",
-            "# Disable HTTP_PROXY/HTTPS_PROXY for Go's default transport",
-            "# to prevent Go from trying to use SOCKS5 as HTTP proxy.",
-            "# Go's http.DefaultTransport reads these env vars and would",
-            "# break on socks5:// URLs (expects http/https proxy).",
-            "Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue",
-            "Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue",
-            "Remove-Item Env:http_proxy -ErrorAction SilentlyContinue",
-            "Remove-Item Env:https_proxy -ErrorAction SilentlyContinue",
             "",
-            "Write-Host `"[DVR Wrapper] Starting chaturbate-dvr.exe with Netherlands proxy`"",
-            "Write-Host `"[DVR Wrapper] Proxy: $proxyUrl`"",
+            "Write-Host `"[DVR Wrapper] Starting chaturbate-dvr.exe`"",
             "Write-Host `"[DVR Wrapper] Working Directory: $repoDir`"",
             "Write-Host `"[DVR Wrapper] Videos Directory: $videosDir`"",
-            "Write-Host `"[DVR Wrapper] Time: `$(Get-Date)`"",
+            "Write-Host `"[DVR Wrapper] Time: `$(Get-Date)`""
             "",
             "Set-Location `"$repoDir`"",
             "",
@@ -550,7 +289,7 @@ jobs:
             "Write-Host `"[DVR Wrapper] Starting DVR binary...`"",
             "Stop-Transcript",
             "",
-            "# Start DVR process with proxy environment",
+            "# Start DVR process",
             "# Redirect stdout/stderr to a log file so we can debug crashes",
             "`$dvrLog = `"$repoDir\dvr-output.log`"",
             "& `"$dvrExe`" --no-tunnel --output-dir `"$videosDir`" *>&1 | Tee-Object -FilePath `"$dvrLog`" -Append"
@@ -567,7 +306,7 @@ jobs:
           $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Hours 0)
           
           Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-          Write-Host "[OK] DVR scheduled task created (with proxy wrapper)"
+          Write-Host "[OK] DVR scheduled task created"
           
           # Verify task was created
           $taskExists = schtasks /Query /TN $taskName 2>&1
@@ -577,7 +316,7 @@ jobs:
             Write-Warning "Task may not have been created successfully"
           }
           
-          Write-Host "[OK] DVR scheduled task created (with proxy wrapper)"
+          Write-Host "[OK] DVR scheduled task created"
           Write-Host "=== Setting up Cloudflare tunnel ==="
           
           # Download cloudflared to repo directory
@@ -630,16 +369,6 @@ jobs:
               "`$tunnelUrlFile = `"$tunnelUrlFile`"",
               "`$cloudflared = `"$cloudflaredPath`"",
               "`$repoDir = `"$repoDir`"",
-              "",
-              "# Set proxy for cloudflared edge connection (HTTP_PROXY works with cloudflared)",
-              "`$env:HTTP_PROXY = `"http://127.0.0.1:8888`"",
-              "`$env:HTTPS_PROXY = `"http://127.0.0.1:8888`"",
-              "# Fallback: try SOCKS5 directly if HTTP proxy is not available",
-              "if (-not (Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue)) {",
-              "    Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue",
-              "    Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue",
-              "    Write-Host `"[Tunnel Wrapper] No HTTP proxy on 8888, connecting directly`"",
-              "}",
               "",
               "while (`$true) {",
               "    Write-Host `"[Tunnel Wrapper] Starting cloudflared tunnel at `$(Get-Date)`"",
@@ -712,96 +441,6 @@ jobs:
             Write-Host "[OK] Cloudflared tunnel scheduled task created (for reboot persistence)"
           }
 
-      - name: Configure Proxy for DVR and Browsers
-        shell: powershell
-        run: |
-          # Use socks-to-http-proxy (simpler than 3proxy)
-          $proxyUrl = $env:ALL_PROXY
-          
-          if ($proxyUrl -match 'socks5://([^:]+):(\d+)') {
-            $proxyHost = $matches[1]
-            $proxyPort = $matches[2]
-            
-            Write-Host "=== Setting up Proxy ==="
-            Write-Host "Netherlands SOCKS5: $proxyHost`:$proxyPort"
-            Write-Host ""
-            
-            $s2hExe = "C:\proxy\socks-to-http-proxy.exe"
-            $alreadyRunning = Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue
-            
-            if (-not $alreadyRunning) {
-              # Download socks-to-http-proxy (single executable, no configuration needed)
-              Write-Host "Downloading socks-to-http-proxy..."
-              $s2hUrl = "https://github.com/KaranGauswami/socks-to-http-proxy/releases/download/v0.5.0/sthp-windows.exe"
-              
-              try {
-                New-Item -ItemType Directory -Force -Path "C:\proxy" | Out-Null
-                Invoke-WebRequest -Uri $s2hUrl -OutFile $s2hExe -UseBasicParsing -TimeoutSec 30
-                
-                if (Test-Path $s2hExe) {
-                  Write-Host "[OK] socks-to-http-proxy downloaded"
-                  
-                  # sthp CLI: -p <local-port> -s <socks5-host:port>
-                  $proxyArgs = "-p 8888 -s ${proxyHost}:${proxyPort}"
-                  Start-Process -FilePath $s2hExe -ArgumentList $proxyArgs -WindowStyle Hidden
-                  
-                  $started = $false
-                  for ($i = 0; $i -lt 15; $i++) {
-                    Start-Sleep -Seconds 1
-                    $listening = Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue
-                    if ($listening) { $started = $true; break }
-                  }
-                  if (-not $started) {
-                    Write-Warning "socks-to-http-proxy did not bind to port 8888 within 15s"
-                  }
-                }
-              } catch {
-                Write-Warning "Proxy setup failed: $_"
-                Write-Host "DVR will still work with direct SOCKS5"
-              }
-            } else {
-              Write-Host "[OK] HTTP proxy already running on port 8888"
-            }
-            
-            # Check if it's running
-            $listening = Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue
-                if ($listening) {
-                  Write-Host "[OK] HTTP proxy running on localhost:8888"
-                  
-                  # Configure Windows to use the HTTP proxy
-                  reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyEnable /t REG_DWORD /d 1 /f | Out-Null
-                  reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyServer /t REG_SZ /d "127.0.0.1:8888" /f | Out-Null
-                  reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyOverride /t REG_SZ /d "localhost;127.*;10.*;172.*;192.168.*;*.local;<local>" /f | Out-Null
-                  Write-Host "[OK] Browser proxy configured"
-                  
-                  # Test the proxy chain
-                  Write-Host ""
-                  Write-Host "Testing proxy chain..."
-                  Start-Sleep -Seconds 2
-                  $ipViaProxy = curl.exe -x http://127.0.0.1:8888 -s -m 15 https://api.ipify.org 2>$null
-                  $LASTEXITCODE = 0
-                  if ($ipViaProxy -eq $proxyHost) {
-                    Write-Host "[SUCCESS] Proxy works! Browser will show: $ipViaProxy (Netherlands)"
-                  } elseif ($ipViaProxy) {
-                    Write-Host "[INFO] Proxy returned IP: $ipViaProxy"
-                  } else {
-                    Write-Host "[WARNING] Proxy test timed out - may need more time to connect"
-                  }
-                  
-                  Write-Host ""
-                  Write-Host "[SUCCESS] Proxy setup complete"
-                  Write-Host "  - Open browser in RDP and visit chaturbate.com"
-                  Write-Host "  - Should show Netherlands (no age verification)"
-                } else {
-                  Write-Warning "Proxy not listening on port 8888"
-                }
-            
-          } else {
-            Write-Warning "Could not parse SOCKS5 proxy URL: $proxyUrl"
-          }
-          $LASTEXITCODE = 0
-          exit 0
-
       - name: Show Connection Details
         shell: powershell
         run: |
@@ -849,13 +488,6 @@ jobs:
           Write-Host "=== Starting DVR ==="
           Set-Location $repoDir
           
-          $backupHTTP = $env:HTTP_PROXY
-          $backupHTTPS = $env:HTTPS_PROXY
-          Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue
-          Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
-          Remove-Item Env:http_proxy -ErrorAction SilentlyContinue
-          Remove-Item Env:https_proxy -ErrorAction SilentlyContinue
-          
           # Verify .env exists before starting DVR
           if (Test-Path "$repoDir\.env") {
             $envSize = (Get-Item "$repoDir\.env").Length
@@ -866,9 +498,6 @@ jobs:
           
           $dvrProcess = Start-Process -FilePath $dvrExe -ArgumentList "--no-tunnel --output-dir `"$videosDir`"" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
           Write-Host "[OK] DVR PID: $($dvrProcess.Id)"
-          
-          if ($backupHTTP) { $env:HTTP_PROXY = $backupHTTP }
-          if ($backupHTTPS) { $env:HTTPS_PROXY = $backupHTTPS }
           
           Write-Host "Waiting for DVR to listen on port 8080..."
           $dvrReady = $false

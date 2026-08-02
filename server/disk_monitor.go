@@ -18,6 +18,12 @@ const (
 	diskHysteresis      = 5               // stop auto-deleting when disk drops below critical - hysteresis
 )
 
+// DiskAlert is invoked when a disk warning/critical threshold is crossed.
+// It is set by main to route alerts through the notifier package, keeping
+// this package free of a circular import (notifier imports server).
+// Signature: (key, title, message) — same as notifier.Notify.
+var DiskAlert func(key, title, message string)
+
 // StartDiskMonitor begins periodic disk space monitoring in a background
 // goroutine.  It checks disk usage every diskMonitorInterval and:
 //   - Logs a warning when usage exceeds DiskWarningPercent
@@ -74,6 +80,10 @@ func checkDisk() {
 	// Check warning threshold
 	if cfg.DiskWarningPercent > 0 && info.Percent >= cfg.DiskWarningPercent {
 		log.Printf("[DISK] WARNING: %d%% used (threshold: %d%%)", info.Percent, cfg.DiskWarningPercent)
+		if DiskAlert != nil {
+			DiskAlert(fmt.Sprintf("disk_warning:%s", "system"), "⚠️ Disk Warning",
+				fmt.Sprintf("%d%% of disk is used (threshold: %d%%)", info.Percent, cfg.DiskWarningPercent))
+		}
 	}
 
 	// Check critical threshold — auto-delete oldest uploaded recordings
@@ -88,6 +98,10 @@ func checkDisk() {
 		} else if deleted > 0 {
 			log.Printf("[DISK] auto-cleanup: deleted %d local file(s), disk dropped from %d%% to %d%%",
 				deleted, info.Percent, target)
+		}
+		if DiskAlert != nil {
+			DiskAlert(fmt.Sprintf("disk_critical:%s", "system"), "🚨 Disk Critical",
+				fmt.Sprintf("%d%% of disk is used (threshold: %d%%) — auto-cleaning oldest uploaded recordings", info.Percent, cfg.DiskCriticalPercent))
 		}
 	}
 }

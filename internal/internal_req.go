@@ -61,15 +61,41 @@ func ChaturbatePeakRate() int {
 
 // Req represents an HTTP client with customized settings.
 type Req struct {
-	client *http.Client
+	client  *http.Client
+	isMedia bool   // when true, omits browser-spoofing headers not needed for CDN media requests
+	referer string // CDN Referer/Origin override; only used when isMedia is true
 }
 
-// NewReq creates a new HTTP client reusing the shared transport.
+// NewReq creates a new HTTP client for Chaturbate page/API requests.
 func NewReq() *Req {
 	return &Req{
 		client: &http.Client{
 			Transport: sharedTransport(),
 		},
+	}
+}
+
+// NewMediaReq creates a new HTTP client for CDN media requests (playlists, segments).
+// It omits headers like X-Requested-With that are only needed for page fetches
+// and would cause CDN hosts (e.g. mmcdn.com) to reject the request.
+func NewMediaReq() *Req {
+	return &Req{
+		client: &http.Client{
+			Transport: sharedTransport(),
+		},
+		isMedia: true,
+	}
+}
+
+// NewMediaReqWithReferer creates a media HTTP client that sends the given URL as
+// Referer and Origin instead of the Chaturbate defaults. Use this for non-Chaturbate CDNs.
+func NewMediaReqWithReferer(referer string) *Req {
+	return &Req{
+		client: &http.Client{
+			Transport: sharedTransport(),
+		},
+		isMedia: true,
+		referer: referer,
 	}
 }
 
@@ -89,7 +115,7 @@ func (h *Req) Get(ctx context.Context, url string) (string, error) {
 
 // GetBytes sends an HTTP GET request and returns the response as a byte slice.
 func (h *Req) GetBytes(ctx context.Context, url string) ([]byte, error) {
-	req, cancel, err := CreateRequest(ctx, url)
+	req, cancel, err := h.CreateRequest(ctx, url)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("new request: %w", err)
@@ -102,9 +128,18 @@ func (h *Req) GetBytes(ctx context.Context, url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrNotFound
+	}
+
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	// Check for Cloudflare protection
+	if strings.Contains(string(b), "<title>Just a moment...</title>") {
+		return nil, ErrCloudflareBlocked
 	}
 
 	// Check for Age Verification
@@ -148,11 +183,10 @@ func (h *Req) Head(ctx context.Context, url string) (int, error) {
 }
 
 // GetBytesWithTimeout is like GetBytes but with a caller-specified timeout.
-// This is needed for proxied CDN segment downloads where the SOCKS5 proxy
-// adds significant latency — the default 30s may not be enough to read
-// multi-megabyte video segments end-to-end.
+// Large CDN video segments can take a while to read end-to-end, so callers
+// that download them can raise the timeout above the default 30s.
 func (h *Req) GetBytesWithTimeout(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
-	req, cancel, err := CreateRequestWithTimeout(ctx, url, timeout)
+	req, cancel, err := h.CreateRequestWithTimeout(ctx, url, timeout)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("new request: %w", err)
@@ -165,9 +199,18 @@ func (h *Req) GetBytesWithTimeout(ctx context.Context, url string, timeout time.
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrNotFound
+	}
+
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	// Check for Cloudflare protection
+	if strings.Contains(string(b), "<title>Just a moment...</title>") {
+		return nil, ErrCloudflareBlocked
 	}
 
 	if strings.Contains(string(b), "Verify your age") {
@@ -190,13 +233,19 @@ func (h *Req) GetBytesWithTimeout(ctx context.Context, url string, timeout time.
 }
 
 // CreateRequest constructs an HTTP GET request with necessary headers (30s timeout).
-func CreateRequest(ctx context.Context, url string) (*http.Request, context.CancelFunc, error) {
-	return CreateRequestWithTimeout(ctx, url, 30*time.Second)
+func (h *Req) CreateRequest(ctx context.Context, url string) (*http.Request, context.CancelFunc, error) {
+	return h.CreateRequestWithTimeout(ctx, url, 30*time.Second)
 }
 
 // CreateRequestWithTimeout is like CreateRequest but with a custom timeout.
-func CreateRequestWithTimeout(ctx context.Context, url string, timeout time.Duration) (*http.Request, context.CancelFunc, error) {
+func (h *Req) CreateRequestWithTimeout(ctx context.Context, url string, timeout time.Duration) (*http.Request, context.CancelFunc, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
+	if h.isMedia {
+		ctx = context.WithValue(ctx, mediaFlagKey{}, true)
+		if h.referer != "" {
+			ctx = context.WithValue(ctx, mediaRefererKey{}, h.referer)
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -208,7 +257,24 @@ func CreateRequestWithTimeout(ctx context.Context, url string, timeout time.Dura
 
 // SetRequestHeaders applies necessary headers to the request.
 func SetRequestHeaders(req *http.Request) {
-	req.Header.Set("X-Requested-With", "XMLHttpRequest") // Helps avoid Age Verification redirect
+	if isMediaRequest(req) {
+		ref := mediaReferer(req)
+		if ref == "" {
+			ref = "https://chaturbate.com/"
+		}
+		req.Header.Set("Referer", ref)
+		req.Header.Set("Origin", strings.TrimRight(ref, "/"))
+	} else {
+		// X-Requested-With helps bypass Cloudflare on chaturbate.com page fetches.
+		// Do NOT send it to CDN media hosts (mmcdn.com) as it may cause rejection.
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+		domain := strings.TrimRight(server.Config.Domain, "/")
+		if domain != "" {
+			req.Header.Set("Origin", domain)
+			req.Header.Set("Referer", domain+"/")
+		}
+	}
 
 	if server.Config.UserAgent != "" {
 		req.Header.Set("User-Agent", strings.TrimSpace(server.Config.UserAgent))
@@ -219,13 +285,23 @@ func SetRequestHeaders(req *http.Request) {
 			req.AddCookie(&http.Cookie{Name: name, Value: value})
 		}
 	}
-
-	domain := strings.TrimRight(server.Config.Domain, "/")
-	if domain != "" {
-		req.Header.Set("Origin", domain)
-		req.Header.Set("Referer", domain+"/")
-	}
 }
+
+// isMediaRequest reports whether req carries the media client marker.
+func isMediaRequest(req *http.Request) bool {
+	v, _ := req.Context().Value(mediaFlagKey{}).(bool)
+	return v
+}
+
+// mediaReferer returns the per-request Referer override, if any.
+func mediaReferer(req *http.Request) string {
+	v, _ := req.Context().Value(mediaRefererKey{}).(string)
+	return v
+}
+
+type mediaFlagKey struct{}
+
+type mediaRefererKey struct{}
 
 // ParseCookies converts a cookie string into a map.
 func ParseCookies(cookieStr string) map[string]string {

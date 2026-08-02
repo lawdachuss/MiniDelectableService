@@ -18,6 +18,7 @@ import (
 	"github.com/teacat/chaturbate-dvr/coordinator"
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
+	"github.com/teacat/chaturbate-dvr/notifier"
 	"github.com/teacat/chaturbate-dvr/router/view"
 	"github.com/teacat/chaturbate-dvr/server"
 	"github.com/teacat/chaturbate-dvr/watcher"
@@ -105,6 +106,12 @@ type Manager struct {
 	// StartSession is called more than once (e.g. from create-channel handler).
 	sessionMu      sync.Mutex
 	sessionStarted bool
+
+	// Cloudflare block tracking: channels currently in a blocked state, plus
+	// whether the global multi-channel alert has already fired.
+	cfMu            sync.Mutex
+	cfBlocked       map[string]struct{}
+	cfGlobalNotified bool
 }
 
 // TriggerSessionStop signals the session loop to stop recording now and
@@ -150,6 +157,7 @@ func New() (*Manager, error) {
 		logRateLimit: make(map[string]time.Time),
 		renderCache:  make(map[string]*renderCacheEntry),
 		WatcherDone:  make(chan struct{}),
+		cfBlocked:    make(map[string]struct{}),
 	}, nil
 }
 
@@ -930,6 +938,41 @@ func (m *Manager) PublishUploadState() {
 		Event: []byte("upload"),
 		Data:  payload,
 	})
+}
+
+// ReportCFBlock records that a channel is currently blocked by Cloudflare and
+// fires the global multi-channel alert once CFGlobalThreshold channels are
+// blocked at the same time.
+func (m *Manager) ReportCFBlock(username string) {
+	threshold := server.Config.CFGlobalThreshold
+	if threshold <= 0 {
+		threshold = 3
+	}
+
+	m.cfMu.Lock()
+	m.cfBlocked[username] = struct{}{}
+	count := len(m.cfBlocked)
+	fire := count >= threshold && !m.cfGlobalNotified
+	if fire {
+		m.cfGlobalNotified = true
+	}
+	m.cfMu.Unlock()
+
+	if fire {
+		notifier.Notify(notifier.KeyCFGlobal, "⚠️ Cloudflare Block Detected",
+			fmt.Sprintf("%d channels are currently blocked by Cloudflare", count))
+	}
+}
+
+// ResetCFBlock marks a channel as no longer blocked by Cloudflare, re-arming
+// the global alert once the blocked-channel count drops below the threshold.
+func (m *Manager) ResetCFBlock(username string) {
+	m.cfMu.Lock()
+	delete(m.cfBlocked, username)
+	if len(m.cfBlocked) < server.Config.CFGlobalThreshold {
+		m.cfGlobalNotified = false
+	}
+	m.cfMu.Unlock()
 }
 
 func (m *Manager) PublishLog(username, line string) {

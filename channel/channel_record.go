@@ -5,28 +5,42 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"strings"
 	"time"
 
 	"github.com/avast/retry-go/v4"
 	"github.com/teacat/chaturbate-dvr/chaturbate"
 	"github.com/teacat/chaturbate-dvr/internal"
+	"github.com/teacat/chaturbate-dvr/notifier"
 	"github.com/teacat/chaturbate-dvr/server"
 	"github.com/teacat/chaturbate-dvr/site"
-	"github.com/teacat/chaturbate-dvr/stripchat"
 )
 
 // Monitor starts monitoring the channel for live streams and records them.
-func (ch *Channel) Monitor() {
-	siteImpl := resolveSite(ch)
+// runID identifies this monitor run so late-arriving segments from a
+// previous run can be rejected.
+func (ch *Channel) Monitor(runID uint64) {
+	defer ch.finishMonitor()
+
+	s := resolveSite(ch)
 	req := internal.NewReq()
 	ch.Info("starting to record `%s` (%s)", ch.Config.Username, ch.Config.Site)
 
-	ctx, _ := ch.WithCancel(context.Background())
+	// Seed total disk usage in the background so the UI shows it immediately.
+	go ch.ScanTotalDiskUsage()
 
-	ch.stateMu.Lock()
-	ch.RoomStatus = "offline"
-	ch.stateMu.Unlock()
+	// Seed StreamedAt from the site API if we haven't seen this channel stream yet.
+	if ch.StreamedAt == 0 {
+		if ts, err := s.FetchLastBroadcast(context.Background(), req, ch.Config.Username); err == nil && ts > 0 {
+			ch.StreamedAt = ts
+			ch.Config.StreamedAt = ts
+			_ = server.Manager.SaveConfig()
+			ch.Update()
+		}
+	}
+
+	// Create a new context with a cancel function; the CancelFunc is stored on
+	// the channel and invoked by Pause/Stop.
+	ctx, _ := ch.WithCancel(context.Background())
 
 	var err error
 	for {
@@ -35,189 +49,202 @@ func (ch *Channel) Monitor() {
 		}
 
 		pipeline := func() error {
-			return ch.RecordStream(ctx, siteImpl, req)
+			return ch.RecordStream(ctx, runID, s, req)
 		}
-
+		// isExpectedOffline returns true for errors where the full interval
+		// delay is appropriate. Transient errors (502, decode errors, network
+		// hiccups) should retry quickly.
+		isExpectedOffline := func(err error) bool {
+			return errors.Is(err, internal.ErrChannelOffline) ||
+				errors.Is(err, internal.ErrPrivateStream) ||
+				errors.Is(err, internal.ErrHiddenStream) ||
+				errors.Is(err, internal.ErrAgeVerification) ||
+				errors.Is(err, internal.ErrCloudflareBlocked) ||
+				errors.Is(err, internal.ErrRoomPasswordRequired)
+		}
 		onRetry := func(_ uint, err error) {
-			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-				return
+			ch.UpdateOnlineStatus(false)
+
+			// Reset the CF block count whenever a non-CF response is received.
+			if !errors.Is(err, internal.ErrCloudflareBlocked) && ch.CFBlockCount > 0 {
+				ch.CFBlockCount = 0
+				server.Manager.ResetCFBlock(ch.Config.Username)
+				notifier.Default.ResetCooldown(fmt.Sprintf(notifier.KeyCFChannel, ch.Config.Username))
 			}
-			switch {
-			case errors.Is(err, internal.ErrChannelOffline) || errors.Is(err, internal.ErrPrivateStream):
-				ch.stateMu.Lock()
-				ch.IsOnline = false
-				ch.IsConnecting = false
-				roomStatus := ch.RoomStatus
-				ch.stateMu.Unlock()
-				ch.Update()
-				ch.Info("channel is %s, try again in %d min(s)", roomStatus, server.Config.Interval)
 
-			case errors.Is(err, internal.ErrStreamStalled):
-				ch.SetConnecting(true)
-				ch.Info("stream stalled (CDN session expired) — reconnecting in 15s")
-
-			default:
-				ch.SetConnecting(true)
-				ch.Error("on retry: %s: retrying", err.Error())
+			if errors.Is(err, internal.ErrChannelOffline) {
+				ch.Info("channel is offline, try again in %d min(s)", server.Config.Interval)
+			} else if errors.Is(err, internal.ErrPrivateStream) {
+				ch.Info("channel is in a private show, try again in %d min(s)", server.Config.Interval)
+			} else if errors.Is(err, internal.ErrHiddenStream) {
+				ch.Info("channel is hidden, try again in %d min(s)", server.Config.Interval)
+			} else if errors.Is(err, internal.ErrCloudflareBlocked) {
+				ch.CFBlockCount++
+				cfThresh := server.Config.CFChannelThreshold
+				if cfThresh <= 0 {
+					cfThresh = 5
+				}
+				if ch.CFBlockCount >= cfThresh {
+					notifier.Notify(
+						fmt.Sprintf(notifier.KeyCFChannel, ch.Config.Username),
+						"⚠️ Cloudflare Block",
+						fmt.Sprintf("`%s` has been blocked by Cloudflare %d times consecutively", ch.Config.Username, ch.CFBlockCount),
+					)
+				}
+				server.Manager.ReportCFBlock(ch.Config.Username)
+				ch.Info("channel was blocked by Cloudflare; try with `-cookies` and `-user-agent`? try again in %d min(s)", server.Config.Interval)
+			} else if errors.Is(err, internal.ErrAgeVerification) {
+				ch.Info("age verification required; pass cookies with `-cookies` to authenticate, try again in %d min(s)", server.Config.Interval)
+			} else if errors.Is(err, internal.ErrRoomPasswordRequired) {
+				ch.Info("room requires a password, try again in %d min(s)", server.Config.Interval)
+			} else if errors.Is(err, context.Canceled) {
+				// channel stopped/paused — silent
+			} else {
+				ch.Error("on retry: %s: retrying in 10s", err.Error())
 			}
 		}
-
-		customDelay := func(n uint, err error, _ *retry.Config) time.Duration {
-			switch {
-			case errors.Is(err, internal.ErrStreamStalled):
-				return 15*time.Second + time.Duration(rand.Int63n(16))*time.Second
-			case errors.Is(err, internal.ErrChannelOffline) || errors.Is(err, internal.ErrPrivateStream):
+		delayFn := func(_ uint, err error, _ *retry.Config) time.Duration {
+			if isExpectedOffline(err) {
 				base := time.Duration(server.Config.Interval) * time.Minute
-				return base + time.Duration(rand.Int63n(31))*time.Second
-			default:
-				backoff := time.Duration(min(1<<n, 32)) * 10 * time.Second
-				return backoff + time.Duration(rand.Int63n(11))*time.Second
+				jitter := time.Duration(rand.Int63n(int64(base/5))) - base/10 // ±10% of interval
+				return base + jitter
 			}
+			// Transient error (502, decode failure, network hiccup) — recover quickly.
+			return 10 * time.Second
 		}
-
 		if err = retry.Do(
 			pipeline,
 			retry.Context(ctx),
 			retry.Attempts(0),
-			retry.DelayType(customDelay),
+			retry.DelayType(delayFn),
 			retry.OnRetry(onRetry),
 		); err != nil {
 			break
 		}
 	}
 
-	if err := ch.Cleanup(CloseQueue); err != nil {
-		ch.Error("cleanup on monitor exit: %s", err.Error())
-	}
-
-	if err != nil && !errors.Is(err, context.Canceled) {
-		ch.Error("record stream: %s", err.Error())
-	}
-}
-
-func (ch *Channel) Update() {
-	select {
-	case ch.UpdateCh <- true:
-	default:
-	}
-}
-
-const defaultGracePeriod = 3 * time.Minute
-
-// RecordStream fetches stream info via the site interface, then dispatches
-// to the site-specific recording implementation.
-func (ch *Channel) RecordStream(ctx context.Context, siteImpl site.Site, req *internal.Req) error {
-	info, err := siteImpl.FetchStream(ctx, req, ch.Config.Username)
-	if err != nil {
-		if info != nil {
-			ch.stateMu.Lock()
-			ch.RoomStatus = info.RoomStatus
-			ch.stateMu.Unlock()
-		}
-		return fmt.Errorf("get stream: %w", err)
-	}
-
-	ch.stateMu.Lock()
-	ch.RoomTitle = info.RoomTitle
-	ch.Tags = info.Tags
-	ch.Viewers = info.NumUsers
-	ch.Gender = info.Gender
-	ch.LiveThumbURL = info.LiveThumbURL
-	ch.stateMu.Unlock()
-
-	if len(ch.Tags) == 0 && ch.RoomTitle != "" {
-		ch.Tags = extractHashtags(ch.RoomTitle)
-	}
-
-	if ch.Config.Site == "stripchat" {
-		return ch.recordStreamSC(ctx, req, info)
-	}
-	return ch.recordStreamCB(ctx, req, info)
-}
-
-// recordStreamCB handles recording for Chaturbate.
-func (ch *Channel) recordStreamCB(ctx context.Context, req *internal.Req, info *site.StreamInfo) error {
-	playlist, err := chaturbate.FetchPlaylist(ctx, info.HLSSource, ch.Config.Resolution, ch.Config.Framerate)
-	if err != nil {
-		return fmt.Errorf("get playlist: %w", err)
-	}
-
-	ch.Resolution = fmt.Sprintf("%dp", playlist.Resolution)
-	ch.Framerate = playlist.Framerate
-	ch.initRecordingState(playlist.AudioPlaylistURL != "")
-
-	if err := ch.NextFile(); err != nil {
-		return fmt.Errorf("next file: %w", err)
-	}
-
-	defer ch.cleanupOnExit(ctx)
-
-	ch.stateMu.Lock()
-	ch.RoomStatus = site.StatusPublic
-	ch.stateMu.Unlock()
-	ch.UpdateOnlineStatus(true)
-
-	ch.logStreamQuality(playlist.Resolution, playlist.Framerate)
-
-	return ch.watchWithGraceCB(ctx, req, playlist)
-}
-
-// recordStreamSC handles recording for Stripchat with MOUFLON v2 support.
-func (ch *Channel) recordStreamSC(ctx context.Context, req *internal.Req, info *site.StreamInfo) error {
-	playlist, err := stripchat.FetchPlaylist(ctx, req, info.HLSSource, server.Config.StripchatPDKey, ch.Config.Resolution, ch.Config.Framerate)
-	if err != nil {
-		return fmt.Errorf("get playlist: %w", err)
-	}
-
-	ch.Info("stripchat playlist: url=%s pdkey=%q res=%d", playlist.PlaylistURL, playlist.PDKey, playlist.Resolution)
-	ch.Resolution = fmt.Sprintf("%dp", playlist.Resolution)
-	ch.Framerate = playlist.Framerate
-	ch.initRecordingState(playlist.AudioPlaylistURL != "")
-
-	if err := ch.NextFile(); err != nil {
-		return fmt.Errorf("next file: %w", err)
-	}
-
-	defer ch.cleanupOnExit(ctx)
-
-	ch.stateMu.Lock()
-	ch.RoomStatus = site.StatusPublic
-	ch.stateMu.Unlock()
-	ch.UpdateOnlineStatus(true)
-
-	ch.logStreamQuality(playlist.Resolution, playlist.Framerate)
-
-	return ch.watchWithGraceSC(ctx, req, playlist)
-}
-
-func (ch *Channel) initRecordingState(hasSeparateAudio bool) {
-	ch.stateMu.Lock()
-	ch.StreamedAt = time.Now().Unix()
-	ch.Sequence = 0
-	ch.HasSeparateAudio = hasSeparateAudio
-	ch.videoSegmentCount = 0
-	ch.audioSegmentCount = 0
-	ch.stateMu.Unlock()
-	ch.InitSegment = nil
-	ch.AudioInitSegment = nil
-	ch.switchRequested = false
-}
-
-func (ch *Channel) cleanupOnExit(ctx context.Context) {
+	// Always cleanup when monitor exits, regardless of error.
+	// On stop/pause the file is queued for processing by Stop(); on an
+	// error-exit it is finalized and uploaded immediately.
 	mode := CloseProcess
 	if ctx.Err() != nil {
 		mode = CloseQueue
 	}
 	if err := ch.Cleanup(mode); err != nil {
-		ch.Error("cleanup on record stream exit: %s", err.Error())
+		ch.Error("cleanup on monitor exit: %s", err.Error())
+	}
+
+	// Log error if it's not a context cancellation.
+	if err != nil && !errors.Is(err, context.Canceled) {
+		ch.Error("record stream: %s", err.Error())
 	}
 }
 
-func (ch *Channel) logStreamQuality(resolution, framerate int) {
-	ch.Info("stream quality - %dp @ %dfps (target: %dp @ %dfps)", resolution, framerate, ch.Config.Resolution, ch.Config.Framerate)
-	if ch.HasSeparateAudio {
-		ch.Info("mux: separate audio track detected — will mux audio/video after recording")
+// RecordStream records the stream of the channel using the provided site and
+// HTTP client. It retrieves the stream information and starts watching the
+// segments, writing them live-muxed into a single file.
+func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, req *internal.Req) error {
+	ch.fileMu.Lock()
+	ch.mp4InitSegment = nil
+	ch.fileMu.Unlock()
+
+	streamInfo, err := s.FetchStream(ctx, req, ch.Config.Username)
+
+	// Update static metadata whenever the site API returns it, even if the room
+	// is currently offline/private/hidden. This keeps the archive index fresh.
+	changed := false
+	thumbChanged := false
+	if streamInfo != nil {
+		if streamInfo.RoomTitle != "" && streamInfo.RoomTitle != ch.RoomTitle {
+			ch.RoomTitle = streamInfo.RoomTitle
+			ch.Config.RoomTitle = streamInfo.RoomTitle
+			changed = true
+		}
+		if streamInfo.Gender != "" && streamInfo.Gender != ch.Gender {
+			ch.Gender = streamInfo.Gender
+			ch.Config.Gender = streamInfo.Gender
+			changed = true
+		}
+		if streamInfo.SummaryCardImage != "" && streamInfo.SummaryCardImage != ch.SummaryCardImage {
+			ch.SummaryCardImage = streamInfo.SummaryCardImage
+			ch.Config.SummaryCardImage = streamInfo.SummaryCardImage
+			changed = true
+			thumbChanged = true
+		}
+		if changed {
+			_ = server.Manager.SaveConfig()
+			ch.Update()
+			_ = thumbChanged
+		}
 	}
+
+	if err != nil {
+		return fmt.Errorf("get stream: %w", err)
+	}
+	if streamInfo == nil {
+		// Site returned nil, nil — channel is offline.
+		return fmt.Errorf("get stream: %w", internal.ErrChannelOffline)
+	}
+
+	ch.StreamedAt = time.Now().Unix()
+	ch.Config.StreamedAt = ch.StreamedAt
+	_ = server.Manager.SaveConfig()
+	ch.Sequence = 0
+	ch.Viewers = streamInfo.NumUsers
+	if ch.LiveThumbURL != streamInfo.LiveThumbURL {
+		ch.LiveThumbURL = streamInfo.LiveThumbURL
+		ch.Update()
+	}
+
+	playlist, err := chaturbate.FetchPlaylist(ctx, streamInfo.HLSSource, ch.Config.Resolution, ch.Config.Framerate, streamInfo.CDNReferer, streamInfo.MouflonPDKey)
+	if err != nil {
+		return fmt.Errorf("get playlist: %w", err)
+	}
+
+	ch.FileExt = playlist.FileExt
+	if err := ch.NextFile(playlist.FileExt); err != nil {
+		return fmt.Errorf("next file: %w", err)
+	}
+
+	// Ensure the file is cleaned up when this function exits in any case.
+	defer func() {
+		if err := ch.Cleanup(CloseProcess); err != nil {
+			ch.Error("cleanup on record stream exit: %s", err.Error())
+		}
+	}()
+
+	ch.stateMu.Lock()
+	ch.RoomStatus = site.StatusPublic
+	ch.stateMu.Unlock()
+	ch.UpdateOnlineStatus(true) // Update online status after playlist is OK
+
+	// Reset CF state on successful stream start.
+	ch.CFBlockCount = 0
+	notifier.Default.ResetCooldown(fmt.Sprintf(notifier.KeyCFChannel, ch.Config.Username))
+	server.Manager.ResetCFBlock(ch.Config.Username)
+
+	// Notify stream online if enabled.
+	if server.Config.NotifyStreamOnline {
+		title := fmt.Sprintf("📡 %s is live!", ch.Config.Username)
+		body := ch.RoomTitle
+		if body == "" {
+			body = ch.Config.Username
+		}
+		notifier.Notify(fmt.Sprintf(notifier.KeyStreamOnline, ch.Config.Username), title, body)
+	}
+
+	streamType := "HLS"
+	if playlist.FileExt == ".mp4" {
+		if playlist.AudioPlaylistURL != "" {
+			streamType = "LL-HLS (video+audio)"
+		} else if playlist.MouflonPDKey != "" {
+			streamType = "HLS (fMP4)"
+		} else {
+			streamType = "LL-HLS (video only)"
+		}
+	}
+	ch.Info("stream type: %s, resolution %dp (target: %dp), framerate %dfps (target: %dfps)",
+		streamType, playlist.Resolution, ch.Config.Resolution, playlist.Framerate, ch.Config.Framerate)
 	if ch.Viewers > 0 {
 		ch.Info("status: %d viewers", ch.Viewers)
 	}
@@ -228,395 +255,88 @@ func (ch *Channel) logStreamQuality(resolution, framerate int) {
 		}
 		ch.Info("status: room title: %s", title)
 	}
+
+	return playlist.WatchSegments(ctx, func(b []byte, duration float64) error {
+		return ch.handleSegmentForMonitor(runID, b, duration)
+	})
 }
 
-// ─── Chaturbate grace/watch ──────────────────────────────────────────────
+// handleSegmentForMonitor processes and writes segment data for a specific
+// monitor run, ignoring stale late-arriving segments from older runs.
+func (ch *Channel) handleSegmentForMonitor(runID uint64, b []byte, duration float64) error {
+	ch.fileMu.Lock()
+	ch.monitorMu.Lock()
+	isPaused := ch.Config.IsPaused.Load()
+	isCurrentRun := ch.monitorRunID == runID
+	ch.monitorMu.Unlock()
 
-func (ch *Channel) watchWithGraceCB(ctx context.Context, client *internal.Req, p *chaturbate.Playlist) error {
-	const pollInterval = 30 * time.Second
-
-	siteImpl := site.NewChaturbateSite()
-	origErr := ch.watchLoopCB(ctx, client, p)
-	if origErr == nil {
-		return nil
-	}
-	if errors.Is(origErr, context.Canceled) || errors.Is(origErr, context.DeadlineExceeded) {
-		return origErr
-	}
-
-	ch.Info("recording: segment fetch interrupted (%s); %s grace period starts", origErr, defaultGracePeriod)
-
-	deadline := time.Now().Add(defaultGracePeriod)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
-		}
-
-		info, apiErr := siteImpl.FetchStream(ctx, client, ch.Config.Username)
-		if apiErr != nil {
-			ch.Info("recording: API still unavailable (%s); %s remaining", apiErr, time.Until(deadline).Round(time.Second))
-			continue
-		}
-
-		newPlaylist, apiErr := chaturbate.FetchPlaylist(ctx, info.HLSSource, ch.Config.Resolution, ch.Config.Framerate)
-		if apiErr != nil {
-			continue
-		}
-
-		ch.Info("recording: channel back online — resuming with fresh playlist")
-		ch.stateMu.Lock()
-		ch.RoomStatus = site.StatusPublic
-		ch.stateMu.Unlock()
-		ch.UpdateOnlineStatus(true)
-
-		ch.Resolution = fmt.Sprintf("%dp", newPlaylist.Resolution)
-		ch.Framerate = newPlaylist.Framerate
-
-		loopErr := ch.watchLoopCB(ctx, client, newPlaylist)
-		if loopErr == nil {
-			return nil
-		}
-		if errors.Is(loopErr, context.Canceled) || errors.Is(loopErr, context.DeadlineExceeded) {
-			return loopErr
-		}
-		ch.Info("recording: segment fetch interrupted again during grace period (%s)", loopErr)
-	}
-
-	ch.Info("recording: grace period expired — finalizing file")
-	return fmt.Errorf("channel offline after grace period: %w", origErr)
-}
-
-func (ch *Channel) watchLoopCB(ctx context.Context, client *internal.Req, p *chaturbate.Playlist) error {
-	const maxStalls = 10
-	siteImpl := site.NewChaturbateSite()
-	for stall := 0; stall < maxStalls; stall++ {
-		err := p.WatchAVSegments(ctx, ch.HandleSegment, ch.HandleInitSegment, ch.HandleAudioSegment, ch.HandleAudioInitSegment, ch.OnPollComplete)
-		if err == nil || !errors.Is(err, internal.ErrStreamStalled) {
-			return err
-		}
-		ch.Info("recording: CDN session expired — fetching fresh playlist URL")
-		info, apiErr := siteImpl.FetchStream(ctx, client, ch.Config.Username)
-		if apiErr != nil {
-			return apiErr
-		}
-		newPlaylist, apiErr := chaturbate.FetchPlaylist(ctx, info.HLSSource, ch.Config.Resolution, ch.Config.Framerate)
-		if apiErr != nil {
-			return apiErr
-		}
-		p = newPlaylist
-		ch.Resolution = fmt.Sprintf("%dp", newPlaylist.Resolution)
-		ch.Framerate = newPlaylist.Framerate
-		ch.stateMu.Lock()
-		ch.RoomStatus = site.StatusPublic
-		ch.stateMu.Unlock()
-		ch.UpdateOnlineStatus(true)
-	}
-	return fmt.Errorf("too many consecutive CDN stalls (%d): %w", maxStalls, internal.ErrStreamStalled)
-}
-
-// ─── Stripchat grace/watch ──────────────────────────────────────────────
-
-func (ch *Channel) watchWithGraceSC(ctx context.Context, client *internal.Req, p *stripchat.Playlist) error {
-	const pollInterval = 30 * time.Second
-
-	var siteImpl site.Site = site.NewChaturbateSite()
-	if ch.Config.Site == "stripchat" {
-		siteImpl = stripchat.NewStripchatSite()
-	}
-
-	// Periodically refresh LiveThumbURL during Stripchat recording.
-	// Stripchat's API returns a signed preview URL that can expire; refreshing
-	// it ensures the thumbnail in the UI stays current rather than going stale.
-	refreshCtx, refreshCancel := context.WithCancel(ctx)
-	defer refreshCancel()
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-refreshCtx.Done():
-				return
-			case <-ticker.C:
-				info, err := siteImpl.FetchStream(refreshCtx, client, ch.Config.Username)
-				if err == nil && info.LiveThumbURL != "" {
-					ch.stateMu.Lock()
-					ch.LiveThumbURL = info.LiveThumbURL
-					ch.stateMu.Unlock()
-				}
-			}
-		}
-	}()
-
-	origErr := ch.watchLoopSC(ctx, client, p)
-	if origErr == nil {
-		return nil
-	}
-	if errors.Is(origErr, context.Canceled) || errors.Is(origErr, context.DeadlineExceeded) {
-		return origErr
-	}
-
-	ch.Info("recording: segment fetch interrupted (%s); %s grace period starts", origErr, defaultGracePeriod)
-
-	deadline := time.Now().Add(defaultGracePeriod)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
-		}
-
-		info, apiErr := siteImpl.FetchStream(ctx, client, ch.Config.Username)
-		if apiErr != nil {
-			ch.Info("recording: API still unavailable (%s); %s remaining", apiErr, time.Until(deadline).Round(time.Second))
-			continue
-		}
-
-		if info.LiveThumbURL != "" {
-			ch.stateMu.Lock()
-			ch.LiveThumbURL = info.LiveThumbURL
-			ch.stateMu.Unlock()
-		}
-
-		newPlaylist, apiErr := stripchat.FetchPlaylist(ctx, client, info.HLSSource, "", ch.Config.Resolution, ch.Config.Framerate)
-		if apiErr != nil {
-			continue
-		}
-
-		ch.Info("recording: channel back online — resuming with fresh playlist")
-		ch.stateMu.Lock()
-		ch.RoomStatus = site.StatusPublic
-		ch.stateMu.Unlock()
-		ch.UpdateOnlineStatus(true)
-
-		ch.Resolution = fmt.Sprintf("%dp", newPlaylist.Resolution)
-		ch.Framerate = newPlaylist.Framerate
-
-		loopErr := ch.watchLoopSC(ctx, client, newPlaylist)
-		if loopErr == nil {
-			return nil
-		}
-		if errors.Is(loopErr, context.Canceled) || errors.Is(loopErr, context.DeadlineExceeded) {
-			return loopErr
-		}
-		ch.Info("recording: segment fetch interrupted again during grace period (%s)", loopErr)
-	}
-
-	ch.Info("recording: grace period expired — finalizing file")
-	return fmt.Errorf("channel offline after grace period: %w", origErr)
-}
-
-func (ch *Channel) watchLoopSC(ctx context.Context, client *internal.Req, p *stripchat.Playlist) error {
-	const maxStalls = 10
-	for stall := 0; stall < maxStalls; stall++ {
-		err := p.WatchAVSegments(ctx, ch.HandleSegment, ch.HandleInitSegment, ch.HandleAudioSegment, ch.HandleAudioInitSegment, ch.OnPollComplete)
-		if err == nil || !errors.Is(err, internal.ErrStreamStalled) {
-			return err
-		}
-		ch.Info("recording: CDN session expired — refreshing master playlist (refresh #%d)", stall+1)
-
-		// The variant playlist URL has a short-lived ?pkey= token (~20s).
-		// The master playlist URL has no token — re-fetch it to get a fresh
-		// pkey embedded in the response, then build a new variant URL.
-		// This is much cheaper than calling the Stripchat API.
-		//
-		// Pass pdkey="" so FetchPlaylist extracts the fresh pkey from the
-		// new master body and resolves a new pdkey for MOUFLON decryption.
-		newPlaylist, apiErr := stripchat.FetchPlaylist(ctx, client, p.MasterURL, "", ch.Config.Resolution, ch.Config.Framerate)
-		if apiErr != nil {
-			// Master fetch failed — the stream may have ended.
-			// Fall back to the Stripchat API to check online status.
-			ch.Info("recording: master playlist unavailable (%s) — checking API", apiErr)
-			siteImpl := stripchat.NewStripchatSite()
-			info, fetchErr := ch.fetchStreamWithRetry(ctx, client, siteImpl)
-			if fetchErr != nil {
-				ch.Info("recording: channel appears offline after CDN expiry (%s)", fetchErr)
-				return fetchErr
-			}
-			newPlaylist, apiErr = stripchat.FetchPlaylist(ctx, client, info.HLSSource, "", ch.Config.Resolution, ch.Config.Framerate)
-			if apiErr != nil {
-				return apiErr
-			}
-		}
-		p = newPlaylist
-		ch.Resolution = fmt.Sprintf("%dp", newPlaylist.Resolution)
-		ch.Framerate = newPlaylist.Framerate
-		ch.stateMu.Lock()
-		ch.RoomStatus = site.StatusPublic
-		ch.stateMu.Unlock()
-		ch.UpdateOnlineStatus(true)
-	}
-	return fmt.Errorf("too many consecutive CDN stalls (%d): %w", maxStalls, internal.ErrStreamStalled)
-}
-
-// fetchStreamWithRetry calls FetchStream and retries transient API failures
-// with a short delay so a brief blip during CDN token rollover doesn't trigger
-// the full 3-minute grace period.
-func (ch *Channel) fetchStreamWithRetry(ctx context.Context, client *internal.Req, siteImpl site.Site) (*site.StreamInfo, error) {
-	const maxAttempts = 5
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		info, err := siteImpl.FetchStream(ctx, client, ch.Config.Username)
-		if err == nil {
-			return info, nil
-		}
-		lastErr = err
-		if attempt < maxAttempts-1 {
-			ch.Info("recording: API unavailable during CDN refresh (%s) — retrying in 15s (attempt %d/%d)", err, attempt+1, maxAttempts)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(15 * time.Second):
-			}
-		}
-	}
-	return nil, lastErr
-}
-
-// HandleInitSegment stores the fMP4 init segment and writes it to the file.
-func (ch *Channel) HandleInitSegment(initData []byte) error {
-	if ch.InitSegment != nil {
-		return nil
-	}
-	ch.InitSegment = initData
-
-	if ch.File == nil {
-		return nil
-	}
-
-	n, err := ch.File.Write(initData)
-	if err != nil {
-		return fmt.Errorf("write init segment: %w", err)
-	}
-	ch.stateMu.Lock()
-	ch.Filesize += n
-	ch.stateMu.Unlock()
-	return nil
-}
-
-// HandleAudioInitSegment stores the fMP4 audio init segment and writes it to the file.
-func (ch *Channel) HandleAudioInitSegment(initData []byte) error {
-	if ch.AudioInitSegment != nil {
-		return nil
-	}
-	ch.AudioInitSegment = initData
-
-	if ch.AudioFile == nil {
-		return nil
-	}
-
-	n, err := ch.AudioFile.Write(initData)
-	if err != nil {
-		return fmt.Errorf("write audio init segment: %w", err)
-	}
-	ch.stateMu.Lock()
-	ch.Filesize += n
-	ch.stateMu.Unlock()
-	return nil
-}
-
-// HandleSegment processes and writes segment data to a file.
-func (ch *Channel) HandleSegment(b []byte, duration float64) error {
-	if ch.Config.IsPaused.Load() {
+	if isPaused || !isCurrentRun {
+		ch.fileMu.Unlock()
 		return retry.Unrecoverable(internal.ErrPaused)
 	}
 
 	if ch.File == nil {
-		return fmt.Errorf("HandleSegment: ch.File is nil")
+		ch.fileMu.Unlock()
+		return fmt.Errorf("write file: no active file")
+	}
+
+	if isMP4InitSegment(b) {
+		ch.mp4InitSegment = append(ch.mp4InitSegment[:0], b...)
+	}
+	if ch.FileExt == ".mp4" && ch.Filesize == 0 && !isMP4InitSegment(b) && len(ch.mp4InitSegment) > 0 {
+		n, err := ch.File.Write(ch.mp4InitSegment)
+		if err != nil {
+			ch.fileMu.Unlock()
+			return fmt.Errorf("write mp4 init segment: %w", err)
+		}
+		ch.Filesize += n
 	}
 
 	n, err := ch.File.Write(b)
 	if err != nil {
+		ch.fileMu.Unlock()
 		return fmt.Errorf("write file: %w", err)
 	}
 
-	ch.stateMu.Lock()
 	ch.Filesize += n
 	ch.Duration += duration
-	ch.videoSegmentCount++
-	dur := ch.Duration
-	fs := ch.Filesize
-	vSegCount := ch.videoSegmentCount
-	aSegCount := ch.audioSegmentCount
-	hasSeparateAudio := ch.HasSeparateAudio
-	ch.stateMu.Unlock()
+	formattedDuration := internal.FormatDuration(ch.Duration)
+	formattedFilesize := internal.FormatFilesize(ch.Filesize)
+	shouldSwitch := ch.shouldSwitchFileLocked()
 
-	if hasSeparateAudio {
-		segDiff := vSegCount - aSegCount
-		if segDiff != 0 {
-			ch.Info("duration: %s, filesize: %s [v:%d a:%d Δ%+d]", internal.FormatDuration(dur), internal.FormatFilesize(fs), vSegCount, aSegCount, segDiff)
-		} else {
-			ch.Info("duration: %s, filesize: %s [v:%d a:%d synced]", internal.FormatDuration(dur), internal.FormatFilesize(fs), vSegCount, aSegCount)
+	var newFilename string
+	if shouldSwitch {
+		if err := ch.cleanupLocked(); err != nil {
+			ch.fileMu.Unlock()
+			return fmt.Errorf("next file: %w", err)
 		}
-	} else {
-		ch.Info("duration: %s, filesize: %s", internal.FormatDuration(dur), internal.FormatFilesize(fs))
+		filename, err := ch.generateFilenameLocked()
+		if err != nil {
+			ch.fileMu.Unlock()
+			return err
+		}
+		if err := ch.createNewFileLocked(filename, ch.FileExt); err != nil {
+			ch.fileMu.Unlock()
+			return fmt.Errorf("next file: %w", err)
+		}
+		ch.Sequence++
+		newFilename = ch.File.Name()
+	}
+	ch.fileMu.Unlock()
+
+	// After a rotation, kick off post-processing (finalize + upload) of any
+	// queued files so long recordings upload each part as it completes.
+	if shouldSwitch {
+		ch.flushPending()
 	}
 
+	ch.Verbose("duration: %s, filesize: %s", formattedDuration, formattedFilesize)
+
+	// Send an SSE update to update the view.
 	ch.Update()
 
-	if !ch.ShouldSwitchFile() {
-		return nil
+	if newFilename != "" {
+		ch.Info("max filesize or duration exceeded, new file created: %s", newFilename)
 	}
-
-	if hasSeparateAudio {
-		ch.switchRequested = true
-		return nil
-	}
-
-	if err := ch.NextFile(); err != nil {
-		return fmt.Errorf("next file: %w", err)
-	}
-	ch.Info("max filesize or duration exceeded, new file created: %s", ch.File.Name())
 	return nil
-}
-
-// OnPollComplete performs any file rotation requested during the poll cycle.
-func (ch *Channel) OnPollComplete() error {
-	if !ch.switchRequested {
-		return nil
-	}
-	ch.switchRequested = false
-	if err := ch.NextFile(); err != nil {
-		return fmt.Errorf("next file: %w", err)
-	}
-	ch.Info("max filesize or duration exceeded, new file created: %s", ch.File.Name())
-	return nil
-}
-
-// HandleAudioSegment processes and writes audio segment data to a sidecar file.
-func (ch *Channel) HandleAudioSegment(b []byte, duration float64) error {
-	if ch.AudioFile == nil {
-		return nil
-	}
-	if ch.Config.IsPaused.Load() {
-		return retry.Unrecoverable(internal.ErrPaused)
-	}
-
-	if _, err := ch.AudioFile.Write(b); err != nil {
-		return fmt.Errorf("write audio file: %w", err)
-	}
-
-	ch.stateMu.Lock()
-	ch.audioSegmentCount++
-	ch.stateMu.Unlock()
-
-	return nil
-}
-
-// extractHashtags pulls #word tokens out of a room title and returns them as
-// a clean tag list. Used as a fallback when the API returns an empty tags array.
-func extractHashtags(title string) []string {
-	var tags []string
-	for _, word := range strings.Fields(title) {
-		if !strings.HasPrefix(word, "#") {
-			continue
-		}
-		tag := strings.TrimPrefix(word, "#")
-		tag = strings.Trim(tag, ".,!?;:")
-		if tag != "" {
-			tags = append(tags, tag)
-		}
-	}
-	return tags
 }

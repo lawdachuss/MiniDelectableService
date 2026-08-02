@@ -34,6 +34,26 @@ type ChannelConfig struct {
 	Compress                bool        `json:"compress"`
 	MinDurationBeforeUpload int         `json:"min_duration_before_upload"` // seconds; 0 = disabled
 	CreatedAt               int64       `json:"created_at"`
+
+	// Persisted metadata — captured from the site API even when offline so
+	// restarts don't lose them (drives the archive site).
+	RoomTitle        string `json:"room_title,omitempty"`
+	Gender           string `json:"gender,omitempty"`
+	SummaryCardImage string `json:"summary_card_image,omitempty"`
+	StreamedAt       int64  `json:"streamed_at,omitempty"`
+}
+
+// NormalizeFinalizeMode returns a supported finalization mode
+// ("none", "remux", or "transcode"), defaulting to "none".
+func NormalizeFinalizeMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "remux":
+		return "remux"
+	case "transcode":
+		return "transcode"
+	default:
+		return "none"
+	}
 }
 
 func (c *ChannelConfig) Sanitize() {
@@ -70,6 +90,7 @@ type ChannelInfo struct {
 	LiveThumbURL   string // live-updating thumbnail; empty = use platform default
 	Duration       string
 	Filesize       string
+	TotalDiskUsage string // total bytes across all recordings for this channel
 	Filename       string
 	StreamedAt     string
 	MaxDuration    string
@@ -80,6 +101,13 @@ type ChannelInfo struct {
 	UploadStatus   string  // human-readable upload status (empty = idle)
 	UploadProgress float64 // 0–100 upload progress estimate
 	UploadFilename string  // file currently being uploaded
+
+	// Persisted room metadata (shown even when offline).
+	RoomTitle        string
+	Gender           string
+	NumViewers       int
+	EdgeRegion       string
+	SummaryCardImage string
 }
 
 // HostEntry holds live upload progress for a single host.
@@ -157,10 +185,7 @@ type Config struct {
 	Csrftoken     string
 	CfClearance   string
 	UserAgent     string
-	Domain        string
-	ProxyURL      string
-	ProxyUsername string
-	ProxyPassword string
+	Domain string
 
 	OutputDir               string
 	PerModelFolder          bool
@@ -184,6 +209,26 @@ type Config struct {
 	StripchatPDKey string
 
 	FFmpegPath string
+
+	// Finalization: how closed recordings are post-processed
+	// ("none" = BuildSeekIndex only, "remux" / "transcode" = ffmpeg).
+	CompletedDir    string
+	FinalizeMode    string
+	FFmpegEncoder   string
+	FFmpegContainer string
+	FFmpegQuality   int
+	FFmpegPreset    string
+	Debug           bool
+
+	// Notifications (Discord + ntfy) — persisted via settings, editable in web UI.
+	NtfyURL             string
+	NtfyTopic           string
+	NtfyToken           string
+	DiscordWebhookURL   string
+	CFChannelThreshold  int // consecutive CF blocks before per-channel alert; default 5
+	CFGlobalThreshold   int // channels hitting CF in same window for global alert; default 3
+	NotifyCooldownHours int // hours between repeated alerts of the same type; default 4
+	NotifyStreamOnline  bool
 
 	SessionDuration       string        // recording session length (e.g. "5h20m0s"); empty = disabled (continuous recording)
 	SessionDurationParsed time.Duration // parsed from SessionDuration; 0 = disabled

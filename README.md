@@ -13,7 +13,6 @@ A high-performance, always-on stream recorder and video manager for Chaturbate a
 - **Built-in web UI** — Dark-mode dashboard with live channel logs (SSE), video browser, and player with HLS support
 - **Adaptive rate limiting** — Token-bucket rate limiter + circuit breaker for resilient API calls
 - **Chrome TLS fingerprinting** — Uses httpcloak to spoof Chrome 146 TLS fingerprints, bypassing Cloudflare WAF
-- **SOCKS5 proxy support** — Proxy rotation for CDN and API requests
 - **Cloudflare tunnels** — One-command public access via cloudflared
 - **Scheduled task persistence** — Windows Task Scheduler for auto-restart on reboot
 - **File watcher** — fsnotify-based watcher for external video processing
@@ -80,7 +79,6 @@ All configuration is done via environment variables (`.env` file) and JSON confi
 |---|---|---|
 | `SUPABASE_URL` | Yes | Supabase project URL |
 | `SUPABASE_API_KEY` | Yes | Supabase anon/service key |
-| `PROXY_URL` | No | SOCKS5 proxy URL (`socks5://host:port`) |
 | `USER_AGENT` | No | Custom User-Agent for API requests |
 
 ### Config Files
@@ -192,7 +190,7 @@ MiniDelectableService/
 ├── internal/                  # HTTP client (httpcloak), rate limiter, errors
 ├── watcher/                   # fsnotify file watcher
 ├── scripts/                   # Diagnostic and utility scripts
-├── docs/                      # Proxy/cookie/setup documentation
+├── docs/                      # Cookie/setup documentation
 ├── setup.bat                  # Automated Windows setup
 └── setup.ps1                  # PowerShell equivalent
 ```
@@ -367,11 +365,10 @@ Set `CHANNEL_POOL_MODE=isolated` on all nodes and restart. The existing `channel
 
 The project includes a GitHub Actions workflow that provisions a Windows RDP runner:
 
-1. Sets up a SOCKS5 proxy (Netherlands)
-2. Installs FFmpeg, Tailscale, cloudflared
-3. Clones the repo and runs `setup.bat`
-4. Creates scheduled tasks for DVR and tunnel persistence
-5. Provides RDP access via Tailscale
+1. Installs FFmpeg, Tailscale, cloudflared
+2. Clones the repo and runs `setup.bat`
+3. Creates scheduled tasks for DVR and tunnel persistence
+4. Provides RDP access via Tailscale
 
 **Required Secrets:**
 | Secret | Description |

@@ -21,10 +21,10 @@ import (
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/manager"
+	"github.com/teacat/chaturbate-dvr/notifier"
 	"github.com/teacat/chaturbate-dvr/router"
 	"github.com/teacat/chaturbate-dvr/server"
 	"github.com/teacat/chaturbate-dvr/site"
-	"github.com/teacat/chaturbate-dvr/stripchat"
 	"github.com/urfave/cli/v2"
 )
 
@@ -165,24 +165,6 @@ func main() {
 				Value: "https://chaturbate.com/",
 			},
 			&cli.StringFlag{
-				Name:    "proxy-url",
-				Usage:   "HTTP/SOCKS5 proxy URL for Chaturbate requests",
-				EnvVars: []string{"PROXY_URL", "PROXY_SERVER", "ALL_PROXY", "all_proxy", "SOCKS_PROXY"},
-				Value:   "",
-			},
-			&cli.StringFlag{
-				Name:    "proxy-username",
-				Usage:   "Proxy username",
-				EnvVars: []string{"PROXY_USERNAME"},
-				Value:   "",
-			},
-			&cli.StringFlag{
-				Name:    "proxy-password",
-				Usage:   "Proxy password",
-				EnvVars: []string{"PROXY_PASSWORD"},
-				Value:   "",
-			},
-			&cli.StringFlag{
 				Name:    "ffmpeg-path",
 				Usage:   "Path to ffmpeg executable (e.g. C:\\ffmpeg\\bin\\ffmpeg.exe). If not set, PATH is used.",
 				EnvVars: []string{"FFMPEG_PATH"},
@@ -321,6 +303,94 @@ func main() {
 				EnvVars: []string{"NODE_ID"},
 				Value:   "",
 			},
+
+			// ── Finalization ────────────────────────────────────────────────
+			&cli.StringFlag{
+				Name:    "completed-dir",
+				Usage:   "Directory to move fully closed recordings into (default: <recording dir>/completed)",
+				EnvVars: []string{"COMPLETED_DIR"},
+				Value:   "",
+			},
+			&cli.StringFlag{
+				Name:  "finalize-mode",
+				Usage: "Post-process closed recordings: none (fast seek index), remux, or transcode",
+				Value: "none",
+			},
+			&cli.StringFlag{
+				Name:  "ffmpeg-encoder",
+				Usage: "FFmpeg video encoder for transcode mode (e.g. libx264, libx265, h264_nvenc)",
+				Value: "libx264",
+			},
+			&cli.StringFlag{
+				Name:  "ffmpeg-container",
+				Usage: "FFmpeg output container for remux/transcode mode (mp4 or mkv)",
+				Value: "mp4",
+			},
+			&cli.IntFlag{
+				Name:  "ffmpeg-quality",
+				Usage: "FFmpeg quality value (CRF for software encoders, CQ for many hardware encoders)",
+				Value: 23,
+			},
+			&cli.StringFlag{
+				Name:  "ffmpeg-preset",
+				Usage: "FFmpeg preset for transcode mode",
+				Value: "medium",
+			},
+			&cli.BoolFlag{
+				Name:  "debug",
+				Usage: "Write full HTML responses to temp files when stream detection fails and log verbose details",
+				Value: false,
+			},
+
+			// ── Notifications ───────────────────────────────────────────────
+			&cli.StringFlag{
+				Name:    "ntfy-url",
+				Usage:   "ntfy.sh server URL for notifications (e.g. https://ntfy.sh)",
+				EnvVars: []string{"NTFY_URL"},
+				Value:   "",
+			},
+			&cli.StringFlag{
+				Name:    "ntfy-topic",
+				Usage:   "ntfy.sh topic for notifications",
+				EnvVars: []string{"NTFY_TOPIC"},
+				Value:   "",
+			},
+			&cli.StringFlag{
+				Name:    "ntfy-token",
+				Usage:   "ntfy.sh access token (optional)",
+				EnvVars: []string{"NTFY_TOKEN"},
+				Value:   "",
+			},
+			&cli.StringFlag{
+				Name:    "discord-webhook-url",
+				Usage:   "Discord webhook URL for notifications",
+				EnvVars: []string{"DISCORD_WEBHOOK_URL"},
+				Value:   "",
+			},
+			&cli.IntFlag{
+				Name:    "cf-channel-threshold",
+				Usage:   "Consecutive Cloudflare blocks per channel before a notification fires (default 5)",
+				EnvVars: []string{"CF_CHANNEL_THRESHOLD"},
+				Value:   5,
+			},
+			&cli.IntFlag{
+				Name:    "cf-global-threshold",
+				Usage:   "Channels blocked simultaneously before a global Cloudflare notification fires (default 3)",
+				EnvVars: []string{"CF_GLOBAL_THRESHOLD"},
+				Value:   3,
+			},
+			&cli.IntFlag{
+				Name:    "notify-cooldown-hours",
+				Usage:   "Hours between repeated notifications of the same type (default 4)",
+				EnvVars: []string{"NOTIFY_COOLDOWN_HOURS"},
+				Value:   4,
+			},
+			&cli.BoolFlag{
+				Name:    "notify-stream-online",
+				Usage:   "Send a notification when a watched channel goes live",
+				EnvVars: []string{"NOTIFY_STREAM_ONLINE"},
+				Value:   false,
+			},
 		},
 		Action: start,
 	}
@@ -368,10 +438,7 @@ func start(c *cli.Context) error {
 	}
 
 	// Warm up TLS sessions with Cloudflare in the background so server
-	// startup is not delayed by slow/unreachable SOCKS5 proxies.
-	// The httpcloak pool-level dial doesn't propagate the context deadline
-	// during the SOCKS5 handshake, causing it to block for the OS TCP
-	// timeout (~30-120s) instead of the desired 10s context deadline.
+	// startup is not delayed by the first connection.
 	go func() {
 		warmupT := time.Now()
 		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -388,6 +455,9 @@ func start(c *cli.Context) error {
 		return fmt.Errorf("new manager: %w", err)
 	}
 	fmt.Printf("[startup] manager created in %v\n", time.Since(started).Round(time.Millisecond))
+
+	// Route disk-threshold alerts through the notifier (Discord/ntfy).
+	server.DiskAlert = notifier.Notify
 
 	// ── Distributed coordinator ──────────────────────────────────────────
 	var coord *coordinator.Coordinator
@@ -554,7 +624,7 @@ func (l *liveChecker) IsLive(ctx context.Context, siteName, username string) boo
 	var siteImpl site.Site
 	switch siteName {
 	case "stripchat":
-		siteImpl = stripchat.NewStripchatSite()
+		siteImpl = site.NewStripchatSite()
 	default:
 		siteImpl = site.NewChaturbateSite()
 	}

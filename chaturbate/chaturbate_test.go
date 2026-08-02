@@ -7,10 +7,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/grafov/m3u8"
 	"github.com/teacat/chaturbate-dvr/entity"
-	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
 )
 
@@ -20,7 +20,7 @@ func TestPickPlaylistIncludesDefaultAudioRendition(t *testing.T) {
 	master := &m3u8.MasterPlaylist{
 		Variants: []*m3u8.Variant{
 			{
-				URI: "video.m3u8",
+				URI: "llhls_video.m3u8",
 				VariantParams: m3u8.VariantParams{
 					Resolution: "1920x1080",
 					FrameRate:  60,
@@ -33,15 +33,20 @@ func TestPickPlaylistIncludesDefaultAudioRendition(t *testing.T) {
 		},
 	}
 
+	// The audio rendition is resolved only for LL-HLS/fMP4 streams (the
+	// variant URL must signal llhls/.m4s, or the base URL a Stripchat CDN).
 	playlist, err := PickPlaylist(master, "https://example.com/master.m3u8", 1080, 60)
 	if err != nil {
 		t.Fatalf("PickPlaylist() error = %v", err)
 	}
-	if got, want := playlist.PlaylistURL, "https://example.com/video.m3u8"; got != want {
+	if got, want := playlist.PlaylistURL, "https://example.com/llhls_video.m3u8"; got != want {
 		t.Fatalf("PlaylistURL = %q, want %q", got, want)
 	}
 	if got, want := playlist.AudioPlaylistURL, "https://example.com/audio-en.m3u8"; got != want {
 		t.Fatalf("AudioPlaylistURL = %q, want %q", got, want)
+	}
+	if got, want := playlist.FileExt, ".mp4"; got != want {
+		t.Fatalf("FileExt = %q, want %q", got, want)
 	}
 }
 
@@ -64,14 +69,15 @@ func TestAlternateEdgeURLsPreservesLLHLSToken(t *testing.T) {
 	}
 }
 
-// TestProcessMediaPlaylistKeepsLastSeqOnFetchFailure guards against silent
-// segment drop: if a segment fetch fails, lastSeq must not advance past the
-// failed segment, so the next playlist poll can retry it (or at minimum not
-// claim it was successfully processed).
-func TestProcessMediaPlaylistKeepsLastSeqOnFetchFailure(t *testing.T) {
+// TestWatchSegmentsContinuesAfterSegmentFetchFailure guards against a
+// transient segment fetch failure permanently stalling the recording loop.
+// The failed segment (seq 101) is skipped after its fetch attempts fail, but
+// recording must continue with later segments (seq 102) on the next poll.
+func TestWatchSegmentsContinuesAfterSegmentFetchFailure(t *testing.T) {
 	if server.Config == nil {
 		server.Config = &entity.Config{}
 	}
+	server.Config.Debug = false
 
 	playlistBody := strings.Join([]string{
 		"#EXTM3U",
@@ -86,8 +92,6 @@ func TestProcessMediaPlaylistKeepsLastSeqOnFetchFailure(t *testing.T) {
 		"seg_3_102_video_abc.m4s",
 		"",
 	}, "\n")
-
-	var handlerCalls int32
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/playlist.m3u8", func(w http.ResponseWriter, _ *http.Request) {
@@ -117,27 +121,32 @@ func TestProcessMediaPlaylistKeepsLastSeqOnFetchFailure(t *testing.T) {
 
 	pl := &Playlist{
 		PlaylistURL: srv.URL + "/playlist.m3u8",
+		RootURL:     srv.URL + "/",
 	}
 
+	var handlerCalls atomic.Int32
 	handler := func(_ []byte, _ float64) error {
-		atomic.AddInt32(&handlerCalls, 1)
+		handlerCalls.Add(1)
 		return nil
 	}
 
-	lastSeq := -1
-	initWritten := false
-	_, err := pl.processMediaPlaylist(context.Background(), internal.NewReq(), pl.PlaylistURL, handler, nil, &lastSeq, &initWritten)
-	if err == nil {
-		t.Fatalf("processMediaPlaylist() error = nil, want segment fetch error")
-	}
-	if !strings.Contains(err.Error(), "segment seq=101") {
-		t.Fatalf("processMediaPlaylist() error = %v, want segment seq=101", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if got := atomic.LoadInt32(&handlerCalls); got != 1 {
-		t.Fatalf("handler called %d times, want 1 (should stop at first failure)", got)
+	done := make(chan error, 1)
+	go func() {
+		done <- pl.WatchSegments(ctx, handler)
+	}()
+
+	// seg_1 (seq 100) must reach the handler, the failed seg_2 (seq 101) must
+	// be skipped, and seg_3 (seq 102) must still be recorded on the next poll.
+	deadline := time.Now().Add(20 * time.Second)
+	for handlerCalls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
 	}
-	if lastSeq != 100 {
-		t.Fatalf("lastSeq = %d, want 100 (must not advance past failed segment 101)", lastSeq)
+	cancel()
+
+	if got := handlerCalls.Load(); got != 2 {
+		t.Fatalf("handler called %d times, want 2 (seg_1 + seg_3; failed seg_2 must be skipped)", got)
 	}
 }

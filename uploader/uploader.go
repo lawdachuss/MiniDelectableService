@@ -16,8 +16,8 @@ import (
 
 // newNoProxyClient returns an http.Client that explicitly bypasses any
 // environment-configured proxy (ALL_PROXY / HTTP_PROXY / HTTPS_PROXY).
-// The Chaturbate DVR proxy setting is only meant for Chaturbate requests;
-// image/thumbnail upload services must reach the public internet directly.
+// All connections are direct; image/thumbnail upload services must reach
+// the public internet directly.
 func newNoProxyClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,

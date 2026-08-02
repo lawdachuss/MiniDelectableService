@@ -3,16 +3,13 @@ package internal
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sardanioss/httpcloak"
-	"github.com/teacat/chaturbate-dvr/server"
 )
 
 // httpcloakTransport wraps httpcloak.Client as an http.RoundTripper.
@@ -21,14 +18,12 @@ import (
 // ECH (Encrypted Client Hello) hides the SNI from network observers for
 // better Cloudflare bot scores.
 //
-// When the SOCKS5 proxy is unreachable (i/o timeout, connection refused),
-// automatically rotates to the next proxy URL in the list. This handles
-// the case where free proxy servers are intermittently available.
+// All connections are direct (no proxy). Plain-HTTP requests, CDN hosts and
+// Stripchat go through http.DefaultTransport; everything else uses the
+// httpcloak client.
 type httpcloakTransport struct {
-	mu        sync.Mutex
-	client    *httpcloak.Client
-	proxyURLs []string
-	proxyIdx  int
+	mu     sync.Mutex
+	client *httpcloak.Client
 }
 
 // sharedTransportSingleton is a singleton http.RoundTripper for the shared transport.
@@ -37,103 +32,22 @@ var sharedTransportOnce sync.Once
 
 func getSharedTransport() http.RoundTripper {
 	sharedTransportOnce.Do(func() {
-		proxyURLs := configuredProxyURLs()
-		client := newCloakClient(proxyURLAt(proxyURLs, 0))
 		sharedTransportSingleton = &httpcloakTransport{
-			client:    client,
-			proxyURLs: proxyURLs,
+			client: newCloakClient(),
 		}
 	})
 	return sharedTransportSingleton
 }
 
-func proxyURLAt(urls []string, idx int) string {
-	if len(urls) == 0 {
-		return ""
-	}
-	return urls[idx%len(urls)]
-}
-
-// newCloakClient creates a new httpcloak client with the given proxy URL.
-func newCloakClient(proxyURL string) *httpcloak.Client {
-	opts := []httpcloak.Option{
-		httpcloak.WithTimeout(120 * time.Second),
-	}
-	if proxyURL != "" {
-		opts = append(opts, httpcloak.WithProxy(proxyURL))
-	}
-	return httpcloak.New("chrome-146-windows", opts...)
-}
-
-// configuredProxyURLs returns all proxy URLs (supports comma-separated for failover).
-func configuredProxyURLs() []string {
-	if server.Config == nil {
-		return nil
-	}
-	raw := strings.TrimSpace(server.Config.ProxyURL)
-	if raw == "" {
-		return nil
-	}
-
-	username := strings.TrimSpace(server.Config.ProxyUsername)
-	password := strings.TrimSpace(server.Config.ProxyPassword)
-
-	var urls []string
-	for _, part := range strings.Split(raw, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		part = applyProxyAuth(part, username, password)
-		urls = append(urls, part)
-	}
-	return urls
-}
-
-func applyProxyAuth(proxyURL, username, password string) string {
-	if username == "" && password == "" {
-		return proxyURL
-	}
-	u, err := url.Parse(proxyURL)
-	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil {
-		return proxyURL
-	}
-	if password != "" {
-		u.User = url.UserPassword(username, password)
-	} else {
-		u.User = url.User(username)
-	}
-	return u.String()
-}
-
-// rotateProxy recreates the httpcloak client with the next proxy in the list.
-// Returns true if a different proxy was selected.
-func (t *httpcloakTransport) rotateProxy() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if len(t.proxyURLs) <= 1 {
-		return false
-	}
-
-	t.proxyIdx++
-	proxyURL := proxyURLAt(t.proxyURLs, t.proxyIdx)
-
-	// Close old client if it exposes a Close method
-	if c, ok := interface{}(t.client).(interface{ Close() error }); ok {
-		c.Close()
-	}
-
-	t.client = newCloakClient(proxyURL)
-	return true
+// newCloakClient creates a new httpcloak client with a Chrome 146 TLS fingerprint.
+func newCloakClient() *httpcloak.Client {
+	return httpcloak.New("chrome-146-windows", httpcloak.WithTimeout(120*time.Second))
 }
 
 // WarmupChaturbate makes an initial request to chaturbate.com to establish
 // TLS session tickets with Cloudflare before any API calls are made.
 // This gives subsequent requests TLS session resumption, making them look
-// more like a returning browser visitor.
-// Uses a single-attempt round trip — warmup is best-effort and should not
-// retry through multiple proxies (that can delay startup by 30s per domain).
+// more like a returning browser visitor. Best-effort — single attempt.
 func WarmupChaturbate(ctx context.Context) {
 	req, err := http.NewRequestWithContext(ctx, "HEAD", "https://chaturbate.com/", nil)
 	if err != nil {
@@ -144,7 +58,7 @@ func WarmupChaturbate(ctx context.Context) {
 	if !ok {
 		return
 	}
-	resp, err := t.roundTripOnce(req)
+	resp, err := t.RoundTrip(req)
 	if err != nil {
 		return
 	}
@@ -164,41 +78,26 @@ func WarmupStripchat(ctx context.Context) {
 	if !ok {
 		return
 	}
-	resp, err := t.roundTripOnce(req)
+	resp, err := t.RoundTrip(req)
 	if err != nil {
 		return
 	}
 	resp.Body.Close()
 }
 
-// isProxyError checks if an error is a proxy connection failure (SOCKS5 unreachable).
-// These errors trigger automatic proxy rotation.
-func isProxyError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "SOCKS5 CONNECT failed") ||
-		strings.Contains(msg, "connect to SOCKS5 proxy") ||
-		strings.Contains(msg, "i/o timeout") ||
-		strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "no reachable proxy")
-}
-
 // cdnHostSuffixes lists CDN hostname suffixes that serve HLS segments
-// with signed URLs (pkey/token). These hosts are directly reachable from
-// any region — the proxy is only needed for geo-unblocking API requests
-// (chaturbate.com, stripchat.com). Bypassing the proxy for CDN eliminates
-// the slow-proxy → timeout → pkey-expiry failure chain.
+// with signed URLs (pkey/token). These hosts are routed through
+// http.DefaultTransport directly.
 var cdnHostSuffixes = []string{
 	".doppiocdn.net",
 	".doppiocdn.com",
 	".live.mmcdn.com",
 }
 
-// proxyBypassHosts lists hosts that should never use the proxy.
-// Stripchat doesn't need a Netherlands proxy — it has no age verification.
-var proxyBypassHosts = []string{
+// directHosts lists hosts that should always use http.DefaultTransport.
+// Stripchat has no age-verification wall, so it doesn't need the Chrome
+// fingerprint client.
+var directHosts = []string{
 	"stripchat.com",
 	".stripchat.com",
 }
@@ -213,9 +112,9 @@ func isCDNHost(host string) bool {
 	return false
 }
 
-func isProxyBypassHost(host string) bool {
+func isDirectHost(host string) bool {
 	host = strings.ToLower(host)
-	for _, h := range proxyBypassHosts {
+	for _, h := range directHosts {
 		if host == h || strings.HasSuffix(host, h) {
 			return true
 		}
@@ -223,10 +122,16 @@ func isProxyBypassHost(host string) bool {
 	return false
 }
 
-// roundTripOnce executes a single request attempt using the current httpcloak
-// client. No proxy rotation — used by warmup functions (best-effort).
-func (t *httpcloakTransport) roundTripOnce(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) || isProxyBypassHost(req.URL.Host) {
+// shouldUseDefaultTransport reports whether a request should bypass the
+// httpcloak client and go straight through http.DefaultTransport.
+func shouldUseDefaultTransport(req *http.Request) bool {
+	return req.URL.Scheme == "http" || isCDNHost(req.URL.Host) || isDirectHost(req.URL.Host)
+}
+
+// RoundTrip implements http.RoundTripper. All connections are direct;
+// CDN/HTTP/Stripchat requests bypass the httpcloak client entirely.
+func (t *httpcloakTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if shouldUseDefaultTransport(req) {
 		return http.DefaultTransport.RoundTrip(req)
 	}
 
@@ -237,6 +142,7 @@ func (t *httpcloakTransport) roundTripOnce(req *http.Request) (*http.Response, e
 		defer cancel()
 	}
 
+	// Prepare request body once
 	var bodyBytes []byte
 	if req.Body != nil {
 		var err error
@@ -285,90 +191,4 @@ func (t *httpcloakTransport) roundTripOnce(req *http.Request) (*http.Response, e
 		}
 	}
 	return resp, nil
-}
-
-// RoundTrip implements http.RoundTripper. CDN requests bypass the proxy
-// entirely. API requests use httpcloak with the SOCKS5 proxy, and
-// automatically rotate to the next proxy on connection failure.
-func (t *httpcloakTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) || isProxyBypassHost(req.URL.Host) {
-		return http.DefaultTransport.RoundTrip(req)
-	}
-
-	ctx := req.Context()
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-	}
-
-	// Prepare request body once, reuse across retries
-	var bodyBytes []byte
-	if req.Body != nil {
-		var err error
-		bodyBytes, err = io.ReadAll(req.Body)
-		req.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Try up to len(proxyURLs) attempts, rotating proxy on connection failures.
-	for attempt := 0; attempt < max(1, len(t.proxyURLs)); attempt++ {
-		t.mu.Lock()
-		client := t.client
-		t.mu.Unlock()
-
-		cloakReq := &httpcloak.Request{
-			Method:  req.Method,
-			URL:     req.URL.String(),
-			Headers: req.Header,
-		}
-		if len(bodyBytes) > 0 {
-			cloakReq.Body = bytes.NewReader(bodyBytes)
-		}
-
-		cloakResp, err := client.Do(ctx, cloakReq)
-
-		if err == nil {
-			body, bodyErr := cloakResp.Bytes()
-			if bodyErr != nil {
-				cloakResp.Close()
-				return nil, bodyErr
-			}
-
-			resp := &http.Response{
-				StatusCode: cloakResp.StatusCode,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewReader(body)),
-				Request:    req,
-			}
-			if cloakResp.Headers != nil {
-				for k, vs := range cloakResp.Headers {
-					for _, v := range vs {
-						resp.Header.Add(k, v)
-					}
-				}
-			}
-			return resp, nil
-		}
-
-		// Proxy connection failure — rotate to next proxy in the list
-		if isProxyError(err) {
-			if t.rotateProxy() {
-				continue
-			}
-		}
-		return nil, err
-	}
-
-	return nil, fmt.Errorf("all proxies failed")
-}
-
-// max returns the larger of a and b.
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

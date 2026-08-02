@@ -82,7 +82,7 @@ def extract_single_cookie(cookie_str, name):
     return None
 
 
-def try_refresh_with_curl_cffi(user_agent, proxy=None):
+def try_refresh_with_curl_cffi(user_agent):
     """Try to get fresh cookies using curl_cffi (browser TLS impersonation).
 
     Returns dict of new cookies, or empty dict on failure.
@@ -99,15 +99,6 @@ def try_refresh_with_curl_cffi(user_agent, proxy=None):
     impersonate = "chrome124"
     session_cookies = {}
 
-    proxies = None
-    if proxy:
-        # curl_cffi uses socks5h:// for DNS resolution through proxy
-        if proxy.startswith("socks5://"):
-            proxy_h = proxy.replace("socks5://", "socks5h://", 1)
-        else:
-            proxy_h = proxy
-        proxies = {"https": proxy_h, "http": proxy_h}
-        print(f"  Using proxy: {proxy}")
 
     # First: visit chaturbate.com to get initial cookies
     try:
@@ -115,7 +106,6 @@ def try_refresh_with_curl_cffi(user_agent, proxy=None):
             "https://chaturbate.com",
             impersonate=impersonate,
             timeout=60,
-            proxies=proxies,
             headers={"User-Agent": user_agent} if user_agent else None,
             allow_redirects=True,
         )
@@ -184,7 +174,6 @@ def main():
 
     supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
     supabase_key = os.environ.get("SUPABASE_API_KEY", "")
-    proxy = os.environ.get("ALL_PROXY", "")
 
     if not supabase_url or not supabase_key:
         print("  [SKIP] SUPABASE_URL or SUPABASE_API_KEY not set")
@@ -246,12 +235,12 @@ def main():
     print(f"  sessionid: {'[OK]' if 'sessionid' in old else '[NO]'}")
     print(f"  csrftoken: {'[OK]' if 'csrftoken' in old else '[NO]'}")
     print(f"  cf_clearance: {'[OK]' if 'cf_clearance' in old else '[NO]'}")
-    print(f"  Proxy: {'[OK] ' + proxy if proxy else '[NO] (direct)'}")
+    print("  Proxy: [NO] (direct connection)")
 
     # --- Try to refresh cookies ---
     print("\n[2/3] Refreshing cookies...")
 
-    new_cookies = try_refresh_with_curl_cffi(user_agent, proxy)
+    new_cookies = try_refresh_with_curl_cffi(user_agent)
 
     # --- Merge and save ---
     print("\n[3/3] Merging cookies...")

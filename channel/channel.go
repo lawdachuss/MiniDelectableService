@@ -14,16 +14,13 @@ import (
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
 	"github.com/teacat/chaturbate-dvr/site"
-	"github.com/teacat/chaturbate-dvr/stripchat"
 )
 
 // pendingFile tracks a closed recording file awaiting post-processing
-// (mux, move to output dir, thumbnail, upload, DB save, deletion).
+// (finalize → move to output dir → thumbnail → upload → DB save → deletion).
 type pendingFile struct {
-	videoPath        string
-	audioPath        string // empty if no separate audio
-	hasSeparateAudio bool   // captured at queue-time so file-level A/V pairing survives stream config changes
-	skipMinDuration  bool   // when true, bypass the minimum-duration threshold (used on pause)
+	videoPath       string
+	skipMinDuration bool // when true, bypass the minimum-duration threshold (used on pause)
 }
 
 // Channel represents a channel instance.
@@ -38,44 +35,51 @@ type Channel struct {
 
 	IsOnline     bool
 	IsConnecting bool   // true during retry/reconnect, shown as "Reconnecting..." in UI
-	RoomStatus   string // public, private, group, away, offline
+	RoomStatus   string // public, private, group, away, offline, hidden
 	StreamedAt   int64
 	Duration     float64 // Seconds
 	Filesize     int     // Bytes
 	Sequence     int
+	FileExt      string // ".ts" or ".mp4", set per-stream
+	CurrentFilename string
 
 	CompressingCount int32 // atomic: number of active compression goroutines
 
-	stateMu sync.Mutex // protects IsOnline, IsConnecting, RoomStatus, Duration, Filesize
+	stateMu sync.Mutex // protects IsOnline, IsConnecting, RoomStatus, metadata fields
 
-	RoomTitle    string   // captured from API at recording start
-	Tags         []string // captured from API at recording start
-	Viewers      int      // captured from API at recording start
-	Gender       string   // broadcaster_gender from Chaturbate API ("m", "f", "c", "t", …)
-	Resolution   string   // actual stream resolution (e.g. "1920x1080")
-	Framerate    int      // actual stream framerate (e.g. 30)
-	LiveThumbURL string   // live thumbnail URL for the current stream
+	RoomTitle        string   // captured from API, persisted even when offline
+	Tags             []string // captured from API at recording start
+	Viewers          int      // captured from API at recording start
+	Gender           string   // broadcaster_gender from API ("m", "f", "c", "t", …)
+	Resolution       string   // actual stream resolution (e.g. "1920x1080")
+	Framerate        int      // actual stream framerate (e.g. 30)
+	LiveThumbURL     string   // live thumbnail URL for the current stream
+	SummaryCardImage string   // static profile card image; persisted even when offline
+	CFBlockCount     int      // consecutive Cloudflare-blocked responses
 
 	Logs   []string
 	logsMu sync.Mutex
 
-	File              *os.File
-	AudioFile         *os.File
-	Config            *entity.ChannelConfig
-	CurrentFilename   string
-	InitSegment       []byte // fMP4 video init segment for LL-HLS streams
-	AudioInitSegment  []byte // fMP4 audio init segment for LL-HLS streams
-	HasSeparateAudio  bool
-	switchRequested   bool       // set by HandleSegment, consumed by OnPollComplete
-	videoSegmentCount int        // tracks video segments written to current file
-	audioSegmentCount int        // tracks audio segments written to current file
-	cleanupMu         sync.Mutex // serialises Cleanup() calls from concurrent goroutines
-	pendingFiles      []pendingFile
-	pendingWg         sync.WaitGroup // tracks async pending-file processing goroutine
-	UploadWg          sync.WaitGroup // tracks in-flight upload goroutines for graceful shutdown
-	monitorWg         sync.WaitGroup // tracks the Monitor goroutine lifetime
-	uploadSem         chan struct{}  // per-channel upload semaphore (1 at a time)
-	PipelineQueue     *PipelineQueue // ordered pipeline for thumbnails → upload → metadata → cleanup
+	File           *os.File
+	mp4InitSegment []byte
+	Config         *entity.ChannelConfig
+
+	fileMu     sync.RWMutex // protects File, mp4InitSegment, Duration, Filesize, TotalDiskUsageBytes
+	monitorMu  sync.Mutex
+	monitorRunning bool
+	monitorRestartRequested bool
+	monitorRunID uint64
+	monitorDone chan struct{}
+
+	cleanupMu    sync.Mutex // serialises Cleanup() calls from concurrent goroutines
+	pendingFiles []pendingFile
+	pendingWg    sync.WaitGroup // tracks async pending-file finalization goroutines
+	UploadWg     sync.WaitGroup // tracks in-flight upload goroutines for graceful shutdown
+	monitorWg    sync.WaitGroup // tracks the Monitor goroutine lifetime
+	uploadSem    chan struct{}  // per-channel upload semaphore (1 at a time)
+	PipelineQueue *PipelineQueue // ordered pipeline for thumbnails → upload → metadata → cleanup
+
+	TotalDiskUsageBytes int64 // total bytes across all recordings for this channel
 
 	// Upload progress tracking — updated by the pipeline worker goroutine.
 	// Thread-safe via uploadStatusMu; visible in the UI via ExportInfo().
@@ -102,6 +106,10 @@ func New(conf *entity.ChannelConfig) *Channel {
 		PauseCancelFunc: func() {},
 		uploadSem:       make(chan struct{}, 1),
 		RoomStatus:      "offline",
+		RoomTitle:       conf.RoomTitle,
+		Gender:          conf.Gender,
+		SummaryCardImage: conf.SummaryCardImage,
+		StreamedAt:      conf.StreamedAt,
 	}
 	ch.PipelineQueue = NewPipelineQueue(ch)
 	go ch.Publisher()
@@ -172,6 +180,19 @@ func (ch *Channel) Info(format string, a ...any) {
 		log.Printf(" WARN [%s] log queue full, dropped: %s", ch.Config.Username, msg)
 	}
 	log.Printf(" INFO [%s] %s", ch.Config.Username, fmt.Sprintf(format, a...))
+}
+
+// Verbose logs a message to the browser log always, and to stdout only when --debug is enabled.
+// Use this for high-frequency events (e.g. per-segment updates) that would clutter the console.
+func (ch *Channel) Verbose(format string, a ...any) {
+	msg := fmt.Sprintf("%s [INFO] %s", time.Now().Format("15:04"), fmt.Sprintf(format, a...))
+	select {
+	case ch.LogCh <- msg:
+	default:
+	}
+	if server.Config != nil && server.Config.Debug {
+		log.Printf(" INFO [%s] %s", ch.Config.Username, fmt.Sprintf(format, a...))
+	}
 }
 
 // Warn logs a warning message.
@@ -255,6 +276,18 @@ func (ch *Channel) ExportStatusInfo() *entity.ChannelInfo {
 }
 
 func (ch *Channel) exportInfo(includeLogs bool) *entity.ChannelInfo {
+	ch.fileMu.RLock()
+	duration := ch.Duration
+	filesize := ch.Filesize
+	totalDiskUsageBytes := ch.TotalDiskUsageBytes
+	currentFilename := ch.CurrentFilename
+	fileExt := ch.FileExt
+	var fileName string
+	if ch.File != nil {
+		fileName = ch.File.Name()
+	}
+	ch.fileMu.RUnlock()
+
 	ch.stateMu.Lock()
 	var streamedAt string
 	if ch.StreamedAt != 0 {
@@ -263,23 +296,19 @@ func (ch *Channel) exportInfo(includeLogs bool) *entity.ChannelInfo {
 	isOnline := ch.IsOnline
 	isConnecting := ch.IsConnecting
 	roomStatus := ch.RoomStatus
-	duration := ch.Duration
-	filesize := ch.Filesize
-	currentFilename := ch.CurrentFilename
-	hasSeparateAudio := ch.HasSeparateAudio
-	hasFile := ch.File != nil
 	liveThumbURL := ch.LiveThumbURL
-	var fileName string
-	if hasFile {
-		fileName = ch.File.Name()
-	}
+	roomTitle := ch.RoomTitle
+	gender := ch.Gender
+	viewers := ch.Viewers
+	summaryCardImage := ch.SummaryCardImage
 	ch.stateMu.Unlock()
 
 	var filename string
-	if currentFilename != "" && hasSeparateAudio {
-		filename = currentFilename + ".mp4"
-	} else if hasFile {
+	switch {
+	case fileName != "":
 		filename = fileName
+	case currentFilename != "":
+		filename = currentFilename + fileExt
 	}
 
 	var logsCopy []string
@@ -306,34 +335,43 @@ func (ch *Channel) exportInfo(includeLogs bool) *entity.ChannelInfo {
 	}
 
 	return &entity.ChannelInfo{
-		IsOnline:       isOnline,
-		IsConnecting:   isConnecting,
-		IsPaused:       ch.Config.IsPaused.Load(),
-		IsCompressing:  atomic.LoadInt32(&ch.CompressingCount) > 0,
-		RoomStatus:     roomStatus,
-		Username:       ch.Config.Username,
-		Site:           siteName,
-		SiteDomain:     siteDomain,
-		LiveThumbURL:   liveThumbURL,
-		MaxDuration:    internal.FormatDuration(float64(ch.Config.MaxDuration * 60)),
-		MaxFilesize:    internal.FormatFilesize(ch.Config.MaxFilesize * 1024 * 1024),
-		StreamedAt:     streamedAt,
-		CreatedAt:      ch.Config.CreatedAt,
-		Duration:       internal.FormatDuration(duration),
-		Filesize:       internal.FormatFilesize(filesize),
-		Filename:       filename,
-		Logs:           logsCopy,
-		GlobalConfig:   server.Config,
-		UploadStatus:   uploadStatus,
-		UploadProgress: uploadProgress,
-		UploadFilename: uploadFilename,
+		IsOnline:         isOnline,
+		IsConnecting:     isConnecting,
+		IsPaused:         ch.Config.IsPaused.Load(),
+		IsCompressing:    atomic.LoadInt32(&ch.CompressingCount) > 0,
+		RoomStatus:       roomStatus,
+		Username:         ch.Config.Username,
+		Site:             siteName,
+		SiteDomain:       siteDomain,
+		LiveThumbURL:     liveThumbURL,
+		MaxDuration:      internal.FormatDuration(float64(ch.Config.MaxDuration * 60)),
+		MaxFilesize:      internal.FormatFilesize(ch.Config.MaxFilesize * 1024 * 1024),
+		StreamedAt:       streamedAt,
+		CreatedAt:        ch.Config.CreatedAt,
+		Duration:         internal.FormatDuration(duration),
+		Filesize:         internal.FormatFilesize(filesize),
+		TotalDiskUsage:   internal.FormatFilesize(int(totalDiskUsageBytes)),
+		Filename:         filename,
+		Logs:             logsCopy,
+		GlobalConfig:     server.Config,
+		UploadStatus:     uploadStatus,
+		UploadProgress:   uploadProgress,
+		UploadFilename:   uploadFilename,
+		RoomTitle:        roomTitle,
+		Gender:           gender,
+		NumViewers:       viewers,
+		SummaryCardImage: summaryCardImage,
 	}
 }
 
 // Pause pauses the channel and cancels the context.
 func (ch *Channel) Pause() {
-	// Stop the monitoring loop and hand over to CheckOnlineWhilePaused
-	// which will poll the API to keep RoomStatus and IsOnline up to date.
+	// Stop the monitoring loop. `context.Canceled` → `ch.Monitor()` →
+	// `onRetry` → `ch.UpdateOnlineStatus(false)`.
+	ch.monitorMu.Lock()
+	ch.monitorRestartRequested = false
+	ch.monitorMu.Unlock()
+
 	ch.Config.IsPaused.Store(true)
 	ch.cancelMu.Lock()
 	ch.CancelFunc()
@@ -365,11 +403,17 @@ func (ch *Channel) Cancel() {
 
 // Stop stops the channel and cancels the context.
 func (ch *Channel) Stop() {
+	ch.monitorMu.Lock()
+	ch.monitorRestartRequested = false
+	ch.Config.IsPaused.Store(true)
+	ch.monitorMu.Unlock()
+
 	ch.cancelMu.Lock()
 	ch.CancelFunc()
 	ch.PauseCancelFunc()
 	ch.cancelMu.Unlock()
-	ch.WaitMonitor()
+
+	ch.waitForMonitorStop()
 	ch.ProcessPending()
 	ch.Info("channel stopped")
 	ch.Close()
@@ -408,27 +452,27 @@ func (ch *Channel) Resume(_ int) {
 			return
 		default:
 		}
-
-		ch.Monitor()
+		runID, ok := ch.requestMonitorStart()
+		if !ok {
+			return
+		}
+		ch.Monitor(runID)
 	}()
 }
 
 // WaitMonitor blocks until the Monitor goroutine has fully exited.
 // By the time it returns, Cleanup() has already run and any pending
-// files have been queued into UploadWg.
+// files have been queued.
 func (ch *Channel) WaitMonitor() {
 	ch.monitorWg.Wait()
 }
 
-// ProcessPending waits for any in-flight async processing from Cleanup(CloseProcess)
-// to finish, then muxes/compresses/uploads any queued pending files.
+// ProcessPending waits for any in-flight async finalization from Cleanup(CloseProcess)
+// to finish, then processes queued pending files and waits for all uploads.
 // Blocks until all uploads (including those from previous file rotations)
 // complete.  Call after WaitMonitor when Cleanup was called with CloseQueue.
 func (ch *Channel) ProcessPending() {
-	// Wait for the async Cleanup goroutine to finish processing files
-	// that were dispatched in CloseProcess mode.  This ensures all
-	// CompressFile / MoveToOutputDir calls have already done UploadWg.Add(1)
-	// before we check UploadWg below (no missed Add/Wait race).
+	// Wait for the async finalize goroutines so no pending files are missed.
 	ch.pendingWg.Wait()
 
 	ch.cleanupMu.Lock()
@@ -444,6 +488,9 @@ func (ch *Channel) UpdateOnlineStatus(isOnline bool) {
 	ch.stateMu.Lock()
 	ch.IsOnline = isOnline
 	ch.IsConnecting = false
+	if !isOnline {
+		ch.Viewers = 0
+	}
 	ch.stateMu.Unlock()
 	ch.Update()
 }
@@ -462,7 +509,7 @@ func (ch *Channel) SetConnecting(connecting bool) {
 func resolveSite(ch *Channel) site.Site {
 	switch ch.Config.Site {
 	case "stripchat":
-		return stripchat.NewStripchatSite()
+		return site.NewStripchatSite()
 	default:
 		return site.NewChaturbateSite()
 	}
@@ -526,5 +573,81 @@ func (ch *Channel) CheckOnlineWhilePaused(ctx context.Context, startSeq int) {
 			return
 		case <-timer.C:
 		}
+	}
+}
+
+// requestMonitorStart starts a monitor immediately when possible, or records
+// a pending restart if a previous monitor is still shutting down.
+func (ch *Channel) requestMonitorStart() (uint64, bool) {
+	ch.monitorMu.Lock()
+	defer ch.monitorMu.Unlock()
+
+	if ch.monitorRunning {
+		if ch.Config.IsPaused.Load() {
+			ch.monitorRestartRequested = true
+		}
+		return 0, false
+	}
+
+	return ch.startMonitorLocked(), true
+}
+
+// finishMonitor clears the running flag when a monitor loop exits.
+func (ch *Channel) finishMonitor() {
+	ch.monitorMu.Lock()
+	done := ch.monitorDone
+	shouldRestart := ch.monitorRestartRequested
+	ch.monitorRunning = false
+	ch.monitorRestartRequested = false
+	var runID uint64
+	if shouldRestart {
+		runID = ch.startMonitorLocked()
+	} else {
+		ch.monitorDone = nil
+	}
+	ch.monitorMu.Unlock()
+
+	if done != nil {
+		close(done)
+	}
+
+	if shouldRestart {
+		ch.Update()
+		ch.Info("channel resumed")
+		ch.monitorWg.Add(1)
+		go func() {
+			defer ch.monitorWg.Done()
+			ch.Monitor(runID)
+		}()
+	}
+}
+
+// startMonitorLocked marks a monitor as active and allocates a new run ID.
+// monitorMu must already be held by the caller.
+func (ch *Channel) startMonitorLocked() uint64 {
+	ch.Config.IsPaused.Store(false)
+	ch.monitorRunning = true
+	ch.monitorRestartRequested = false
+	ch.monitorDone = make(chan struct{})
+	ch.monitorRunID++
+	return ch.monitorRunID
+}
+
+// waitForMonitorStop blocks until the current monitor run has finished cleanup.
+func (ch *Channel) waitForMonitorStop() {
+	ch.monitorMu.Lock()
+	done := ch.monitorDone
+	ch.monitorMu.Unlock()
+
+	if done != nil {
+		<-done
+	}
+}
+
+// Update sends an update signal to the channel's update channel.
+func (ch *Channel) Update() {
+	select {
+	case ch.UpdateCh <- true:
+	default:
 	}
 }

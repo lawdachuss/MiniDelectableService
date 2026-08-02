@@ -23,12 +23,13 @@ func (s *ChaturbateSite) FetchStream(ctx context.Context, req *internal.Req, use
 	var roomInfo chaturbate.APIResponse
 	stream, roomStatus, err := chaturbate.FetchStream(ctx, req, username, &roomInfo)
 	si := &StreamInfo{
-		RoomStatus:   roomStatus,
-		RoomTitle:    roomInfo.RoomTitle,
-		Tags:         roomInfo.Tags,
-		NumUsers:     roomInfo.NumUsers,
-		Gender:       roomInfo.BroadcasterGender,
-		LiveThumbURL: fmt.Sprintf("https://thumb.live.mmcdn.com/ri/%s.jpg", username),
+		RoomStatus:       roomStatus,
+		RoomTitle:        roomInfo.RoomTitle,
+		Tags:             roomInfo.Tags,
+		NumUsers:         roomInfo.NumUsers,
+		Gender:           roomInfo.BroadcasterGender,
+		LiveThumbURL:     fmt.Sprintf("https://thumb.live.mmcdn.com/ri/%s.jpg", username),
+		SummaryCardImage: roomInfo.SummaryCardImage,
 	}
 	if err != nil {
 		return si, err
@@ -38,6 +39,29 @@ func (s *ChaturbateSite) FetchStream(ctx context.Context, req *internal.Req, use
 	}
 	si.HLSSource = stream.HLSSource
 	return si, nil
+}
+
+// FetchLastBroadcast implements site.Site via the biocontext API.
+func (s *ChaturbateSite) FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error) {
+	apiURL := fmt.Sprintf("%sapi/biocontext/%s/", server.Config.Domain, username)
+	body, err := req.Get(ctx, apiURL)
+	if err != nil {
+		return 0, fmt.Errorf("fetch biocontext: %w", err)
+	}
+	var bio struct {
+		LastBroadcast string `json:"last_broadcast"`
+	}
+	if err := json.Unmarshal([]byte(body), &bio); err != nil {
+		return 0, fmt.Errorf("parse biocontext: %w", err)
+	}
+	if bio.LastBroadcast == "" {
+		return 0, nil
+	}
+	t, err := time.Parse("2006-01-02T15:04:05.999", bio.LastBroadcast)
+	if err != nil {
+		return 0, fmt.Errorf("parse last_broadcast: %w", err)
+	}
+	return t.Unix(), nil
 }
 
 func (s *ChaturbateSite) GetRoomStatus(ctx context.Context, req *internal.Req, username string) (string, error) {

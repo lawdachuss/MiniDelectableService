@@ -16,13 +16,16 @@ const (
 
 // StreamInfo holds the result of fetching a stream for a model.
 type StreamInfo struct {
-	HLSSource    string
-	RoomStatus   string
-	RoomTitle    string
-	Tags         []string
-	NumUsers     int
-	Gender       string
-	LiveThumbURL string // live-updating thumbnail URL; empty = use site default
+	HLSSource        string
+	RoomStatus       string
+	RoomTitle        string
+	Tags             []string
+	NumUsers         int
+	Gender           string
+	LiveThumbURL     string   // live-updating thumbnail URL; empty = use site default
+	SummaryCardImage string   // static profile card image; persisted even when offline
+	CDNReferer       string   // Referer/Origin to use for CDN media requests; empty defaults to Chaturbate
+	MouflonPDKey     string   // Stripchat MOUFLON v2 decryption key; empty if not applicable
 }
 
 // Site is the interface that each live cam site must implement.
@@ -35,4 +38,8 @@ type Site interface {
 
 	// GetRoomStatus returns the room status string (public, private, away, offline, etc.).
 	GetRoomStatus(ctx context.Context, req *internal.Req, username string) (string, error)
+
+	// FetchLastBroadcast returns the Unix timestamp of the model's last
+	// broadcast, or 0 if unknown/unavailable.
+	FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error)
 }

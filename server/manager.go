@@ -31,4 +31,6 @@ type IManager interface {
 	SessionInfo() (time.Duration, bool)
 	TriggerSessionStop()
 	UploadEntries() *entity.UploadsResponse
+	ReportCFBlock(username string)
+	ResetCFBlock(username string)
 }

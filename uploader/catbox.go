@@ -20,7 +20,6 @@ type CatboxUploader struct {
 
 // NewCatboxUploader creates a new Catbox.moe uploader.
 // Always connects directly — Catbox is CDN-backed and accessible from any IP.
-// The SOCKS5 proxy is only needed for Chaturbate/Stripchat stream access.
 func NewCatboxUploader() *CatboxUploader {
 	transport := &http.Transport{
 		MaxIdleConns:          100,

@@ -1,4 +1,4 @@
-package stripchat
+package site
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/teacat/chaturbate-dvr/internal"
-	"github.com/teacat/chaturbate-dvr/site"
+	"github.com/teacat/chaturbate-dvr/server"
 )
 
 type StripchatSite struct{}
@@ -55,7 +55,7 @@ func mapGender(g string) string {
 	}
 }
 
-func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, username string) (*site.StreamInfo, error) {
+func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, username string) (*StreamInfo, error) {
 	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam", username)
 
 	body, err := req.Get(ctx, apiURL)
@@ -74,7 +74,7 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 	roomStatus := u.Status
 	if !u.IsOnline && !u.IsLive {
 		if roomStatus == "" {
-			roomStatus = site.StatusOffline
+			roomStatus = StatusOffline
 		}
 	}
 
@@ -105,12 +105,16 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 		}
 	}
 
-	info := &site.StreamInfo{
+	info := &StreamInfo{
 		RoomStatus:   roomStatus,
 		RoomTitle:    resp.Cam.Topic,
 		Tags:         tags,
 		Gender:       mapGender(u.BroadcastGender),
 		LiveThumbURL: thumbURL,
+		// Stripchat CDNs require a stripchat.com Referer/Origin for media
+		// requests, and MOUFLON segment decryption needs a pdkey.
+		CDNReferer:   "https://stripchat.com/",
+		MouflonPDKey: mouflonPDKey(),
 	}
 
 	if !u.IsOnline && !u.IsLive {
@@ -142,6 +146,22 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 	return info, nil
 }
 
+// mouflonPDKey returns the manual Stripchat PD key if configured, otherwise
+// "auto" so FetchPlaylist resolves the pkey from the master playlist and
+// extracts/verifies the pdkey automatically.
+func mouflonPDKey() string {
+	if server.Config != nil && server.Config.StripchatPDKey != "" {
+		return server.Config.StripchatPDKey
+	}
+	return "auto"
+}
+
+// FetchLastBroadcast implements site.Site. Stripchat's model API does not
+// expose a last_broadcast timestamp in a usable form, so this returns 0.
+func (s *StripchatSite) FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error) {
+	return 0, nil
+}
+
 func (s *StripchatSite) GetRoomStatus(ctx context.Context, req *internal.Req, username string) (string, error) {
 	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam", username)
 
@@ -158,11 +178,11 @@ func (s *StripchatSite) GetRoomStatus(ctx context.Context, req *internal.Req, us
 	status := resp.User.User.Status
 	if status == "" {
 		if !resp.User.User.IsOnline && !resp.User.User.IsLive {
-			return site.StatusOffline, nil
+			return StatusOffline, nil
 		}
 		return "unknown", nil
 	}
 	return status, nil
 }
 
-var _ site.Site = (*StripchatSite)(nil)
+var _ Site = (*StripchatSite)(nil)
