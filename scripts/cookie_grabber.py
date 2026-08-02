@@ -11,13 +11,16 @@ Strategy (defeats the managed Turnstile challenge):
      printed by Cloudflare and get stuck on the challenge. The GitHub runner
      has an interactive RDP desktop, so headed works there. Falls back to
      headless only if headed cannot open a window.
-  2. Seed the browser context with the cookies already stored in Supabase so
-     the session looks established (csrftoken, __cf_bm, etc.).
-  3. Navigate to the site, then actively click the Turnstile checkbox if it
-     appears (iframe[src*=challenges.cloudflare.com]), reload, and wait up to
-     GRAB_TIMEOUT for cf_clearance to land.
-  4. Verify the clearance actually works by reloading the page and checking
-     the HTTP status + absence of the "Just a moment" challenge.
+  2. Seed the browser with stored cookies EXCEPT the IP-bound Cloudflare ones
+     (cf_clearance / __cf_bm) - seeding stale ones from another IP poisons the
+     challenge. csrftoken & site cookies are safe to keep.
+  3. Navigate to the site. When the Turnstile checkbox appears, click it ONCE
+     and then wait *quietly* (no spam clicks, no reloads) for Cloudflare to run
+     its proof-of-work and auto-redirect to the real site with a fresh
+     cf_clearance.
+  4. Verify the clearance actually works: fetch a real API endpoint from
+     *inside* the browser context (it carries the fresh cookies). HTTP 200
+     means the Go client with the same cookies will pass too.
   5. Merge the browser cookie set with the stored one and save to Supabase.
 
 Best-effort: on any failure it exits non-zero and the DVR continues with the
@@ -70,7 +73,35 @@ AGE_BUTTONS = [
     "Continue",
 ]
 
-DEFAULT_TIMEOUT = int(os.environ.get("GRAB_TIMEOUT", "120"))  # seconds
+DEFAULT_TIMEOUT = int(os.environ.get("GRAB_TIMEOUT", "150"))  # seconds
+
+# Cloudflare cookies are IP-bound: never seed them from a previous session.
+CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfruid", "cf_chl_", "cf_")
+
+
+def is_cf_cookie(name):
+    n = name.lower()
+    for c in CF_COOKIE_NAMES:
+        if n == c or n.startswith(c):
+            return True
+    return False
+
+
+STEALTH_JS = """
+// Reduce automation fingerprints that Cloudflare's bot score uses.
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+  window.navigator.permissions.query = (p) => (
+    p.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(p)
+  );
+}
+"""
 
 
 def save_to_supabase(rest, api_key, value):
@@ -124,27 +155,26 @@ def launch_browser(p):
 
 
 def click_turnstile_checkbox(page):
-    """Try to click the Turnstile 'Verify you are human' checkbox. Returns True
-    if a click was performed."""
+    """Find and click the Turnstile 'Verify you are human' checkbox exactly
+    once. Returns True if a click was performed."""
     for fr in page.frames:
         try:
             if "challenges.cloudflare.com" in (fr.url or ""):
-                # The checkbox is a label/input inside the widget iframe.
+                # The widget renders a checkbox (input/label) inside the iframe.
                 for sel in (
                     "input[type='checkbox']",
                     "label[for='cf-chl-widget-input']",
                     "#cf-chl-widget-input",
-                    "input[type='checkbox']",
                 ):
-                    el = fr.locator(sel).first
-                    if el.count() > 0:
-                        try:
+                    try:
+                        el = fr.locator(sel).first
+                        if el.count() > 0:
                             el.click(timeout=2500)
                             print("  [OK] Clicked Turnstile checkbox")
                             return True
-                        except Exception:
-                            continue
-                # Fallback: click the widget iframe center
+                    except Exception:
+                        continue
+                # Fallback: click the widget area center once.
                 try:
                     box = fr.locator("body").first.bounding_box(timeout=2000)
                     if box:
@@ -155,49 +185,74 @@ def click_turnstile_checkbox(page):
                     pass
         except Exception:
             continue
-    # Some layouts put the checkbox in a top-level iframe with a title
-    for fr in page.frames:
-        try:
-            if "challenge" in (fr.title() or "").lower() or "verify" in (fr.title() or "").lower():
-                for sel in ("input[type='checkbox']", "#cf-chl-widget-input"):
-                    el = fr.locator(sel).first
-                    if el.count() > 0:
-                        try:
-                            el.click(timeout=2500)
-                            print("  [OK] Clicked checkbox in challenge frame")
-                            return True
-                        except Exception:
-                            continue
-        except Exception:
-            continue
     return False
 
 
-def wait_for_clearance(page, ctx, timeout):
-    """Wait up to `timeout` seconds for cf_clearance to appear, actively
-    clicking the Turnstile checkbox and reloading to nudge the challenge."""
+def on_real_site(page):
+    """True when the current page is the actual site, not a challenge."""
+    try:
+        title = (page.title() or "").lower()
+        url = page.url or ""
+    except Exception:
+        return False
+    if "just a moment" in title or "enable javascript" in title:
+        return False
+    if "challenges.cloudflare.com" in url:
+        return False
+    return "cb.xxx" in url or "chaturbate" in url
+
+
+def verify_api_via_browser(page):
+    """Fetch a real API endpoint from inside the browser context (which carries
+    the fresh cookies incl. cf_clearance). Returns True if it gets HTTP 200,
+    which proves the clearance is valid for this IP."""
+    try:
+        result = page.evaluate(
+            """async () => {
+                try {
+                    const r = await fetch('/api/biocontext/kittengirlxo/', {
+                        headers: {'Accept': 'application/json'}
+                    });
+                    const t = await r.text();
+                    return {status: r.status, bytes: t.length};
+                } catch (e) {
+                    return {status: 0, error: String(e)};
+                }
+            }"""
+        )
+        print(f"  API verify (biocontext): {result}")
+        return isinstance(result, dict) and result.get("status") == 200
+    except Exception as e:
+        print(f"  [WARN] API verify failed: {e}")
+        return False
+
+
+def solve_challenge(page, ctx, timeout):
+    """Click the Turnstile checkbox once, then wait quietly for Cloudflare to
+    auto-redirect to the real site with a valid cf_clearance. Returns True on
+    success."""
     deadline = time.time() + timeout
-    reloaded = False
+    clicked = False
+    last_state = ""
     while time.time() < deadline:
-        try:
-            title = page.title() or ""
-        except Exception:
-            title = ""
+        state = "real" if on_real_site(page) else "challenge"
+        if state != last_state:
+            print(f"  page state: {state} (title='{(page.title() or '')[:50]}')")
+            last_state = state
         has_cf = any(c.get("name") == "cf_clearance" for c in ctx.cookies())
-        just_moment = "just a moment" in title.lower() or "enable javascript" in title.lower()
-        if has_cf and not just_moment:
-            return True, title
-        clicked = click_turnstile_checkbox(page)
-        if clicked and not reloaded:
+        if has_cf and state == "real":
+            # Give the proof-of-work a moment to settle, then verify for real.
             time.sleep(3)
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=30000)
-                reloaded = True
-                print("  Reloaded after checkbox click...")
-            except Exception:
-                pass
-        time.sleep(1)
-    return False, title
+            if verify_api_via_browser(page):
+                print("  [OK] cf_clearance verified - API returned HTTP 200")
+                return True
+            print("  [WARN] cf_clearance present but API still challenged - waiting...")
+        if not clicked:
+            if click_turnstile_checkbox(page):
+                clicked = True
+                print("  Checkbox clicked - waiting for Cloudflare to verify (no more clicks)...")
+        time.sleep(2)
+    return False
 
 
 def main():
@@ -250,13 +305,14 @@ def main():
                 user_agent=user_agent or CHROME146_UA,
                 locale="en-US",
                 viewport={"width": 1366, "height": 900},
-                # Seed the session with known-good cookies (csrftoken, __cf_bm)
-                # so the browser looks like an established visitor.
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
-            # Seed the browser with the stored cookies so the session looks
-            # established (csrftoken, __cf_bm, etc.). CF cookies are
-            # domain-scoped; add_cookies handles the domain.
+            ctx.add_init_script(STEALTH_JS)
+
+            # Seed ONLY non-CF cookies (csrftoken, site cookies). Never seed
+            # cf_clearance/__cf_bm - they're IP-bound and stale ones poison the
+            # challenge.
+            seedable = {k: v for k, v in old.items() if v and not is_cf_cookie(k)}
             try:
                 ctx.add_cookies(
                     [
@@ -267,39 +323,25 @@ def main():
                             "path": "/",
                             "secure": True,
                         }
-                        for k, v in old.items()
-                        if v
+                        for k, v in seedable.items()
                     ]
                 )
-                print(f"  [OK] Seeded {len(old)} stored cookies into the browser")
+                print(f"  [OK] Seeded {len(seedable)} non-CF cookies (skipped {len(old) - len(seedable)} CF cookies)")
             except Exception as e:
                 print(f"  [WARN] cookie seeding failed ({str(e)[:80]})")
+
             page = ctx.new_page()
             print(f"  Visiting {site_domain} ...")
             resp = page.goto(site_domain, timeout=60000, wait_until="domcontentloaded")
             print(f"  Initial response: HTTP {resp.status if resp else '?'}")
 
-            # --- Wait for any Cloudflare challenge to clear ---
-            print(f"\n[3/4] Waiting for Cloudflare challenge to clear (up to {DEFAULT_TIMEOUT}s)...")
-            cleared, title = wait_for_clearance(page, ctx, DEFAULT_TIMEOUT)
-            if cleared:
-                print(f"  Challenge cleared (cf_clearance present, title='{title[:60]}')")
+            # --- Solve the Cloudflare challenge ---
+            print(f"\n[3/4] Solving Cloudflare challenge (up to {DEFAULT_TIMEOUT}s)...")
+            solved = solve_challenge(page, ctx, DEFAULT_TIMEOUT)
+            if solved:
+                print("  Challenge fully cleared (cf_clearance valid for this IP)")
             else:
-                print(f"  [WARN] cf_clearance did not appear within {DEFAULT_TIMEOUT}s - grabbing whatever we have")
-
-            # --- Verify: reload and confirm we're NOT on a challenge page ---
-            verify_ok = False
-            resp2 = None
-            try:
-                time.sleep(1)
-                resp2 = page.goto(site_domain, timeout=45000, wait_until="domcontentloaded")
-                title2 = (page.title() or "").lower()
-                if resp2 and resp2.status == 200 and "just a moment" not in title2:
-                    verify_ok = True
-            except Exception:
-                pass
-            status2 = resp2.status if resp2 is not None else "?"
-            print(f"  Verification reload: HTTP {status2} - {'PASS' if verify_ok else 'STILL CHALLENGED'}")
+                print(f"  [WARN] could not obtain a valid cf_clearance within {DEFAULT_TIMEOUT}s - grabbing whatever we have")
 
             # --- Dismiss the age-verification modal if present ---
             try:
