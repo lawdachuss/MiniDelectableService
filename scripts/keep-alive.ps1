@@ -101,6 +101,17 @@ function Update-NodeWebUrl {
       if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_API_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
     }
   }
+  # Guard against placeholder/junk secret values (e.g. a single '-') that
+  # slipped into the env - fall back to the .env file's real value.
+  if ($sbUrl -and ($sbUrl -match '^\-+$' -or $sbUrl.Trim().Length -le 2)) {
+    Write-Warning "(WARN) SUPABASE_URL env value looks like a placeholder ('$sbUrl') - falling back to .env"
+    $sb = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
+    $sbUrl = $null; $sbKey = $null
+    if ($sb) {
+      if ($sb -match '(?m)^SUPABASE_URL=(.+)$') { $sbUrl = $matches[1].Trim() }
+      if ($sb -match '(?m)^SUPABASE_API_KEY=(.+)$') { $sbKey = $matches[1].Trim() }
+    }
+  }
   if ([string]::IsNullOrWhiteSpace($sbUrl)) { Write-Warning "(WARN) SUPABASE_URL missing (no secret, no .env) - cannot update web_url"; return }
   if ([string]::IsNullOrWhiteSpace($sbKey)) { Write-Warning "(WARN) SUPABASE_API_KEY missing (no secret, no .env) - cannot update web_url"; return }
   if ($sbUrl -notmatch '^https?://') { $sbUrl = 'https://' + $sbUrl }

@@ -445,7 +445,10 @@ jobs:
             $sb = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
             if ($sb -eq $null) { $sb = "" }
             function SetOrAdd($k, $v) { if ($sb -match "(?m)^$k=") { $script:sb = $sb -replace "(?m)^$k=.*`$", "$k=$v" } else { $script:sb = $sb.TrimEnd("`r","`n") + "`n$k=$v`n" } }
-            SetOrAdd "SUPABASE_URL" $env:SUPABASE_URL; SetOrAdd "SUPABASE_API_KEY" $env:SUPABASE_API_KEY; SetOrAdd "SUPABASE_SERVICE_ROLE_KEY" $env:SUPABASE_SERVICE_ROLE_KEY; SetOrAdd "DATABASE_PASSWORD" $env:DATABASE_PASSWORD
+            # Only merge real values - placeholder secrets (e.g. a single '-')
+            # must not overwrite the correct MINI_ENV .env entries.
+            function GuardedSetOrAdd($k, $v) { if (-not [string]::IsNullOrWhiteSpace($v) -and $v -notmatch '^\-+$' -and $v.Length -gt 5) { SetOrAdd $k $v } }
+            GuardedSetOrAdd "SUPABASE_URL" $env:SUPABASE_URL; GuardedSetOrAdd "SUPABASE_API_KEY" $env:SUPABASE_API_KEY; GuardedSetOrAdd "SUPABASE_SERVICE_ROLE_KEY" $env:SUPABASE_SERVICE_ROLE_KEY; GuardedSetOrAdd "DATABASE_PASSWORD" $env:DATABASE_PASSWORD
             [System.IO.File]::WriteAllText("$repoDir\.env", $sb, (New-Object System.Text.UTF8Encoding($false)))
           }
 
@@ -520,34 +523,40 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         run: |
-          # The runner box's resolver can NXDOMAIN the custom Supabase host while
-          # public resolvers resolve it fine (observed: keep-alive + curl got
-          # "No such host is known" / HTTP 000, but cloudflared worked). Fix:
-          # 1) point the box at public resolvers, 2) pin the host in the hosts
-          # file with Cloudflare anycast IPs (outbound 443 to CF demonstrably
-          # works - the quick tunnel connects), 3) verify with a real API call.
+          # Never fatal: a bad secret/resolver must degrade gracefully, not kill
+          # the run (PowerShell EAP=stop on the runner turns curl stderr into a
+          # terminating error). Fix: point the box at public resolvers, pin the
+          # host in the hosts file with Cloudflare anycast IPs, then verify.
+          $ErrorActionPreference = 'Continue'
           $sbHost = (($env:SUPABASE_URL -replace '^https?://','') -split '[/:]')[0]
-          if ([string]::IsNullOrWhiteSpace($sbHost)) { $sbHost = 'supabase.chuglii.in' }
+          if ([string]::IsNullOrWhiteSpace($sbHost) -or $sbHost -eq '-' -or $sbHost.Length -le 2) { $sbHost = 'supabase.chuglii.in' }
           Write-Host "(DNS) Supabase host: $sbHost (hex: $([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($sbHost)).Replace('-','')))"
           try {
-            $adapter = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
-            if ($adapter) {
-              Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses ('1.1.1.1','8.8.8.8') -ErrorAction Stop
-              Write-Host "(DNS) Set adapter $($adapter.Name) DNS -> 1.1.1.1, 8.8.8.8"
-            } else { Write-Warning "(DNS) No physical up adapter found" }
-          } catch { Write-Warning "(DNS) Set-DnsClientServerAddress failed: $($_.Exception.Message)" }
+            Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+              try {
+                Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses ('1.1.1.1','8.8.8.8') -ErrorAction Stop | Out-Null
+                Write-Host "(DNS) Set $($_.Name) DNS -> 1.1.1.1, 8.8.8.8"
+              } catch { Write-Warning "(DNS) DNS set skipped on $($_.Name): $($_.Exception.Message)" }
+            }
+          } catch { Write-Warning "(DNS) DNS enumeration failed: $($_.Exception.Message)" }
           ipconfig /flushdns | Out-Null
           $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
           try {
             $hosts = Get-Content $hostsPath -Raw -ErrorAction SilentlyContinue
-            if (-not $hosts -or $hosts -notmatch [regex]::Escape($sbHost)) {
-              Add-Content -Path $hostsPath -Value "`n104.21.25.61 $sbHost`n172.67.223.51 $sbHost`n" -ErrorAction Stop
-              Write-Host "(DNS) Pinned $sbHost in hosts file"
-            } else { Write-Host "(DNS) $sbHost already in hosts file" }
+            $e1 = "104.21.25.61 $sbHost"; $e2 = "172.67.223.51 $sbHost"
+            $need = @()
+            if (-not $hosts -or $hosts -notmatch [regex]::Escape($e1)) { $need += $e1 }
+            if (-not $hosts -or $hosts -notmatch [regex]::Escape($e2)) { $need += $e2 }
+            if ($need.Count -gt 0) {
+              Add-Content -Path $hostsPath -Value ("`n" + ($need -join "`n") + "`n") -ErrorAction Stop
+              Write-Host "(DNS) Pinned: $($need -join ' | ')"
+            } else { Write-Host "(DNS) Hosts entry already present" }
           } catch { Write-Warning "(DNS) hosts write failed: $($_.Exception.Message)" }
           Start-Sleep -Seconds 2
-          $code = & curl.exe -s -o NUL -w "%{http_code}" "https://$sbHost/rest/v1/" -m 20 --noproxy "*" --tlsv1.2 2>&1
-          Write-Host "(DNS) Supabase reachability check: HTTP $code (401/2xx = reachable, 000 = unreachable)"
+          try {
+            $code = & curl.exe -s -o NUL -w "%{http_code}" "https://$sbHost/rest/v1/" -m 20 --noproxy "*" --tlsv1.2 2>$null
+            Write-Host "(DNS) Supabase reachability check: HTTP $code (401/2xx = reachable, 000 = unreachable)"
+          } catch { Write-Host "(DNS) Supabase reachability check threw: $($_.Exception.Message)" }
 
       - name: Keep Runner Alive
         shell: pwsh
