@@ -137,7 +137,7 @@ func runCookieScript(py string, pyArgs []string, name string) {
 		return
 	}
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
 	args := append(append([]string{}, pyArgs...), script)
 	cmd := exec.CommandContext(ctx, py, args...)

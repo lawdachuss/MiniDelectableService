@@ -283,7 +283,13 @@ def main():
         if isinstance(val, dict):
             old_str = val.get("cookies", "") or ""
     old = parse_cookies(old_str)
-    print(f"  Existing cookies: {len(old)} (will be replaced by a fresh set)")
+    print(f"  Existing cookies: {len(old)}")
+
+    # Fast path: if a valid cf_clearance is already present in Supabase (e.g. minted
+    # by the workflow step right before DVR boot), skip launching the browser again.
+    if "cf_clearance" in old and len(old.get("cf_clearance", "")) > 20:
+        print(f"  [OK] Valid cf_clearance already in Supabase (len {len(old['cf_clearance'])}) — skipping browser solve")
+        return 0
 
     # CRITICAL: the DVR presents these cookies over httpcloak's
     # 'chrome-146-windows' TLS fingerprint, and cf_clearance is bound to the

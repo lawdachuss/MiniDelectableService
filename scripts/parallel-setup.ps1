@@ -218,13 +218,8 @@ $tsConnectJob = Start-Job -Name tsc -ArgumentList $tailscaleIpFile, $tsDiagFile,
   $upOut = (& $ts @upArgs 2>&1) -join ' '
   $upEc = $LASTEXITCODE
   diag "ts up exit: $upEc  output: $upOut"
-  if ($upEc -ne 0) {
-    diag "retrying ts up with --tun=userspace-networking (WinTun driver often unavailable on runners)"
-    $upOut = (& $ts @upArgs --tun=userspace-networking 2>&1) -join ' '
-    $upEc = $LASTEXITCODE
-    diag "ts up userspace exit: $upEc  output: $upOut"
-    if ($upEc -ne 0) { return }
-  }
+  if ($upEc -ne 0) { return }
+
   function Get-TsIP { (& $ts ip -4 2>&1 | Out-String).Trim() }
   $deadline = (Get-Date).AddSeconds(45)
   $ip = ""
@@ -237,26 +232,29 @@ $tsConnectJob = Start-Job -Name tsc -ArgumentList $tailscaleIpFile, $tsDiagFile,
     diag "IP obtained: $ip"
     $ip | Set-Content $ipFile -Force
   } else {
-    diag "WARNING: no IPv4 after 45s (WinTun likely missing) — retrying with --tun=userspace-networking"
-    $upArgsUS = @("up","--authkey=$authKey","--hostname=github-rdp-$runId","--accept-routes","--accept-dns=false","--timeout=120s","--reset","--tun=userspace-networking")
-    $upOutUS = (& $ts @upArgsUS 2>&1) -join ' '
-    $upEcUS = $LASTEXITCODE
-    diag "ts up userspace exit: $upEcUS  output: $upOutUS"
-    if ($upEcUS -eq 0) {
-      $deadline2 = (Get-Date).AddSeconds(60)
-      while ((Get-Date) -lt $deadline2) {
-        $ip = Get-TsIP
-        if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
-        Start-Sleep -Seconds 3
-      }
-      if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
-        diag "IP obtained via userspace-networking: $ip"
-        $ip | Set-Content $ipFile -Force
-      } else {
-        diag "FAIL: no IPv4 after userspace-networking fallback; ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
-      }
+    diag "WARNING: no IPv4 after 45s (WinTun driver likely missing) — restarting tailscaled daemon with --tun=userspace-networking..."
+    Stop-Service Tailscale -Force -ErrorAction SilentlyContinue
+    Get-Process tailscaled -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $stateDir = "$env:ProgramData\Tailscale"
+    New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    $stateFile = Join-Path $stateDir "server-state.conf"
+    $p = Start-Process -FilePath $tsd -ArgumentList "--state=`"$stateFile`" --tun=userspace-networking" -WindowStyle Hidden -PassThru -RedirectStandardError "$env:TEMP\_tsd_err" -RedirectStandardOutput "$env:TEMP\_tsd_out"
+    diag "userspace tailscaled launched pid=$($p.Id)"
+    Start-Sleep -Seconds 5
+    $upOutUS = (& $ts @upArgs 2>&1) -join ' '
+    diag "userspace ts up exit: $LASTEXITCODE  output: $upOutUS"
+    $deadline2 = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline2) {
+      $ip = Get-TsIP
+      if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+      Start-Sleep -Seconds 3
+    }
+    if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
+      diag "IP obtained via userspace-networking: $ip"
+      $ip | Set-Content $ipFile -Force
     } else {
-      diag "FAIL: userspace-networking ts up also failed (exit $upEcUS); ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
+      diag "FAIL: no IPv4 after userspace-networking fallback; ts ip -4 = '$(Get-TsIP)'  ts status = '$((& $ts status 2>&1 | Out-String).Trim())'"
     }
   }
 }
