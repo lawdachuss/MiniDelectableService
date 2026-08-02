@@ -255,10 +255,11 @@ jobs:
       - name: Grab fresh cookies (browser)
         if: always()
         continue-on-error: true
-        shell: powershell
+        shell: pwsh
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          PYTHONUNBUFFERED: '1'
         run: |
           # FIX: run cookie_grabber.py BEFORE the DVR starts so it has a fresh
           # cf_clearance cookie bound to this runner's IP. Without this the DVR
@@ -268,9 +269,16 @@ jobs:
           $ErrorActionPreference = 'Continue'
           Write-Host "[COOKIE] Running cookie_grabber.py to mint fresh cf_clearance..."
           $t = Measure-Command {
-            python scripts/cookie_grabber.py 2>&1 | ForEach-Object { Write-Host "  [CG] $_" }
+            $proc = Start-Process -FilePath python -ArgumentList "-u","scripts/cookie_grabber.py" `
+              -WorkingDirectory $env:REPO_DIR -NoNewWindow -PassThru `
+              -RedirectStandardOutput "$env:TEMP\cg_out.txt" `
+              -RedirectStandardError  "$env:TEMP\cg_err.txt"
+            $proc.WaitForExit()
           }
-          $grabExit = $LASTEXITCODE
+          $grabExit = $proc.ExitCode
+          # Stream output line-by-line so it appears in the step log
+          Get-Content "$env:TEMP\cg_out.txt" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [CG] $_" }
+          Get-Content "$env:TEMP\cg_err.txt" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [CGe] $_" }
           Write-Host "[COOKIE] cookie_grabber.py finished in $([math]::Round($t.TotalSeconds,1))s (exit $grabExit)"
           if ($grabExit -ne 0) {
             Write-Warning "[COOKIE] cookie_grabber.py failed (exit $grabExit) - DVR will use existing cookies from Supabase"

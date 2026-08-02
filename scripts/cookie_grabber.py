@@ -93,20 +93,50 @@ if (originalQuery) {
 
 
 def save_to_supabase(rest, api_key, value):
-    """PATCH the dvr_settings row (INSERT fallback) with the new settings blob."""
+    """PATCH the dvr_settings row (INSERT fallback) with the new settings blob.
+
+    Merges cookie fields on top of the existing value so other settings
+    (voesx_api_key, streamtape_*, mixdrop_*, etc.) stored in the same row
+    are preserved.  Only the keys in `value` are updated.
+    """
+    import sys
     patch_url = f"{rest}/app_settings?key=eq.dvr_settings"
-    result = supabase_request("PATCH", patch_url, api_key, {"value": value})
+
+    # --- Load existing value first so we don't wipe non-cookie settings ---
+    get_url = f"{rest}/app_settings?key=eq.dvr_settings&select=value"
+    existing = supabase_request("GET", get_url, api_key)
+    merged_value = {}
+    if existing and len(existing) > 0:
+        raw = existing[0].get("value", {})
+        if isinstance(raw, dict):
+            merged_value = dict(raw)
+            print(f"  [OK] Loaded existing settings ({len(merged_value)} keys) — will merge cookie fields on top")
+        else:
+            print("  [WARN] Existing value is not a dict — will overwrite")
+    else:
+        print("  [INFO] No existing dvr_settings row found — will INSERT")
+    sys.stdout.flush()
+
+    # Merge: cookie fields from `value` overwrite existing, other keys preserved
+    merged_value.update(value)
+
+    result = supabase_request("PATCH", patch_url, api_key, {"value": merged_value})
     if result is not None and result != []:
-        print("  [OK] Cookies saved to Supabase")
+        print("  [OK] Cookies saved to Supabase (merged)")
+        sys.stdout.flush()
         return True
-    print("  Row may not exist, trying INSERT...")
+    # PATCH returns [] when row exists but Prefer:return=representation has no rows
+    # (shouldn't happen, but guard anyway).  Also handles missing-row case.
+    print("  Row may not exist or PATCH returned empty, trying INSERT...")
     result = supabase_request(
-        "POST", f"{rest}/app_settings", api_key, {"key": "dvr_settings", "value": value}
+        "POST", f"{rest}/app_settings", api_key, {"key": "dvr_settings", "value": merged_value}
     )
     if result is not None:
         print("  [OK] Cookies inserted into Supabase")
+        sys.stdout.flush()
         return True
     print("  [ERROR] Failed to save cookies to Supabase")
+    sys.stdout.flush()
     return False
 
 
@@ -287,9 +317,16 @@ def main():
 
     # Fast path: if a valid cf_clearance is already present in Supabase (e.g. minted
     # by the workflow step right before DVR boot), skip launching the browser again.
+    import sys
+    sys.stdout.flush()
     if "cf_clearance" in old and len(old.get("cf_clearance", "")) > 20:
         print(f"  [OK] Valid cf_clearance already in Supabase (len {len(old['cf_clearance'])}) — skipping browser solve")
+        print(f"  sessionid: {'[OK]' if 'sessionid' in old else '[NO]'}")
+        print(f"  csrftoken: {'[OK]' if 'csrftoken' in old else '[NO]'}")
+        sys.stdout.flush()
         return 0
+    print(f"  [INFO] No valid cf_clearance in Supabase (cf_clearance len={len(old.get('cf_clearance',''))}) — launching browser")
+    sys.stdout.flush()
 
     # CRITICAL: the DVR presents these cookies over httpcloak's
     # 'chrome-146-windows' TLS fingerprint, and cf_clearance is bound to the
