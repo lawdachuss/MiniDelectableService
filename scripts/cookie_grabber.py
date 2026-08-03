@@ -7,26 +7,31 @@ __cf_bm, but cb.xxx serves a Cloudflare Turnstile challenge to datacenter IPs
 real browser can mint a valid, IP-bound cf_clearance for that runner.
 
 Strategy (defeats the managed Turnstile challenge):
-  1. Launch a *headed* browser (Edge/Chrome) - headless browsers are finger-
-     printed by Cloudflare and get stuck on the challenge. The GitHub runner
-     has an interactive RDP desktop, so headed works there. Falls back to
-     headless only if headed cannot open a window.
-  2. Start with a FULLY CLEAN browser (no stored cookies seeded - the refresher
+  PRIMARY: Scrapling's StealthySession with solve_cloudflare=True - a purpose-
+     built automatic solver that handles managed/interactive/invisible Turnstile
+     challenges (same approach as the working node-3 deployment, but targeted at
+     cb.xxx instead of the old chaturbate.com). It is pointed at the pinned
+     Chrome for Testing 146 via executable_path so the TLS fingerprint + UA that
+     mint cf_clearance match httpcloak's 'chrome-146-windows' preset exactly
+     (cf_clearance is bound to the minting fingerprint). The clearance is
+     verified with an API fetch from the SAME browser session (HTTP 200).
+  FALLBACK: Playwright manual Turnstile checkbox clicking (headed browser), kept
+     for environments where Scrapling is not installed.
+  Both paths:
+  1. Start with a FULLY CLEAN browser (no stored cookies seeded - the refresher
      clears them first). A clean slate every start avoids stale, IP-bound
      cf_clearance cookies that raise the challenge difficulty.
-  3. Navigate to the site. When the Turnstile checkbox appears, click it ONCE
-     and then wait *quietly* (no spam clicks, no reloads) for Cloudflare to run
-     its proof-of-work and auto-redirect to the real site with a fresh
-     cf_clearance.
-  4. Verify the clearance actually works: fetch a real API endpoint from
+  2. Verify the clearance actually works: fetch a real API endpoint from
      *inside* the browser context (it carries the fresh cookies). HTTP 200
      means the Go client with the same cookies will pass too.
-  5. Save the fresh browser cookie set to Supabase (no stale merge).
+  3. Save the fresh browser cookie set to Supabase (no stale merge).
 
 Best-effort: on any failure it exits non-zero and the DVR continues with the
 cookies it already has.
 
-Requires: pip install playwright  (uses system Edge/Chrome - no browser download)
+Requires: pip install "scrapling[fetchers]" playwright
+  (uses pinned Chrome 146 via CHROME146_PATH when present, else system
+   Edge/Chrome - no extra browser download)
 
 Usage: python scripts/cookie_grabber.py
 """
@@ -298,6 +303,93 @@ def solve_challenge(page, ctx, timeout):
     return False
 
 
+def solve_with_scrapling(site_domain, user_agent, timeout):
+    """Solve the Cloudflare challenge using Scrapling's StealthySession.
+
+    Scrapling's solve_cloudflare=True is a purpose-built automatic solver for
+    managed/interactive/invisible Turnstile challenges (the same technique used
+    by the working node-3 deployment, which fetched chaturbate.com - here we
+    target cb.xxx, the domain the DVR actually uses). It is pointed at the
+    pinned Chrome for Testing 146 (CHROME146_PATH) so the TLS fingerprint that
+    mints cf_clearance matches httpcloak's 'chrome-146-windows' preset exactly.
+
+    Returns a dict of cookies with a verified cf_clearance, or None on failure.
+    """
+    try:
+        from scrapling.fetchers import StealthySession
+    except ImportError:
+        print("  [WARN] scrapling not installed (pip install 'scrapling[fetchers]') - using Playwright fallback")
+        return None
+
+    pinned = os.environ.get("CHROME146_PATH", "")
+    executable = pinned if pinned and os.path.isfile(pinned) else None
+    print(f"  [SCRAPLING] Solving challenge (target={site_domain}, "
+          f"executable={executable or 'bundled/stealth browser'})...")
+
+    try:
+        session_kwargs = dict(
+            headless=True,
+            solve_cloudflare=True,
+            block_webrtc=True,
+            hide_canvas=True,
+            useragent=user_agent or CHROME146_UA,
+            timeout=timeout * 1000,  # >=60s recommended for the CF solver
+            retries=3,
+            retry_delay=2,
+        )
+        if executable:
+            # Pinned Chrome 146 -> use it via executable_path so the TLS
+            # fingerprint that mints cf_clearance matches the DVR exactly.
+            # NOTE: do NOT also set real_chrome=True here - that forces
+            # channel="chrome" which conflicts with executable_path.
+            session_kwargs["executable_path"] = executable
+        with StealthySession(**session_kwargs) as session:
+            resp = session.fetch(
+                site_domain,
+                solve_cloudflare=True,
+                timeout=timeout * 1000,
+                retries=3,
+            )
+            status = getattr(resp, "status", None)
+            print(f"  [SCRAPLING] Page loaded (HTTP {status}) - collecting cookies...")
+
+            cookies = {}
+            if isinstance(resp.cookies, tuple):
+                for c in resp.cookies:
+                    if isinstance(c, dict) and "name" in c:
+                        cookies[c["name"]] = c["value"]
+                    elif isinstance(c, dict):
+                        cookies.update(c)
+            elif isinstance(resp.cookies, dict):
+                cookies = dict(resp.cookies)
+            print(f"  [SCRAPLING] Got {len(cookies)} cookies")
+
+            if "cf_clearance" not in cookies or not cookies["cf_clearance"]:
+                print("  [SCRAPLING] No cf_clearance minted - challenge not solved")
+                return None
+            print(f"  [SCRAPLING] cf_clearance found! length={len(cookies['cf_clearance'])}")
+
+            # Verify the clearance actually works from inside the same session
+            # (it carries the fresh cookies). HTTP 200 = the Go client with the
+            # same cookies will pass too.
+            verify_url = site_domain.rstrip("/") + "/api/biocontext/kittengirlxo/"
+            try:
+                vresp = session.fetch(verify_url, timeout=30000)
+                vstatus = getattr(vresp, "status", None)
+                print(f"  [SCRAPLING] API verify: HTTP {vstatus}")
+                if vstatus != 200:
+                    print("  [SCRAPLING] API verify failed - cf_clearance not valid for this IP")
+                    return None
+            except Exception as e:
+                print(f"  [SCRAPLING] API verify threw: {e}")
+                return None
+            print("  [OK] Scrapling solved challenge + verified cf_clearance via API")
+            return cookies
+    except Exception as e:
+        print(f"  [SCRAPLING] solve failed: {str(e)[:200]}")
+        return None
+
+
 def main():
     print("=" * 50)
     print("  Cookie Grabber (Playwright)")
@@ -364,8 +456,41 @@ def main():
     # (never Edge's UA - that mismatches the fingerprint and gets 403).
     user_agent = CHROME146_UA
 
+    # --- PRIMARY: Scrapling's automatic Turnstile solver ---
+    # Purpose-built solve_cloudflare=True (same as the working node-3
+    # deployment, but targeting cb.xxx). Falls back to Playwright below.
+    print("\n[2/4] Solving Cloudflare challenge with Scrapling (auto-solver)...")
+    scrapling_cookies = solve_with_scrapling(site_domain, user_agent, DEFAULT_TIMEOUT)
+    if scrapling_cookies and scrapling_cookies.get("cf_clearance"):
+        merged = dict(scrapling_cookies)
+        for keep in ("__cf_bm", "csrftoken"):
+            if keep not in merged and keep in old and old[keep]:
+                merged[keep] = old[keep]
+                print(f"  Kept freshly-refreshed {keep} (Scrapling had none)")
+        print(f"\n[4/4] Fresh cookie set: {len(merged)}")
+
+        new_cookie_str = join_cookies(merged)
+        settings_value = {
+            "cookies": new_cookie_str,
+            "user_agent": user_agent or CHROME146_UA,
+        }
+        for key in ("sessionid", "csrftoken", "cf_clearance", "__cf_bm"):
+            if key in merged and merged[key]:
+                settings_value[key] = merged[key]
+        # Tag with run_id so the fast-path can confirm this cf_clearance was
+        # minted during THIS workflow run (i.e. by THIS runner's IP).
+        if current_run_id:
+            settings_value["github_run_id"] = current_run_id
+
+        ok = save_to_supabase(rest, api_key, settings_value)
+        if ok:
+            print("\n[OK] Cookie grab succeeded - fresh cookies saved to Supabase")
+            return 0
+        return 1
+
+    # --- FALLBACK: Playwright manual clicking ---
     # --- Launch browser and visit the site ---
-    print("\n[2/4] Launching browser...")
+    print("\n[2b] Scrapling unavailable/failed - falling back to Playwright...")
     with sync_playwright() as p:
         browser = launch_browser(p)
         if browser is None:
