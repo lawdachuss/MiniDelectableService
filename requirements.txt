@@ -1,2 +1,6 @@
 curl_cffi==0.15.0
 playwright
+scrapling[fetchers]==0.4.9
+browserforge==1.2.4
+apify_fingerprint_datapoints==0.13.0
+pysocks==1.7.1
