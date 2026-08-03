@@ -152,7 +152,19 @@ def try_refresh_with_curl_cffi(user_agent):
 
 def save_to_supabase(rest, api_key, value, is_seed=False):
     patch_url = f"{rest}/app_settings?key=eq.dvr_settings"
-    result = supabase_request("PATCH", patch_url, api_key, {"value": value})
+    # FIX: MERGE on top of the existing blob instead of replacing it. A bare
+    # PATCH wipes github_run_id (set by cookie_grabber.py so the DVR startup
+    # grabber can take the fast-path skip) plus any non-cookie settings
+    # (voesx_api_key, streamtape_*, mixdrop_*, ...) stored in the same row.
+    get_url = f"{rest}/app_settings?key=eq.dvr_settings&select=value"
+    existing = supabase_request("GET", get_url, api_key)
+    merged_value = dict(value)
+    if existing and len(existing) > 0:
+        raw = existing[0].get("value", {})
+        if isinstance(raw, dict):
+            merged_value = dict(raw)
+            merged_value.update(value)
+    result = supabase_request("PATCH", patch_url, api_key, {"value": merged_value})
 
     if result is not None and result != []:
         label = "seeded" if is_seed else "saved"
