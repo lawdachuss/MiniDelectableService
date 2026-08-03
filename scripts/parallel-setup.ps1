@@ -82,9 +82,13 @@ $ffJob = Start-Job -Name ffmpeg -ScriptBlock {
 $buildJob = Start-Job -Name build -ScriptBlock {
   param($d)
   New-Item -ItemType Directory -Force -Path "D:\repos" | Out-Null
+  New-Item -ItemType Directory -Force -Path $d | Out-Null
+  # Always refresh repo files (requirements.txt, scripts/, .env templates) into
+  # REPO_DIR even when the DVR binary is restored from the cache - the binary
+  # cache restore only populates chaturbate-dvr.exe, and later steps (cookie
+  # deps install, cookie grab) need the full repo present.
+  Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination $d -Recurse -Force -ErrorAction SilentlyContinue
   if (-not (Test-Path "$d\chaturbate-dvr.exe")) {
-    New-Item -ItemType Directory -Force -Path $d | Out-Null
-    Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination $d -Recurse -Force -ErrorAction SilentlyContinue
     Set-Location $d
     Write-Host "(BUILD) Building Go binaries..."
     $sa = $env:ALL_PROXY; Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
