@@ -247,8 +247,13 @@ $tsConnectJob = Start-Job -Name tsc -ArgumentList $tailscaleIpFile, $tsDiagFile,
     $stateDir = "$env:TEMP\TailscaleUS"
     New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
     $stateFile = Join-Path $stateDir "server-state.conf"
+    # FIX: '--no-logs-to-stderr' is NOT a valid tailscaled flag (the real one
+    # is '--no-logs-no-support'); Go's flag package prints usage + exits when
+    # it sees an undefined flag, which is why the userspace daemon died
+    # instantly in CI (pid exited right after launch, 'ts up' could not
+    # connect). Only pass flags tailscaled actually accepts.
     $p = Start-Process -FilePath $tsd `
-      -ArgumentList "--state=`"$stateFile`" --tun=userspace-networking --no-logs-to-stderr" `
+      -ArgumentList "--state=`"$stateFile`" --tun=userspace-networking" `
       -WindowStyle Hidden -PassThru `
       -RedirectStandardError "$env:TEMP\_tsd_err" `
       -RedirectStandardOutput "$env:TEMP\_tsd_out"

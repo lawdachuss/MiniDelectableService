@@ -277,7 +277,11 @@ jobs:
                 }
               }
             } else { Write-Host "[CHROME146] Using cached zip" }
-            if (Test-Path $zip -and (Get-Item $zip).Length -gt 50MB) {
+            # FIX: 'Test-Path $zip -and (...)' parses '-and' as a Test-Path
+            # parameter and throws 'parameter name and' (seen in CI), so the
+            # downloaded zip was never extracted. Parentheses force expression
+            # mode.
+            if ((Test-Path $zip) -and ((Get-Item $zip).Length -gt 50MB)) {
               Write-Host "[CHROME146] Extracting..."
               Expand-Archive -Path $zip -DestinationPath $dir -Force
             }
