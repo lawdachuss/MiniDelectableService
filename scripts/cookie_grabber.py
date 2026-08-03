@@ -40,6 +40,7 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -79,6 +80,45 @@ AGE_BUTTONS = [
 ]
 
 DEFAULT_TIMEOUT = int(os.environ.get("GRAB_TIMEOUT", "150"))  # seconds
+
+# Hard wall-clock budget for the ENTIRE grab. Scrapling's solve_cloudflare
+# solver does NOT honor the per-call timeout as a bound for managed Turnstile
+# challenges - it loops internally for many minutes (observed: 25+ min per
+# attempt) before its bounding_box locator times out, and retries multiply
+# that. This watchdog force-exits the process so a CI step (or the DVR's
+# startup cookie refresh in main.go) can never hang for tens of minutes.
+# Override with GRAB_TOTAL_TIMEOUT (seconds).
+GRAB_TOTAL_TIMEOUT = int(os.environ.get("GRAB_TOTAL_TIMEOUT", "480"))
+
+# Budget for a single scrapling solve attempt (whole solve, incl. verify).
+SCRAPLING_BUDGET = int(os.environ.get("SCRAPLING_BUDGET", "150"))
+
+
+def install_watchdog():
+    """Force-exit the whole process after GRAB_TOTAL_TIMEOUT seconds.
+
+    The only reliable bound: scrapling/playwright will happily ignore per-call
+    timeouts while a managed Turnstile challenge loops. On Windows, first
+    taskkill the whole process tree (this python + any child browsers the
+    solver spawned) so orphaned Camoufox/Chrome can't linger during a long
+    DVR session, then os._exit as the guarantee.
+    """
+
+    def _boom():
+        sys.stderr.write(
+            f"\n  [FATAL] cookie_grabber exceeded {GRAB_TOTAL_TIMEOUT}s total budget "
+            "- force exiting (DVR will keep existing cookies)\n"
+        )
+        sys.stderr.flush()
+        if os.name == "nt":
+            # Kill self + child browsers. Ignore failure; os._exit is the fallback.
+            os.system(f"taskkill /PID {os.getpid()} /T /F >NUL 2>&1")
+        os._exit(1)
+
+    t = threading.Timer(GRAB_TOTAL_TIMEOUT, _boom)
+    t.daemon = True  # must not block a fast-path exit
+    t.start()
+
 
 STEALTH_JS = """
 // Reduce automation fingerprints that Cloudflare's bot score uses.
@@ -303,20 +343,135 @@ def solve_challenge(page, ctx, timeout):
     return False
 
 
+def _browser_pids():
+    """Set of PIDs for known browser images (Windows only). Used to kill only
+    browsers that appeared DURING a solve, never a user's existing browser."""
+    import subprocess
+
+    pids = set()
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+        for line in out.splitlines():
+            parts = line.strip('"').split('"' + ',' + '"')
+            if len(parts) >= 2 and parts[0].lower() in (
+                "chrome.exe", "msedge.exe", "camoufox.exe", "firefox.exe",
+            ):
+                try:
+                    pids.add(int(parts[1].strip('"')))
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return pids
+
+
+def _kill_new_browsers(pre_pids):
+    """taskkill /T /F every browser PID that appeared after the snapshot."""
+    import subprocess
+
+    for pid in sorted(_browser_pids() - pre_pids):
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, timeout=15,
+            )
+        except Exception:
+            pass
+
+
+def _scrapling_attempt(site_domain, user_agent, timeout, executable):
+    """Run one scrapling solve. Executed in a worker thread so the caller can
+    bound it with a hard budget (the internal solver ignores per-call timeouts
+    on managed Turnstiles and would otherwise loop for many minutes).
+
+    Returns a dict of cookies with a verified cf_clearance, or None on failure.
+    """
+    from scrapling.fetchers import StealthySession
+
+    # Headed by default on the runner (it has an RDP desktop and Cloudflare
+    # finger-prints headless browsers harder). Set SCRAPLING_HEADLESS=1 to
+    # force headless on desktop-less hosts.
+    headless = os.environ.get("SCRAPLING_HEADLESS", "0") == "1"
+    session_kwargs = dict(
+        headless=headless,
+        solve_cloudflare=True,
+        block_webrtc=True,
+        hide_canvas=True,
+        useragent=user_agent or CHROME146_UA,
+        timeout=timeout * 1000,  # >=60s recommended for the CF solver
+        retries=1,
+        retry_delay=2,
+    )
+    if executable:
+        # Pinned Chrome 146 -> use it via executable_path so the TLS
+        # fingerprint that mints cf_clearance matches the DVR exactly.
+        # NOTE: do NOT also set real_chrome=True here - that forces
+        # channel="chrome" which conflicts with executable_path.
+        session_kwargs["executable_path"] = executable
+    with StealthySession(**session_kwargs) as session:
+        resp = session.fetch(
+            site_domain,
+            solve_cloudflare=True,
+            timeout=timeout * 1000,
+            retries=1,
+        )
+        status = getattr(resp, "status", None)
+        print(f"  [SCRAPLING] Page loaded (HTTP {status}) - collecting cookies...")
+
+        cookies = {}
+        if isinstance(resp.cookies, tuple):
+            for c in resp.cookies:
+                if isinstance(c, dict) and "name" in c:
+                    cookies[c["name"]] = c["value"]
+                elif isinstance(c, dict):
+                    cookies.update(c)
+        elif isinstance(resp.cookies, dict):
+            cookies = dict(resp.cookies)
+        print(f"  [SCRAPLING] Got {len(cookies)} cookies")
+
+        if "cf_clearance" not in cookies or not cookies["cf_clearance"]:
+            print("  [SCRAPLING] No cf_clearance minted - challenge not solved")
+            return None
+        print(f"  [SCRAPLING] cf_clearance found! length={len(cookies['cf_clearance'])}")
+
+        # Verify the clearance actually works from inside the same session
+        # (it carries the fresh cookies). HTTP 200 = the Go client with the
+        # same cookies will pass too.
+        verify_url = site_domain.rstrip("/") + "/api/biocontext/kittengirlxo/"
+        try:
+            vresp = session.fetch(verify_url, timeout=30000)
+            vstatus = getattr(vresp, "status", None)
+            print(f"  [SCRAPLING] API verify: HTTP {vstatus}")
+            if vstatus != 200:
+                print("  [SCRAPLING] API verify failed - cf_clearance not valid for this IP")
+                return None
+        except Exception as e:
+            print(f"  [SCRAPLING] API verify threw: {e}")
+            return None
+        print("  [OK] Scrapling solved challenge + verified cf_clearance via API")
+        return cookies
+
+
 def solve_with_scrapling(site_domain, user_agent, timeout):
     """Solve the Cloudflare challenge using Scrapling's StealthySession.
 
-    Scrapling's solve_cloudflare=True is a purpose-built automatic solver for
-    managed/interactive/invisible Turnstile challenges (the same technique used
-    by the working node-3 deployment, which fetched chaturbate.com - here we
-    target cb.xxx, the domain the DVR actually uses). It is pointed at the
-    pinned Chrome for Testing 146 (CHROME146_PATH) so the TLS fingerprint that
-    mints cf_clearance matches httpcloak's 'chrome-146-windows' preset exactly.
+    Scrapling's solve_cloudflare=True is an automatic solver for
+    interactive/invisible Turnstile challenges (the same technique used by the
+    working node-3 deployment, which fetched chaturbate.com - here we target
+    cb.xxx, the domain the DVR actually uses). WARNING: cb.xxx serves a
+    "managed" Turnstile to datacenter IPs that this solver cannot clear - the
+    whole attempt is hard-bounded by SCRAPLING_BUDGET + GRAB_TOTAL_TIMEOUT so
+    it fast-fails instead of hanging. It is pointed at the pinned Chrome for
+    Testing 146 (CHROME146_PATH) so the TLS fingerprint that mints
+    cf_clearance matches httpcloak's 'chrome-146-windows' preset exactly.
 
     Returns a dict of cookies with a verified cf_clearance, or None on failure.
     """
     try:
-        from scrapling.fetchers import StealthySession
+        from scrapling.fetchers import StealthySession  # noqa: F401  (presence check)
     except ImportError:
         print("  [WARN] scrapling not installed (pip install 'scrapling[fetchers]') - using Playwright fallback")
         return None
@@ -324,76 +479,50 @@ def solve_with_scrapling(site_domain, user_agent, timeout):
     pinned = os.environ.get("CHROME146_PATH", "")
     executable = pinned if pinned and os.path.isfile(pinned) else None
     print(f"  [SCRAPLING] Solving challenge (target={site_domain}, "
-          f"executable={executable or 'bundled/stealth browser'})...")
+          f"executable={executable or 'bundled/stealth browser'}, "
+          f"budget={SCRAPLING_BUDGET}s)...")
 
+    # The internal solver ignores per-call timeouts on managed Turnstiles and
+    # can loop for many minutes, so bound the WHOLE attempt from here. NOTE:
+    # do NOT use `with ThreadPoolExecutor(...)` - its __exit__ calls
+    # shutdown(wait=True) and would block forever if the solver thread is
+    # stuck. shutdown(wait=False) + daemon workers (Py3.9+) lets the process
+    # exit cleanly; the watchdog's taskkill /T cleans up any stray browser.
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    # Snapshot existing browser PIDs so we can kill only NEW ones (the solver's
+    # Camoufox/Chrome) if the budget expires - never a user's own browser.
+    pre_browsers = _browser_pids() if os.name == "nt" else set()
+    ex = ThreadPoolExecutor(max_workers=1)
     try:
-        session_kwargs = dict(
-            headless=True,
-            solve_cloudflare=True,
-            block_webrtc=True,
-            hide_canvas=True,
-            useragent=user_agent or CHROME146_UA,
-            timeout=timeout * 1000,  # >=60s recommended for the CF solver
-            retries=3,
-            retry_delay=2,
-        )
-        if executable:
-            # Pinned Chrome 146 -> use it via executable_path so the TLS
-            # fingerprint that mints cf_clearance matches the DVR exactly.
-            # NOTE: do NOT also set real_chrome=True here - that forces
-            # channel="chrome" which conflicts with executable_path.
-            session_kwargs["executable_path"] = executable
-        with StealthySession(**session_kwargs) as session:
-            resp = session.fetch(
-                site_domain,
-                solve_cloudflare=True,
-                timeout=timeout * 1000,
-                retries=3,
-            )
-            status = getattr(resp, "status", None)
-            print(f"  [SCRAPLING] Page loaded (HTTP {status}) - collecting cookies...")
-
-            cookies = {}
-            if isinstance(resp.cookies, tuple):
-                for c in resp.cookies:
-                    if isinstance(c, dict) and "name" in c:
-                        cookies[c["name"]] = c["value"]
-                    elif isinstance(c, dict):
-                        cookies.update(c)
-            elif isinstance(resp.cookies, dict):
-                cookies = dict(resp.cookies)
-            print(f"  [SCRAPLING] Got {len(cookies)} cookies")
-
-            if "cf_clearance" not in cookies or not cookies["cf_clearance"]:
-                print("  [SCRAPLING] No cf_clearance minted - challenge not solved")
-                return None
-            print(f"  [SCRAPLING] cf_clearance found! length={len(cookies['cf_clearance'])}")
-
-            # Verify the clearance actually works from inside the same session
-            # (it carries the fresh cookies). HTTP 200 = the Go client with the
-            # same cookies will pass too.
-            verify_url = site_domain.rstrip("/") + "/api/biocontext/kittengirlxo/"
-            try:
-                vresp = session.fetch(verify_url, timeout=30000)
-                vstatus = getattr(vresp, "status", None)
-                print(f"  [SCRAPLING] API verify: HTTP {vstatus}")
-                if vstatus != 200:
-                    print("  [SCRAPLING] API verify failed - cf_clearance not valid for this IP")
-                    return None
-            except Exception as e:
-                print(f"  [SCRAPLING] API verify threw: {e}")
-                return None
-            print("  [OK] Scrapling solved challenge + verified cf_clearance via API")
-            return cookies
+        fut = ex.submit(_scrapling_attempt, site_domain, user_agent, timeout, executable)
+        try:
+            return fut.result(timeout=SCRAPLING_BUDGET)
+        except FutureTimeoutError:
+            print(f"  [SCRAPLING] solver exceeded {SCRAPLING_BUDGET}s budget - abandoning attempt")
+            # The abandoned worker thread still holds a StealthySession browser.
+            # Kill browsers that appeared during the solve so nothing leaks into
+            # a long DVR session (covers the main.go startup path too, where no
+            # workflow cleanup runs).
+            if os.name == "nt":
+                _kill_new_browsers(pre_browsers)
+            return None
     except Exception as e:
         print(f"  [SCRAPLING] solve failed: {str(e)[:200]}")
         return None
+    finally:
+        ex.shutdown(wait=False)
 
 
 def main():
     print("=" * 50)
     print("  Cookie Grabber (Playwright)")
     print("=" * 50)
+
+    # Guarantee the whole run is bounded (Scrapling's managed-Turnstile solver
+    # ignores per-call timeouts and can loop for 25+ min per attempt).
+    install_watchdog()
 
     load_dotenv(".env")
 

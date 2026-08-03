@@ -222,6 +222,26 @@ jobs:
             $t = Measure-Command { python -m playwright install chromium 2>&1 | ForEach-Object { Write-Host "  [PW] $_" } }
             Write-Host "[PLAYWRIGHT] Chromium install done in $([math]::Round($t.TotalSeconds,1))s (exit $LASTEXITCODE)"
           } catch { Write-Warning "[PLAYWRIGHT] Chromium install failed: $($_.Exception.Message)" }
+          # Pre-warm the scrapling browser so the FIRST grab doesn't spend its
+          # 150s solve budget launching/downloading a browser mid-solve (which
+          # would abandon the thread). Uses CHROME146_PATH when the pinned
+          # Chrome 146 is installed (it's set by the earlier install step),
+          # else scrapling's bundled browser. A real start() is required -
+          # the constructor alone does not launch anything. Bounded at 240s.
+          Write-Host "[SCRAPLING] Pre-warming scrapling browser (cap 240s)..."
+          try {
+            $warmScript = "$env:TEMP\_scrap_warmup.py"
+            Set-Content $warmScript -Value "import os, sys; from scrapling.fetchers import StealthySession; kw={}; exe=os.environ.get('CHROME146_PATH',''); kw['executable_path']=exe if exe and os.path.isfile(exe) else None; kw={k:v for k,v in kw.items() if v}; s=StealthySession(headless=True, **kw); s.start(); print('warmup: browser launched OK'); s.close()" -Encoding utf8
+            $warmJob = Start-Job -ScriptBlock { param($f) python -u $f 2>&1 } -ArgumentList $warmScript
+            if (-not (Wait-Job $warmJob -Timeout 240)) {
+              Write-Warning "[SCRAPLING] warm-up timed out - first grab will pay the cost"
+              Stop-Job $warmJob -ErrorAction SilentlyContinue
+            } else {
+              Receive-Job $warmJob | ForEach-Object { Write-Host "  [SCRAP] $_" }
+            }
+            Remove-Job $warmJob -Force -ErrorAction SilentlyContinue
+            Remove-Item $warmScript -Force -ErrorAction SilentlyContinue
+          } catch { Write-Warning "[SCRAPLING] warm-up failed: $($_.Exception.Message)" }
 
       - name: Install pinned Chrome 146 (cf_clearance fingerprint)
         if: always()
@@ -275,26 +295,79 @@ jobs:
         shell: pwsh
         env:
           PYTHONUNBUFFERED: '1'
+          GRAB_TOTAL_TIMEOUT: '480'
         run: |
           # FIX: run cookie_grabber.py BEFORE the DVR starts so it has a fresh
           # cf_clearance cookie bound to this runner's IP. Without this the DVR
           # uses stale cookies from Supabase -> instant Cloudflare 403 on every
           # /get_edge_hls_url_ajax/ call ("Just a moment..." Turnstile page).
+          # HARD CAP: cb.xxx serves a "managed" Turnstile to datacenter IPs that
+          # the auto-solver cannot clear - the scrapling solver used to loop for
+          # 25+ min per attempt and this step had NO timeout (30+ min runs).
+          # cookie_grabber.py now self-bounds via the GRAB_TOTAL_TIMEOUT watchdog
+          # (480s) and this step ALSO hard-caps at 540s and taskkill /T's the
+          # whole process tree (browser included) if the cap is hit.
+          #
+          # CRITICAL: do NOT use Start-Process -RedirectStandardOutput here.
+          # Windows anonymous pipes have a ~64KB buffer and when the child
+          # (Python/scrapling) writes enough log output, the pipe fills and the
+          # child blocks forever on write. Start-Job with Receive-Job pipes
+          # output through PowerShell's robust serialization queue instead of
+          # a fixed-size pipe buffer, avoiding the deadlock entirely.
           Set-Location $env:REPO_DIR
           $ErrorActionPreference = 'Continue'
-          Write-Host "[COOKIE] Running cookie_grabber.py to mint fresh cf_clearance..."
-          $t = Measure-Command {
-            $proc = Start-Process -FilePath python -ArgumentList "-u","scripts/cookie_grabber.py" `
-              -WorkingDirectory $env:REPO_DIR -NoNewWindow -PassThru `
-              -RedirectStandardOutput "$env:TEMP\cg_out.txt" `
-              -RedirectStandardError  "$env:TEMP\cg_err.txt"
-            $proc.WaitForExit()
+          Write-Host "[COOKIE] Running cookie_grabber.py to mint fresh cf_clearance... (hard cap 540s)"
+          # Browser PIDs that already exist before the grab starts - these must
+          # be preserved (RDP user's browser, etc.). Only NEW browsers get killed.
+          $preGrab = @(Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $capSec = 540
+          $grabJob = Start-Job -ScriptBlock {
+            param($dir)
+            Set-Location $dir
+            $env:PYTHONUNBUFFERED = '1'
+            & python -u scripts/cookie_grabber.py 2>&1
+            # Emit the exit code as the last line so Receive-Job can pick it up
+            Write-Output "__EXITCODE__$LASTEXITCODE"
+          } -ArgumentList $env:REPO_DIR
+          # Poll with a hard deadline; Receive-Job streams output live so
+          # progress is visible in the step log even while the script is still
+          # running. Unlike Start-Process -RedirectStandardOutput, this does
+          # NOT use a fixed-size anonymous pipe - PowerShell's job system
+          # serializes output through a queue, so the child never blocks on
+          # stdout writes.
+          $lastOutputLen = 0
+          while ($grabJob.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $capSec) {
+            $lines = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
+            if ($lines.Count -gt $lastOutputLen) {
+              $lines[$lastOutputLen..($lines.Count-1)] | ForEach-Object { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
+              $lastOutputLen = $lines.Count
+            }
+            Start-Sleep -Seconds 2
           }
-          $grabExit = $proc.ExitCode
-          # Stream output line-by-line so it appears in the step log
-          Get-Content "$env:TEMP\cg_out.txt" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [CG] $_" }
-          Get-Content "$env:TEMP\cg_err.txt" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [CGe] $_" }
-          Write-Host "[COOKIE] cookie_grabber.py finished in $([math]::Round($t.TotalSeconds,1))s (exit $grabExit)"
+          # Drain any remaining output (including __EXITCODE__)
+          $remaining = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
+          foreach ($_ in $remaining) { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
+          $capped = $sw.Elapsed.TotalSeconds -ge $capSec
+          if ($capped) {
+            Write-Warning "[COOKIE] cookie_grabber.py exceeded ${capSec}s hard cap - stopping job"
+            Stop-Job $grabJob -ErrorAction SilentlyContinue
+          }
+          # Extract exit code from the __EXITCODE__ marker
+          $grabExit = 0
+          $allOutput = @($lines) + @($remaining)
+          foreach ($_ in $allOutput) {
+            if ($_ -match '__EXITCODE__(\d+)') { $grabExit = [int]$matches[1] }
+          }
+          Remove-Job $grabJob -Force -ErrorAction SilentlyContinue
+          # The scrapling solver thread is abandoned (not killed) when its
+          # budget expires, so its Camoufox/Chrome child may survive python's
+          # exit. Kill only browsers that started DURING the grab - they belong
+          # to the grabber, not to the DVR or any RDP session.
+          Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue |
+            Where-Object { $preGrab -notcontains $_.Id } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "[COOKIE] cookie_grabber.py finished in $([math]::Round($sw.Elapsed.TotalSeconds,1))s (exit $grabExit, capped=$capped)"
           if ($grabExit -ne 0) {
             Write-Warning "[COOKIE] cookie_grabber.py failed (exit $grabExit) - DVR will use existing cookies from Supabase"
           } else {
@@ -303,6 +376,15 @@ jobs:
 
       - name: Keep Runner Alive
         shell: pwsh
+        env:
+          # Pass these to the DVR process so the cookie_grabber.py invoked by
+          # main.go's refreshCookies() has the same bounds as the dedicated step.
+          # CHROME146_PATH is set by the Install pinned Chrome 146 step via
+          # GITHUB_ENV and is inherited automatically by all child processes.
+          # All other secrets (SUPABASE_*, NODE_ID, etc.) come from the
+          # job-level env block above.
+          GRAB_TOTAL_TIMEOUT: '240'
+          SCRAPLING_BUDGET: '120'
         run: pwsh ./scripts/keep-alive.ps1
 
       - name: Restore Network for Upload
