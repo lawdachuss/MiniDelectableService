@@ -1,7 +1,6 @@
 name: Secure RDP
 run-name: Secure RDP${{ github.event.inputs.triggered_by == 'workflow-watchman' && ' (watchman)' || '' }}
 
-
 on:
   schedule:
     - cron: '0 */6 * * *'
@@ -18,22 +17,35 @@ permissions:
 
 env:
   GH_TOKEN: ${{ github.token }}
-  # Suppress Node 20 deprecation warnings from actions that bundle older runtimes
+  # Opt into Node 24 now (default since June 16, 2026) and keep the safety valve
+  # for any action that has not been rebuilt yet.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 420
+    env:
+      MINI_ENV: ${{ secrets.MINI_ENV }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
+      NODE_ID: ${{ secrets.NODE_ID }}
+      SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
+      VIDHIDE_API_KEY: ${{ secrets.VIDHIDE_API_KEY }}
+      STREAMWISH_API_KEY: ${{ secrets.STREAMWISH_API_KEY }}
+      UPNSHARE_KEY: ${{ secrets.UPNSHARE_KEY }}
+      DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
+      VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
+      VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+      AFFILIATE_WM: ${{ secrets.AFFILIATE_WM }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
-      - name: Wipe D drive
-        shell: powershell
-        run: |
-          Write-Host "[WIPE] Deleting everything on D: drive..."
-          Get-ChildItem D:\ -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '$Recycle.Bin' -and $_.Name -ne 'System Volume Information' -and $_.Name -ne 'a'} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-          Write-Host "[WIPE] Done"
-
       - uses: actions/checkout@v4
 
       - name: Init
@@ -42,46 +54,39 @@ jobs:
           # Cleanup any stale DVR/tunnel from previous runs
           Get-Process chaturbate-dvr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          # Don't delete videos/ - they contain completed recordings
+          # The runner's OS env vars (USERPROFILE/HOME) are NOT visible to the
+          # ${{ env.* }} context, so export them explicitly so cache steps and
+          # cache path lists resolve the real user profile.
+          echo "USERPROFILE=$env:USERPROFILE" >> $env:GITHUB_ENV
+          echo "HOME=$env:USERPROFILE" >> $env:GITHUB_ENV
+          # Default Go cache paths (also set via go env at save time; keep in sync).
+          echo "GO_MOD_CACHE=$env:USERPROFILE\go\pkg\mod" >> $env:GITHUB_ENV
+          echo "GO_BUILD_CACHE=$env:USERPROFILE\AppData\Local\go-build" >> $env:GITHUB_ENV
           $repoName = ($env:GITHUB_REPOSITORY -split '/')[-1]
           echo "REPO_DIR=D:\repos\$repoName" >> $env:GITHUB_ENV
           Remove-Item "D:\repos\$repoName\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
-          $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          echo "START_TIME=$epoch" >> $env:GITHUB_ENV
-          # Export default Go cache paths so the restore step uses the same
-          # env vars as the save step (set via go env in Discover step).
-          echo "GO_MOD_CACHE=$env:USERPROFILE\go\pkg\mod" >> $env:GITHUB_ENV
-          echo "GO_BUILD_CACHE=$env:USERPROFILE\AppData\Local\go-build" >> $env:GITHUB_ENV
-          # The runner's OS env vars (USERPROFILE/HOME) are NOT visible to the
-          # ${{ env.* }} context, so cache path lists like
-          # "${{ env.USERPROFILE }}\.cache\tailscale.msi" resolve to EMPTY and
-          # silently cache to the wrong drive root. Export them explicitly so
-          # the cache restore/save steps pick up the real user profile.
-          echo "USERPROFILE=$env:USERPROFILE" >> $env:GITHUB_ENV
-          echo "HOME=$env:USERPROFILE" >> $env:GITHUB_ENV
+          echo "START_TIME=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
+          # Single-run guard: self-cancel if another run of this workflow is active.
           $r = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status,startedAt 2>$null | ConvertFrom-Json
           if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt 348)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
 
-      - uses: actions/cache/restore@v5
+      - name: Restore Go cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ${{ env.GO_MOD_CACHE }}
             ${{ env.GO_BUILD_CACHE }}
           key: ${{ github.repository }}-${{ runner.os }}-go-cache-${{ hashFiles('go.sum', 'go.mod') }}
           restore-keys: |
-            ${{ github.repository }}-${{ runner.os }}-go-cache-${{ github.run_id }}-
             ${{ github.repository }}-${{ runner.os }}-go-cache-
             ${{ github.repository }}-${{ runner.os }}-gocache-
-            ${{ github.repository }}-${{ runner.os }}-cache-
-            ${{ github.repository }}-${{ runner.os }}-
-            ${{ runner.os }}-go-cache-
-            ${{ runner.os }}-gocache-
-            ${{ runner.os }}-cache-
-            ${{ runner.os }}-
 
-      - uses: actions/cache/restore@v5
+      - name: Restore tools cache
+        uses: actions/cache/restore@v5
         with:
           path: |
+            ${{ env.USERPROFILE }}\AppData\Local\pip\Cache
+            ${{ env.USERPROFILE }}\AppData\Local\ms-playwright
             ${{ env.USERPROFILE }}\.cache\tailscale.msi
             C:\ProgramData\chocolatey\cache
             C:\ProgramData\chocolatey\lib\ffmpeg
@@ -89,17 +94,19 @@ jobs:
             C:\ProgramData\chocolatey\bin\ffprobe.exe
             C:\cloudflared
             C:\Program Files\Tailscale
+            C:\chrome146
           key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ hashFiles('go.mod') }}
           restore-keys: |
-            ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ github.run_id }}-
             ${{ github.repository }}-${{ runner.os }}-tools-cache-
             ${{ github.repository }}-${{ runner.os }}-tools-
-            ${{ github.repository }}-${{ runner.os }}-cache-
-            ${{ github.repository }}-${{ runner.os }}-
-            ${{ runner.os }}-tools-cache-
-            ${{ runner.os }}-tools-
-            ${{ runner.os }}-cache-
-            ${{ runner.os }}-
+
+      - name: Restore DVR binary
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.REPO_DIR }}\chaturbate-dvr.exe
+          key: ${{ github.repository }}-${{ runner.os }}-dvr-bin-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
+          restore-keys: |
+            ${{ github.repository }}-${{ runner.os }}-dvr-bin-
 
       - uses: actions/setup-go@v5
         with:
@@ -107,50 +114,11 @@ jobs:
 
       - name: Parallel Setup
         shell: pwsh
-        env:
-          MINI_ENV: ${{ secrets.MINI_ENV }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
-          NODE_ID: ${{ secrets.NODE_ID }}
-          SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
-          VIDHIDE_API_KEY: ${{ secrets.VIDHIDE_API_KEY }}
-          STREAMWISH_API_KEY: ${{ secrets.STREAMWISH_API_KEY }}
-          UPNSHARE_KEY: ${{ secrets.UPNSHARE_KEY }}
-          DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
-          VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
-          VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
-          AFFILIATE_WM: ${{ secrets.AFFILIATE_WM }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
         run: pwsh ./scripts/parallel-setup.ps1
-
-
-      - name: Discover Go cache paths and create directories
-        if: always()
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $goMod = $(go env GOMODCACHE)
-          $goBuild = $(go env GOCACHE)
-          Write-Host "GOMODCACHE=$goMod"
-          Write-Host "GOCACHE=$goBuild"
-          New-Item -ItemType Directory -Force -Path $goMod | Out-Null
-          New-Item -ItemType Directory -Force -Path $goBuild | Out-Null
-          echo "GO_MOD_CACHE=$goMod" >> $env:GITHUB_ENV
-          echo "GO_BUILD_CACHE=$goBuild" >> $env:GITHUB_ENV
 
       - name: Save Go cache (before 6h loop, so cancelled runs still save)
         if: always()
         continue-on-error: true
-        # Keep cache HTTP traffic on the direct connection.
-        env:
-          ALL_PROXY: ''
-          HTTP_PROXY: ''
-          HTTPS_PROXY: ''
-          SOCKS_PROXY: ''
-          PROXY_URL: ''
         uses: actions/cache/save@v5
         with:
           path: |
@@ -161,15 +129,11 @@ jobs:
       - name: Save Tools cache (before 6h loop, so cancelled runs still save)
         if: always()
         continue-on-error: true
-        env:
-          ALL_PROXY: ''
-          HTTP_PROXY: ''
-          HTTPS_PROXY: ''
-          SOCKS_PROXY: ''
-          PROXY_URL: ''
         uses: actions/cache/save@v5
         with:
           path: |
+            ${{ env.USERPROFILE }}\AppData\Local\pip\Cache
+            ${{ env.USERPROFILE }}\AppData\Local\ms-playwright
             ${{ env.USERPROFILE }}\.cache\tailscale.msi
             C:\ProgramData\chocolatey\cache
             C:\ProgramData\chocolatey\lib\ffmpeg
@@ -177,13 +141,20 @@ jobs:
             C:\ProgramData\chocolatey\bin\ffprobe.exe
             C:\cloudflared
             C:\Program Files\Tailscale
+            C:\chrome146
           key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ github.run_id }}-${{ hashFiles('go.mod') }}
+
+      - name: Save DVR binary (before 6h loop, so cancelled runs still save)
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.REPO_DIR }}\chaturbate-dvr.exe
+          key: ${{ github.repository }}-${{ runner.os }}-dvr-bin-${{ github.run_id }}-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
 
       - name: Fix Supabase DNS (resolvers + hosts pin)
         if: always()
         shell: powershell
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         run: |
           # Never fatal: a bad secret/resolver must degrade gracefully, not kill
           # the run (PowerShell EAP=stop on the runner turns curl stderr into a
@@ -192,7 +163,7 @@ jobs:
           $ErrorActionPreference = 'Continue'
           $sbHost = (($env:SUPABASE_URL -replace '^https?://','') -split '[/:]')[0]
           if ([string]::IsNullOrWhiteSpace($sbHost) -or $sbHost -eq '-' -or $sbHost.Length -le 2) { $sbHost = 'supabase.chuglii.in' }
-          Write-Host "(DNS) Supabase host: $sbHost (hex: $([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($sbHost)).Replace('-','')))"
+          Write-Host "(DNS) Supabase host: $sbHost"
           try {
             Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
               try {
@@ -236,13 +207,13 @@ jobs:
           # cookie_grabber.py needs to mint a fresh cf_clearance).
           $ErrorActionPreference = 'Continue'
           try {
-            python -m pip install --quiet --disable-pip-version-check curl_cffi playwright
+            python -m pip install --quiet --disable-pip-version-check -r "$env:REPO_DIR\requirements.txt"
             Write-Host "pip install exit: $LASTEXITCODE"
-            python -c "import curl_cffi; print('curl_cffi OK, version', curl_cffi.__version__); import playwright; print('playwright OK')"
+            python -c "import curl_cffi; print('curl_cffi OK, version', curl_cffi.__version__); import playwright; print('playwright OK'); from scrapling.fetchers import StealthySession; print('scrapling OK')"
             if ($LASTEXITCODE -ne 0) {
               Write-Warning "python not usable - trying py -3 launcher"
-              py -3 -m pip install --quiet --disable-pip-version-check curl_cffi playwright
-              py -3 -c "import curl_cffi; print('curl_cffi OK via py -3, version', curl_cffi.__version__); import playwright; print('playwright OK via py -3')"
+              py -3 -m pip install --quiet --disable-pip-version-check -r "$env:REPO_DIR\requirements.txt"
+              py -3 -c "import curl_cffi; print('curl_cffi OK via py -3, version', curl_cffi.__version__); import playwright; print('playwright OK via py -3'); from scrapling.fetchers import StealthySession; print('scrapling OK via py -3')"
             }
           } catch { Write-Warning "cookie deps install failed: $($_.Exception.Message)" }
           # Download Chromium browser binaries for cookie_grabber.py (Playwright)
@@ -252,13 +223,57 @@ jobs:
             Write-Host "[PLAYWRIGHT] Chromium install done in $([math]::Round($t.TotalSeconds,1))s (exit $LASTEXITCODE)"
           } catch { Write-Warning "[PLAYWRIGHT] Chromium install failed: $($_.Exception.Message)" }
 
+      - name: Install pinned Chrome 146 (cf_clearance fingerprint)
+        if: always()
+        continue-on-error: true
+        shell: powershell
+        run: |
+          # FIX: cf_clearance is bound to the TLS fingerprint of the browser
+          # that minted it. The Go DVR presents it over httpcloak's
+          # 'chrome-146-windows' fingerprint, so the cookie MUST be minted by a
+          # real Chrome 146. System Chrome on the runner is newer (150+), and
+          # launching it with a spoofed Chrome/146 UA makes Cloudflare flag the
+          # mismatch -> Turnstile never auto-solves. Download a pinned Chrome
+          # for Testing 146 so fingerprint + UA match the DVR exactly.
+          $ErrorActionPreference = 'Continue'
+          $dir = "C:\chrome146"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $exe = "$dir\chrome-win64\chrome.exe"
+          if (-not (Test-Path $exe)) {
+            $zip = "$dir\chrome-win64.zip"
+            if (-not (Test-Path $zip) -or ((Get-Item $zip).Length -lt 50MB)) {
+              Write-Host "[CHROME146] Downloading Chrome for Testing 146.0.7680.165 (~190MB) via curl..."
+              # curl streams to disk and is far faster/more reliable for large
+              # files than PowerShell's Invoke-WebRequest (which buffers and
+              # can stall on the runner for this 190MB artifact).
+              & curl.exe -L --fail --retry 3 --retry-delay 5 -o $zip "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/win64/chrome-win64.zip"
+              if ($LASTEXITCODE -ne 0 -or (Test-Path $zip) -eq $false -or (Get-Item $zip).Length -lt 50MB) {
+                Write-Warning "[CHROME146] curl failed (exit $LASTEXITCODE) - falling back to Invoke-WebRequest"
+                for ($r = 1; $r -le 2; $r++) {
+                  try {
+                    Invoke-WebRequest -Uri "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/win64/chrome-win64.zip" -OutFile $zip -UseBasicParsing -TimeoutSec 600
+                    if ((Get-Item $zip).Length -gt 50MB) { break }
+                  } catch { Write-Warning "[CHROME146] download attempt $r failed: $($_.Exception.Message)" }
+                }
+              }
+            } else { Write-Host "[CHROME146] Using cached zip" }
+            if (Test-Path $zip -and (Get-Item $zip).Length -gt 50MB) {
+              Write-Host "[CHROME146] Extracting..."
+              Expand-Archive -Path $zip -DestinationPath $dir -Force
+            }
+          }
+          if (Test-Path $exe) {
+            echo "CHROME146_PATH=$exe" >> $env:GITHUB_ENV
+            Write-Host "[CHROME146] OK: $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
+          } else {
+            Write-Warning "[CHROME146] Chrome 146 not available - cookie grab will fall back to system Chrome"
+          }
+
       - name: Grab fresh cookies (browser)
         if: always()
         continue-on-error: true
         shell: pwsh
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
           PYTHONUNBUFFERED: '1'
         run: |
           # FIX: run cookie_grabber.py BEFORE the DVR starts so it has a fresh
@@ -288,22 +303,8 @@ jobs:
 
       - name: Keep Runner Alive
         shell: pwsh
-        env:
-          CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
-          NODE_ID: ${{ secrets.NODE_ID }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
-          VIDHIDE_API_KEY: ${{ secrets.VIDHIDE_API_KEY }}
-          STREAMWISH_API_KEY: ${{ secrets.STREAMWISH_API_KEY }}
-          UPNSHARE_KEY: ${{ secrets.UPNSHARE_KEY }}
-          DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
-          VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
-          VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
-          AFFILIATE_WM: ${{ secrets.AFFILIATE_WM }}
         run: pwsh ./scripts/keep-alive.ps1
+
       - name: Restore Network for Upload
         if: always()
         shell: powershell
@@ -312,16 +313,13 @@ jobs:
           Start-Service mpssvc -ErrorAction SilentlyContinue
           Set-Service mpssvc -StartupType Automatic -ErrorAction SilentlyContinue
           Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
-          Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           Write-Host "(NET) Restored"
 
       - name: Upload Tunnel URL
-        if: always()
+        if: always() && !cancelled()
         continue-on-error: true
         uses: actions/upload-artifact@v4
-        env:
-          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
         with:
           name: tunnel-url
           path: ${{ env.REPO_DIR }}\tunnel-url.txt
@@ -336,3 +334,4 @@ jobs:
           Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:REPO_DIR\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
           Write-Host "[CLEANUP] Done"
+
