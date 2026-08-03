@@ -94,6 +94,7 @@ jobs:
             C:\ProgramData\chocolatey\bin\ffprobe.exe
             C:\cloudflared
             C:\Program Files\Tailscale
+            C:\chrome146
           key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ hashFiles('go.mod') }}
           restore-keys: |
             ${{ github.repository }}-${{ runner.os }}-tools-cache-
@@ -140,6 +141,7 @@ jobs:
             C:\ProgramData\chocolatey\bin\ffprobe.exe
             C:\cloudflared
             C:\Program Files\Tailscale
+            C:\chrome146
           key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ github.run_id }}-${{ hashFiles('go.mod') }}
 
       - name: Save DVR binary (before 6h loop, so cancelled runs still save)
@@ -220,6 +222,45 @@ jobs:
             $t = Measure-Command { python -m playwright install chromium 2>&1 | ForEach-Object { Write-Host "  [PW] $_" } }
             Write-Host "[PLAYWRIGHT] Chromium install done in $([math]::Round($t.TotalSeconds,1))s (exit $LASTEXITCODE)"
           } catch { Write-Warning "[PLAYWRIGHT] Chromium install failed: $($_.Exception.Message)" }
+
+      - name: Install pinned Chrome 146 (cf_clearance fingerprint)
+        if: always()
+        continue-on-error: true
+        shell: powershell
+        run: |
+          # FIX: cf_clearance is bound to the TLS fingerprint of the browser
+          # that minted it. The Go DVR presents it over httpcloak's
+          # 'chrome-146-windows' fingerprint, so the cookie MUST be minted by a
+          # real Chrome 146. System Chrome on the runner is newer (150+), and
+          # launching it with a spoofed Chrome/146 UA makes Cloudflare flag the
+          # mismatch -> Turnstile never auto-solves. Download a pinned Chrome
+          # for Testing 146 so fingerprint + UA match the DVR exactly.
+          $ErrorActionPreference = 'Continue'
+          $dir = "C:\chrome146"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $exe = "$dir\chrome-win64\chrome.exe"
+          if (-not (Test-Path $exe)) {
+            $zip = "$dir\chrome-win64.zip"
+            if (-not (Test-Path $zip) -or ((Get-Item $zip).Length -lt 50MB)) {
+              Write-Host "[CHROME146] Downloading Chrome for Testing 146.0.7680.165 (~190MB)..."
+              for ($r = 1; $r -le 3; $r++) {
+                try {
+                  Invoke-WebRequest -Uri "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/win64/chrome-win64.zip" -OutFile $zip -UseBasicParsing -TimeoutSec 300
+                  if ((Get-Item $zip).Length -gt 50MB) { break }
+                } catch { Write-Warning "[CHROME146] download attempt $r failed: $($_.Exception.Message)" }
+              }
+            } else { Write-Host "[CHROME146] Using cached zip" }
+            if (Test-Path $zip -and (Get-Item $zip).Length -gt 50MB) {
+              Write-Host "[CHROME146] Extracting..."
+              Expand-Archive -Path $zip -DestinationPath $dir -Force
+            }
+          }
+          if (Test-Path $exe) {
+            echo "CHROME146_PATH=$exe" >> $env:GITHUB_ENV
+            Write-Host "[CHROME146] OK: $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
+          } else {
+            Write-Warning "[CHROME146] Chrome 146 not available - cookie grab will fall back to system Chrome"
+          }
 
       - name: Grab fresh cookies (browser)
         if: always()
