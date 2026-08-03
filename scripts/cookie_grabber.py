@@ -110,11 +110,11 @@ def save_to_supabase(rest, api_key, value):
         raw = existing[0].get("value", {})
         if isinstance(raw, dict):
             merged_value = dict(raw)
-            print(f"  [OK] Loaded existing settings ({len(merged_value)} keys) â€” will merge cookie fields on top")
+            print(f"  [OK] Loaded existing settings ({len(merged_value)} keys) — will merge cookie fields on top")
         else:
-            print("  [WARN] Existing value is not a dict â€” will overwrite")
+            print("  [WARN] Existing value is not a dict — will overwrite")
     else:
-        print("  [INFO] No existing dvr_settings row found â€” will INSERT")
+        print("  [INFO] No existing dvr_settings row found — will INSERT")
     sys.stdout.flush()
 
     # Merge: cookie fields from `value` overwrite existing, other keys preserved
@@ -335,7 +335,7 @@ def main():
     print(f"  Existing cookies: {len(old)}")
 
     # Fast path: skip browser solve ONLY if this specific runner already minted a
-    # fresh cf_clearance during this same workflow run.  cf_clearance is IP-bound â€”
+    # fresh cf_clearance during this same workflow run.  cf_clearance is IP-bound —
     # a token from a previous run (different runner IP) will cause 403.
     import sys
     sys.stdout.flush()
@@ -347,15 +347,15 @@ def main():
     sys.stdout.flush()
 
     if cf_val and len(cf_val) > 20 and current_run_id and current_run_id == stored_run_id:
-        print(f"  [OK] cf_clearance from THIS run (run_id={current_run_id}) â€” skipping browser solve")
+        print(f"  [OK] cf_clearance from THIS run (run_id={current_run_id}) — skipping browser solve")
         print(f"  sessionid: {'[OK]' if 'sessionid' in old else '[NO]'}")
         print(f"  csrftoken: {'[OK]' if 'csrftoken' in old else '[NO]'}")
         sys.stdout.flush()
         return 0
     if cf_val and len(cf_val) > 20 and stored_run_id != current_run_id:
-        print(f"  [INFO] cf_clearance is from a DIFFERENT run (stored={stored_run_id!r}) â€” must mint fresh one for this runner's IP")
+        print(f"  [INFO] cf_clearance is from a DIFFERENT run (stored={stored_run_id!r}) — must mint fresh one for this runner's IP")
     elif not cf_val or len(cf_val) <= 20:
-        print(f"  [INFO] No valid cf_clearance found â€” launching browser")
+        print(f"  [INFO] No valid cf_clearance found — launching browser")
     sys.stdout.flush()
 
     # CRITICAL: the DVR presents these cookies over httpcloak's
@@ -397,7 +397,10 @@ def main():
             if solved:
                 print("  Challenge fully cleared (cf_clearance valid for this IP)")
             else:
-                print(f"  [WARN] could not obtain a valid cf_clearance within {DEFAULT_TIMEOUT}s - grabbing whatever we have")
+                print(f"  [ERROR] could not obtain a VALID cf_clearance within {DEFAULT_TIMEOUT}s")
+                print("  [INFO] Keeping the stored cookie set in Supabase - NOT overwriting with unverified cookies")
+                sys.stdout.flush()
+                return 1
 
             # --- Dismiss the age-verification modal if present ---
             try:
