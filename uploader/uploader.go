@@ -104,11 +104,11 @@ type UploadResult struct {
 
 // MultiHostUploader handles uploading to multiple hosts simultaneously
 type MultiHostUploader struct {
-	gofile        *GoFileUploader
-	voesx         *VoeSXUploader
-	streamtape    *StreamtapeUploader
-	mixdrop       *MixdropUploader
-	seekstreaming *SeekStreamingUploader
+	gofile     *GoFileUploader
+	voesx      *VoeSXUploader
+	streamtape *StreamtapeUploader
+	mixdrop    *MixdropUploader
+	vidara     *VidaraUploader
 	log           Logger
 	hostInitOnce  sync.Once
 	hosts         map[string]uploaderFunc // host name -> upload function, lazy-init
@@ -135,24 +135,24 @@ func (m *MultiHostUploader) initHosts() {
 		if m.mixdrop != nil && m.mixdrop.email != "" && m.mixdrop.token != "" {
 			m.hosts["Mixdrop"] = m.mixdrop.UploadWithProgress
 		}
-		if m.seekstreaming != nil && m.seekstreaming.key != "" {
-			m.hosts["SeekStreaming"] = m.seekstreaming.UploadWithProgress
+		if m.vidara != nil && m.vidara.apiKey != "" {
+			m.hosts["Vidara"] = m.vidara.UploadWithProgress
 		}
 	})
 }
 
 // NewMultiHostUploader creates a new multi-host uploader
-func NewMultiHostUploader(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, seekStreamingKey string, log Logger) *MultiHostUploader {
+func NewMultiHostUploader(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, vidaraKey string, log Logger) *MultiHostUploader {
 	if log == nil {
 		log = &nilLogger{}
 	}
 	return &MultiHostUploader{
-		gofile:        NewGoFileUploader(),
-		voesx:         NewVoeSXUploader(voeSXAPIKey),
-		streamtape:    NewStreamtapeUploader(streamtapeLogin, streamtapeKey),
-		mixdrop:       NewMixdropUploader(mixdropEmail, mixdropToken),
-		seekstreaming: NewSeekStreamingUploader(seekStreamingKey),
-		log:           log,
+		gofile:     NewGoFileUploader(),
+		voesx:      NewVoeSXUploader(voeSXAPIKey),
+		streamtape: NewStreamtapeUploader(streamtapeLogin, streamtapeKey),
+		mixdrop:    NewMixdropUploader(mixdropEmail, mixdropToken),
+		vidara:     NewVidaraUploader(vidaraKey),
+		log:        log,
 	}
 }
 

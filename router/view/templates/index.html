@@ -641,6 +641,10 @@
                         <label class="block text-[11px] font-medium text-zinc-500 mb-1.5">Mixdrop Token</label>
                         <input type="password" name="mixdrop_token" value="{{ .Config.MixdropToken }}" class="input-field" />
                     </div>
+                    <div>
+                        <label class="block text-[11px] font-medium text-zinc-500 mb-1.5">Vidara Key</label>
+                        <input type="password" name="vidara_key" value="{{ .Config.VidaraKey }}" class="input-field" />
+                    </div>
                 </div>
                 
                 <p class="text-[11px] text-zinc-600 mt-1.5">Credentials are stored persistently and used for uploads.</p>
@@ -954,8 +958,9 @@ function highlightMsg(msg, baseColor) {
         'GitHub':     { fg: '#e4e4e7', bg: 'rgba(228,228,231,0.08)'},  // white
         'Streamtape': { fg: '#fbbf24', bg: 'rgba(251,191,36,0.1)'  },  // amber
         'Mixdrop':    { fg: '#c084fc', bg: 'rgba(192,132,252,0.1)' },  // purple
+        'Vidara':     { fg: '#38bdf8', bg: 'rgba(56,189,248,0.1)'  },  // sky blue
     };
-    safe = safe.replace(/\[(GoFile|VOE\.sx|VoeSX|TurboViPlay|GitHub|Streamtape|Mixdrop)\]/g,
+    safe = safe.replace(/\[(GoFile|VOE\.sx|VoeSX|TurboViPlay|GitHub|Streamtape|Mixdrop|Vidara)\]/g,
         function(m, host) {
             var c = HOST_COLORS[host] || { fg: '#94a3b8', bg: 'rgba(148,163,184,0.1)' };
             return '<span style="color:' + c.fg + ';background:' + c.bg + ';padding:0 4px;border-radius:3px;font-size:10px;font-weight:600">[' + host + ']</span>';

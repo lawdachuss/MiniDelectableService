@@ -109,15 +109,15 @@ func supabaseRestAPIKey() string {
 }
 
 // supabaseRequest makes an authenticated REST call to Supabase with default
-// headers. For writes (POST/PATCH/DELETE with a body) it sets
-// Prefer: resolution=merge-duplicates. Use supabaseRequestWithPrefer when you
-// need explicit control over the Prefer header.
+// headers and retry logic for transient errors. For writes (POST/PATCH/DELETE
+// with a body) it sets Prefer: resolution=merge-duplicates. Use
+// supabaseRequestWithPrefer when you need explicit control over the Prefer header.
 func supabaseRequest(method, path string, body []byte) (*http.Response, error) {
 	prefer := ""
 	if body != nil {
 		prefer = "resolution=merge-duplicates"
 	}
-	return supabaseRequestWithPrefer(method, path, body, prefer)
+	return supabaseRequestWithRetry(method, path, body, prefer, supabaseHTTPClient)
 }
 
 // Shared HTTP client with connection pooling for the supabaseRequest helper.
@@ -128,14 +128,14 @@ var supabaseHTTPClient = &http.Client{Timeout: 60 * time.Second}
 // so the web server starts quickly even when Supabase is slow or unreachable.
 var fastHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// supabaseRequestWithPrefer is the low-level HTTP helper. Pass an empty string
+// supabaseRequestWithPrefer is the low-level HTTP helper with retry. Pass an empty string
 // for prefer to omit the header entirely.
 func supabaseRequestWithPrefer(method, path string, body []byte, prefer string) (*http.Response, error) {
-	return supabaseRequestWithClient(method, path, body, prefer, supabaseHTTPClient)
+	return supabaseRequestWithRetry(method, path, body, prefer, supabaseHTTPClient)
 }
 
 // supabaseRequestFast is like supabaseRequestWithPrefer but uses a shorter 10s
-// timeout.  Used during startup so the web server binds quickly even when
+// timeout and NO retry. Used during startup so the web server binds quickly even when
 // Supabase is unreachable or slow.
 func supabaseRequestFast(method, path string, body []byte, prefer string) (*http.Response, error) {
 	return supabaseRequestWithClient(method, path, body, prefer, fastHTTPClient)
@@ -166,6 +166,87 @@ func supabaseRequestWithClient(method, path string, body []byte, prefer string, 
 		req.Header.Set("Prefer", prefer)
 	}
 	return client.Do(req)
+}
+
+// supabaseRequestWithRetry executes the request and retries on transient errors:
+// - 503 PGRST002 — schema cache rebuilding after migration
+// - 400 PGRST204 — column not in schema cache yet
+// - 408 Request Timeout
+// - 429 Too Many Requests
+// - 5xx Server Errors
+func supabaseRequestWithRetry(method, path string, body []byte, prefer string, client *http.Client) (*http.Response, error) {
+	const maxRetries = 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := supabaseRequestWithClient(method, path, body, prefer, client)
+		if err != nil {
+			lastErr = err
+			if attempt < maxRetries-1 {
+				backoff := supabaseRetryBackoff(attempt)
+				fmt.Printf("[WARN] Supabase request failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxRetries, backoff, err)
+				time.Sleep(backoff)
+				continue
+			}
+			return nil, err
+		}
+
+		// Check for transient errors that need retry
+		if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 || resp.StatusCode == 400 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			bodyStr := string(bodyBytes)
+
+			// PGRST002: schema cache rebuilding after migration
+			if resp.StatusCode == 503 && strings.Contains(bodyStr, "PGRST002") {
+				lastErr = fmt.Errorf("HTTP 503: %s", bodyStr)
+				backoff := supabaseRetryBackoff(attempt)
+				fmt.Printf("[WARN] Supabase schema cache rebuilding (attempt %d/%d), retrying in %v\n", attempt+1, maxRetries, backoff)
+				resp.Body.Close()
+				time.Sleep(backoff)
+				continue
+			}
+
+			// PGRST204: column not yet in PostgREST schema cache
+			if resp.StatusCode == 400 && strings.Contains(bodyStr, "PGRST204") {
+				lastErr = fmt.Errorf("HTTP 400: %s", bodyStr)
+				backoff := supabaseRetryBackoff(attempt)
+				fmt.Printf("[WARN] Supabase schema cache stale — column missing (attempt %d/%d), retrying in %v\n", attempt+1, maxRetries, backoff)
+				resp.Body.Close()
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Non-retryable error — return as-is
+			if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, bodyStr)
+				resp.Body.Close()
+				if attempt < maxRetries-1 {
+					backoff := supabaseRetryBackoff(attempt)
+					fmt.Printf("[WARN] Supabase transient HTTP %d (attempt %d/%d), retrying in %v\n", resp.StatusCode, attempt+1, maxRetries, backoff)
+					time.Sleep(backoff)
+					continue
+				}
+				return nil, lastErr
+			}
+
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, bodyStr)
+		}
+
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
+}
+
+func supabaseRetryBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 5 {
+		attempt = 5
+	}
+	return time.Duration(1<<attempt) * 2 * time.Second
 }
 
 // CheckSupabase verifies the app_settings table is reachable via the REST API.

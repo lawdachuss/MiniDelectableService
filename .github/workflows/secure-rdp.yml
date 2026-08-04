@@ -15,10 +15,16 @@ permissions:
   contents: read
   actions: write
 
+# One long-running recorder at a time: a new dispatch queues instead of
+# overlapping the active 6h session (replaces the old gh run list self-cancel).
+concurrency:
+  group: secure-rdp
+  cancel-in-progress: false
+
 env:
   GH_TOKEN: ${{ github.token }}
-  # Opt into Node 24 now (default since June 16, 2026) and keep the safety valve
-  # for any action that has not been rebuilt yet.
+  # Opt into Node 24 now (default since June 16, 2026) and keep the safety
+  # valve for any action that has not been rebuilt yet.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
@@ -48,39 +54,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Kill stale processes + export runner paths used by the cache/tooling steps.
       - name: Init
         shell: powershell
         run: |
-          # Cleanup any stale DVR/tunnel from previous runs
-          Get-Process chaturbate-dvr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          # The runner's OS env vars (USERPROFILE/HOME) are NOT visible to the
-          # ${{ env.* }} context, so export them explicitly so cache steps and
-          # cache path lists resolve the real user profile.
+          Get-Process chaturbate-dvr,cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           echo "USERPROFILE=$env:USERPROFILE" >> $env:GITHUB_ENV
           echo "HOME=$env:USERPROFILE" >> $env:GITHUB_ENV
-          # Default Go cache paths (also set via go env at save time; keep in sync).
-          echo "GO_MOD_CACHE=$env:USERPROFILE\go\pkg\mod" >> $env:GITHUB_ENV
-          echo "GO_BUILD_CACHE=$env:USERPROFILE\AppData\Local\go-build" >> $env:GITHUB_ENV
           $repoName = ($env:GITHUB_REPOSITORY -split '/')[-1]
           echo "REPO_DIR=D:\repos\$repoName" >> $env:GITHUB_ENV
           Remove-Item "D:\repos\$repoName\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
           echo "START_TIME=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
-          # Single-run guard: self-cancel if another run of this workflow is active.
-          $r = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status,startedAt 2>$null | ConvertFrom-Json
-          if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt 348)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
 
-      - name: Restore Go cache
-        uses: actions/cache/restore@v5
-        with:
-          path: |
-            ${{ env.GO_MOD_CACHE }}
-            ${{ env.GO_BUILD_CACHE }}
-          key: ${{ github.repository }}-${{ runner.os }}-go-cache-${{ hashFiles('go.sum', 'go.mod') }}
-          restore-keys: |
-            ${{ github.repository }}-${{ runner.os }}-go-cache-
-            ${{ github.repository }}-${{ runner.os }}-gocache-
-
+      # ── Caches: restore everything, save everything ──────────────────────────
+      # Go modules + build cache are handled by setup-go below (cache: true).
       - name: Restore tools cache
         uses: actions/cache/restore@v5
         with:
@@ -95,38 +82,32 @@ jobs:
             C:\cloudflared
             C:\Program Files\Tailscale
             C:\chrome146
-          key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ hashFiles('go.mod') }}
+            D:\ffmpeg
+          key: tools-${{ hashFiles('go.mod', 'requirements.txt') }}
           restore-keys: |
-            ${{ github.repository }}-${{ runner.os }}-tools-cache-
-            ${{ github.repository }}-${{ runner.os }}-tools-
+            tools-
 
       - name: Restore DVR binary
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.REPO_DIR }}\chaturbate-dvr.exe
-          key: ${{ github.repository }}-${{ runner.os }}-dvr-bin-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
+          key: dvr-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
           restore-keys: |
-            ${{ github.repository }}-${{ runner.os }}-dvr-bin-
+            dvr-
 
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
 
+      # RDP + Tailscale + FFmpeg + Go build + cloudflared all run concurrently
+      # inside parallel-setup.ps1 (Start-Job per task), so wall-clock setup is
+      # bounded by the slowest task instead of the sum.
       - name: Parallel Setup
         shell: pwsh
         run: pwsh ./scripts/parallel-setup.ps1
 
-      - name: Save Go cache (before 6h loop, so cancelled runs still save)
-        if: always()
-        continue-on-error: true
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            ${{ env.GO_MOD_CACHE }}
-            ${{ env.GO_BUILD_CACHE }}
-          key: ${{ github.repository }}-${{ runner.os }}-go-cache-${{ github.run_id }}-${{ hashFiles('go.sum', 'go.mod') }}
-
-      - name: Save Tools cache (before 6h loop, so cancelled runs still save)
+      # Save before the 6h keep-alive loop so cancelled runs still persist caches.
+      - name: Save tools cache
         if: always()
         continue-on-error: true
         uses: actions/cache/save@v5
@@ -142,251 +123,31 @@ jobs:
             C:\cloudflared
             C:\Program Files\Tailscale
             C:\chrome146
-          key: ${{ github.repository }}-${{ runner.os }}-tools-cache-${{ github.run_id }}-${{ hashFiles('go.mod') }}
+            D:\ffmpeg
+          key: tools-${{ github.run_id }}-${{ hashFiles('go.mod', 'requirements.txt') }}
 
-      - name: Save DVR binary (before 6h loop, so cancelled runs still save)
+      - name: Save DVR binary
         if: always()
         continue-on-error: true
         uses: actions/cache/save@v5
         with:
           path: ${{ env.REPO_DIR }}\chaturbate-dvr.exe
-          key: ${{ github.repository }}-${{ runner.os }}-dvr-bin-${{ github.run_id }}-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
+          key: dvr-${{ github.run_id }}-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
 
-      - name: Fix Supabase DNS (resolvers + hosts pin)
-        if: always()
-        shell: powershell
-        run: |
-          # Never fatal: a bad secret/resolver must degrade gracefully, not kill
-          # the run (PowerShell EAP=stop on the runner turns curl stderr into a
-          # terminating error). Fix: point the box at public resolvers, pin the
-          # host in the hosts file with Cloudflare anycast IPs, then verify.
-          $ErrorActionPreference = 'Continue'
-          $sbHost = (($env:SUPABASE_URL -replace '^https?://','') -split '[/:]')[0]
-          if ([string]::IsNullOrWhiteSpace($sbHost) -or $sbHost -eq '-' -or $sbHost.Length -le 2) { $sbHost = 'supabase.chuglii.in' }
-          Write-Host "(DNS) Supabase host: $sbHost"
-          try {
-            Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-              try {
-                Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses ('1.1.1.1','8.8.8.8') -ErrorAction Stop | Out-Null
-                Write-Host "(DNS) Set $($_.Name) DNS -> 1.1.1.1, 8.8.8.8"
-              } catch { Write-Warning "(DNS) DNS set skipped on $($_.Name): $($_.Exception.Message)" }
-            }
-          } catch { Write-Warning "(DNS) DNS enumeration failed: $($_.Exception.Message)" }
-          ipconfig /flushdns | Out-Null
-          $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
-          try {
-            $hosts = Get-Content $hostsPath -Raw -ErrorAction SilentlyContinue
-            $e1 = "104.21.25.61 $sbHost"; $e2 = "172.67.223.51 $sbHost"
-            $need = @()
-            if (-not $hosts -or $hosts -notmatch [regex]::Escape($e1)) { $need += $e1 }
-            if (-not $hosts -or $hosts -notmatch [regex]::Escape($e2)) { $need += $e2 }
-            if ($need.Count -gt 0) {
-              Add-Content -Path $hostsPath -Value ("`n" + ($need -join "`n") + "`n") -ErrorAction Stop
-              Write-Host "(DNS) Pinned: $($need -join ' | ')"
-            } else { Write-Host "(DNS) Hosts entry already present" }
-          } catch { Write-Warning "(DNS) hosts write failed: $($_.Exception.Message)" }
-          Start-Sleep -Seconds 2
-          try {
-            $code = & curl.exe -s -o NUL -w "%{http_code}" "https://$sbHost/rest/v1/" -m 20 --noproxy "*" --tlsv1.2 2>$null
-            Write-Host "(DNS) Supabase reachability check: HTTP $code (401/2xx = reachable, 000 = unreachable)"
-          } catch { Write-Host "(DNS) Supabase reachability check threw: $($_.Exception.Message)" }
-
-      - name: Install cookie refresher deps (curl_cffi + playwright browsers)
-        if: always()
-        continue-on-error: true
-        shell: powershell
-        run: |
-          # The DVR refreshes cookies at startup via scripts/cookie_refresher.py,
-          # which requires curl_cffi (browser TLS impersonation) for BOTH the
-          # Supabase calls and the cb.xxx refresh. GitHub-hosted runners ship
-          # Python but NOT curl_cffi - without this step the refresh silently
-          # no-ops and the DVR keeps stale cookies (-> Cloudflare block).
-          # FIX: also install playwright browser binaries (pip install playwright
-          # installs the Python package only; 'playwright install chromium' is
-          # required separately to download the actual browser binaries that
-          # cookie_grabber.py needs to mint a fresh cf_clearance).
-          $ErrorActionPreference = 'Continue'
-          try {
-            python -m pip install --quiet --disable-pip-version-check -r "$env:REPO_DIR\requirements.txt"
-            Write-Host "pip install exit: $LASTEXITCODE"
-            python -c "import curl_cffi; print('curl_cffi OK, version', curl_cffi.__version__); import playwright; print('playwright OK'); from scrapling.fetchers import StealthySession; print('scrapling OK')"
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "python not usable - trying py -3 launcher"
-              py -3 -m pip install --quiet --disable-pip-version-check -r "$env:REPO_DIR\requirements.txt"
-              py -3 -c "import curl_cffi; print('curl_cffi OK via py -3, version', curl_cffi.__version__); import playwright; print('playwright OK via py -3'); from scrapling.fetchers import StealthySession; print('scrapling OK via py -3')"
-            }
-          } catch { Write-Warning "cookie deps install failed: $($_.Exception.Message)" }
-          # Download Chromium browser binaries for cookie_grabber.py (Playwright)
-          Write-Host "[PLAYWRIGHT] Installing Chromium browser binaries..."
-          try {
-            $t = Measure-Command { python -m playwright install chromium 2>&1 | ForEach-Object { Write-Host "  [PW] $_" } }
-            Write-Host "[PLAYWRIGHT] Chromium install done in $([math]::Round($t.TotalSeconds,1))s (exit $LASTEXITCODE)"
-          } catch { Write-Warning "[PLAYWRIGHT] Chromium install failed: $($_.Exception.Message)" }
-          # Pre-warm the scrapling browser so the FIRST grab doesn't spend its
-          # 150s solve budget launching/downloading a browser mid-solve (which
-          # would abandon the thread). Uses CHROME146_PATH when the pinned
-          # Chrome 146 is installed (it's set by the earlier install step),
-          # else scrapling's bundled browser. A real start() is required -
-          # the constructor alone does not launch anything. Bounded at 240s.
-          Write-Host "[SCRAPLING] Pre-warming scrapling browser (cap 240s)..."
-          try {
-            $warmScript = "$env:TEMP\_scrap_warmup.py"
-            Set-Content $warmScript -Value "import os, sys; from scrapling.fetchers import StealthySession; kw={}; exe=os.environ.get('CHROME146_PATH',''); kw['executable_path']=exe if exe and os.path.isfile(exe) else None; kw={k:v for k,v in kw.items() if v}; s=StealthySession(headless=True, **kw); s.start(); print('warmup: browser launched OK'); s.close()" -Encoding utf8
-            $warmJob = Start-Job -ScriptBlock { param($f) python -u $f 2>&1 } -ArgumentList $warmScript
-            if (-not (Wait-Job $warmJob -Timeout 240)) {
-              Write-Warning "[SCRAPLING] warm-up timed out - first grab will pay the cost"
-              Stop-Job $warmJob -ErrorAction SilentlyContinue
-            } else {
-              Receive-Job $warmJob | ForEach-Object { Write-Host "  [SCRAP] $_" }
-            }
-            Remove-Job $warmJob -Force -ErrorAction SilentlyContinue
-            Remove-Item $warmScript -Force -ErrorAction SilentlyContinue
-          } catch { Write-Warning "[SCRAPLING] warm-up failed: $($_.Exception.Message)" }
-
-      - name: Install pinned Chrome 146 (cf_clearance fingerprint)
-        if: always()
-        continue-on-error: true
-        shell: powershell
-        run: |
-          # FIX: cf_clearance is bound to the TLS fingerprint of the browser
-          # that minted it. The Go DVR presents it over httpcloak's
-          # 'chrome-146-windows' fingerprint, so the cookie MUST be minted by a
-          # real Chrome 146. System Chrome on the runner is newer (150+), and
-          # launching it with a spoofed Chrome/146 UA makes Cloudflare flag the
-          # mismatch -> Turnstile never auto-solves. Download a pinned Chrome
-          # for Testing 146 so fingerprint + UA match the DVR exactly.
-          $ErrorActionPreference = 'Continue'
-          $dir = "C:\chrome146"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          $exe = "$dir\chrome-win64\chrome.exe"
-          if (-not (Test-Path $exe)) {
-            $zip = "$dir\chrome-win64.zip"
-            if (-not (Test-Path $zip) -or ((Get-Item $zip).Length -lt 50MB)) {
-              Write-Host "[CHROME146] Downloading Chrome for Testing 146.0.7680.165 (~190MB) via curl..."
-              # curl streams to disk and is far faster/more reliable for large
-              # files than PowerShell's Invoke-WebRequest (which buffers and
-              # can stall on the runner for this 190MB artifact).
-              & curl.exe -L --fail --retry 3 --retry-delay 5 -o $zip "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/win64/chrome-win64.zip"
-              if ($LASTEXITCODE -ne 0 -or (Test-Path $zip) -eq $false -or (Get-Item $zip).Length -lt 50MB) {
-                Write-Warning "[CHROME146] curl failed (exit $LASTEXITCODE) - falling back to Invoke-WebRequest"
-                for ($r = 1; $r -le 2; $r++) {
-                  try {
-                    Invoke-WebRequest -Uri "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/win64/chrome-win64.zip" -OutFile $zip -UseBasicParsing -TimeoutSec 600
-                    if ((Get-Item $zip).Length -gt 50MB) { break }
-                  } catch { Write-Warning "[CHROME146] download attempt $r failed: $($_.Exception.Message)" }
-                }
-              }
-            } else { Write-Host "[CHROME146] Using cached zip" }
-            # FIX: 'Test-Path $zip -and (...)' parses '-and' as a Test-Path
-            # parameter and throws 'parameter name and' (seen in CI), so the
-            # downloaded zip was never extracted. Parentheses force expression
-            # mode.
-            if ((Test-Path $zip) -and ((Get-Item $zip).Length -gt 50MB)) {
-              Write-Host "[CHROME146] Extracting..."
-              Expand-Archive -Path $zip -DestinationPath $dir -Force
-            }
-          }
-          if (Test-Path $exe) {
-            echo "CHROME146_PATH=$exe" >> $env:GITHUB_ENV
-            Write-Host "[CHROME146] OK: $exe ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
-          } else {
-            Write-Warning "[CHROME146] Chrome 146 not available - cookie grab will fall back to system Chrome"
-          }
-
-      - name: Grab fresh cookies (browser)
+      # DNS fix + pip/playwright deps + pinned Chrome 146 run in PARALLEL
+      # background jobs (prepare-cookies.ps1), then cookie_grabber.py mints a
+      # fresh IP-bound cf_clearance before the DVR starts.
+      - name: Prepare cookies (parallel)
         if: always()
         continue-on-error: true
         shell: pwsh
-        env:
-          PYTHONUNBUFFERED: '1'
-          GRAB_TOTAL_TIMEOUT: '480'
-        run: |
-          # FIX: run cookie_grabber.py BEFORE the DVR starts so it has a fresh
-          # cf_clearance cookie bound to this runner's IP. Without this the DVR
-          # uses stale cookies from Supabase -> instant Cloudflare 403 on every
-          # /get_edge_hls_url_ajax/ call ("Just a moment..." Turnstile page).
-          # HARD CAP: cb.xxx serves a "managed" Turnstile to datacenter IPs that
-          # the auto-solver cannot clear - the scrapling solver used to loop for
-          # 25+ min per attempt and this step had NO timeout (30+ min runs).
-          # cookie_grabber.py now self-bounds via the GRAB_TOTAL_TIMEOUT watchdog
-          # (480s) and this step ALSO hard-caps at 540s and taskkill /T's the
-          # whole process tree (browser included) if the cap is hit.
-          #
-          # CRITICAL: do NOT use Start-Process -RedirectStandardOutput here.
-          # Windows anonymous pipes have a ~64KB buffer and when the child
-          # (Python/scrapling) writes enough log output, the pipe fills and the
-          # child blocks forever on write. Start-Job with Receive-Job pipes
-          # output through PowerShell's robust serialization queue instead of
-          # a fixed-size pipe buffer, avoiding the deadlock entirely.
-          Set-Location $env:REPO_DIR
-          $ErrorActionPreference = 'Continue'
-          Write-Host "[COOKIE] Running cookie_grabber.py to mint fresh cf_clearance... (hard cap 540s)"
-          # Browser PIDs that already exist before the grab starts - these must
-          # be preserved (RDP user's browser, etc.). Only NEW browsers get killed.
-          $preGrab = @(Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-          $sw = [Diagnostics.Stopwatch]::StartNew()
-          $capSec = 540
-          $grabJob = Start-Job -ScriptBlock {
-            param($dir)
-            Set-Location $dir
-            $env:PYTHONUNBUFFERED = '1'
-            & python -u scripts/cookie_grabber.py 2>&1
-            # Emit the exit code as the last line so Receive-Job can pick it up
-            Write-Output "__EXITCODE__$LASTEXITCODE"
-          } -ArgumentList $env:REPO_DIR
-          # Poll with a hard deadline; Receive-Job streams output live so
-          # progress is visible in the step log even while the script is still
-          # running. Unlike Start-Process -RedirectStandardOutput, this does
-          # NOT use a fixed-size anonymous pipe - PowerShell's job system
-          # serializes output through a queue, so the child never blocks on
-          # stdout writes.
-          $lastOutputLen = 0
-          while ($grabJob.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $capSec) {
-            $lines = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
-            if ($lines.Count -gt $lastOutputLen) {
-              $lines[$lastOutputLen..($lines.Count-1)] | ForEach-Object { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
-              $lastOutputLen = $lines.Count
-            }
-            Start-Sleep -Seconds 2
-          }
-          # Drain any remaining output (including __EXITCODE__)
-          $remaining = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
-          foreach ($_ in $remaining) { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
-          $capped = $sw.Elapsed.TotalSeconds -ge $capSec
-          if ($capped) {
-            Write-Warning "[COOKIE] cookie_grabber.py exceeded ${capSec}s hard cap - stopping job"
-            Stop-Job $grabJob -ErrorAction SilentlyContinue
-          }
-          # Extract exit code from the __EXITCODE__ marker
-          $grabExit = 0
-          $allOutput = @($lines) + @($remaining)
-          foreach ($_ in $allOutput) {
-            if ($_ -match '__EXITCODE__(\d+)') { $grabExit = [int]$matches[1] }
-          }
-          Remove-Job $grabJob -Force -ErrorAction SilentlyContinue
-          # The scrapling solver thread is abandoned (not killed) when its
-          # budget expires, so its Camoufox/Chrome child may survive python's
-          # exit. Kill only browsers that started DURING the grab - they belong
-          # to the grabber, not to the DVR or any RDP session.
-          Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue |
-            Where-Object { $preGrab -notcontains $_.Id } |
-            Stop-Process -Force -ErrorAction SilentlyContinue
-          Write-Host "[COOKIE] cookie_grabber.py finished in $([math]::Round($sw.Elapsed.TotalSeconds,1))s (exit $grabExit, capped=$capped)"
-          if ($grabExit -ne 0) {
-            Write-Warning "[COOKIE] cookie_grabber.py failed (exit $grabExit) - DVR will use existing cookies from Supabase"
-          } else {
-            Write-Host "[COOKIE] Fresh cf_clearance saved to Supabase - DVR will load it on startup"
-          }
+        run: pwsh ./scripts/prepare-cookies.ps1
 
+      # 6h recording loop. Passes cookie-grab bounds so the DVR's own refresh
+      # stays within the same limits as the dedicated prep step.
       - name: Keep Runner Alive
         shell: pwsh
         env:
-          # Pass these to the DVR process so the cookie_grabber.py invoked by
-          # main.go's refreshCookies() has the same bounds as the dedicated step.
-          # CHROME146_PATH is set by the Install pinned Chrome 146 step via
-          # GITHUB_ENV and is inherited automatically by all child processes.
-          # All other secrets (SUPABASE_*, NODE_ID, etc.) come from the
-          # job-level env block above.
           GRAB_TOTAL_TIMEOUT: '240'
           SCRAPLING_BUDGET: '120'
         run: pwsh ./scripts/keep-alive.ps1
@@ -420,4 +181,3 @@ jobs:
           Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:REPO_DIR\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
           Write-Host "[CLEANUP] Done"
-

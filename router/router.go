@@ -19,7 +19,7 @@ func SetupRouter() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.Default()
-	if err := LoadHTMLFromEmbedFS(r, view.FS, "templates/index.html", "templates/channel_info.html", "templates/videos.html", "templates/video.html", "templates/channel.html", "templates/admin.html", "templates/nodes.html", "templates/pool.html"); err != nil {
+	if err := LoadHTMLFromEmbedFS(r, view.FS, "templates/index.html", "templates/channel_info.html", "templates/videos.html", "templates/video.html", "templates/channel.html", "templates/admin.html", "templates/nodes.html", "templates/pool.html", "templates/logs.html"); err != nil {
 		log.Fatalf("failed to load HTML templates: %v", err)
 	}
 
@@ -111,6 +111,10 @@ func SetupViews(r *gin.Engine) {
 	r.GET("/api/pool", GetPoolJSON)
 	r.POST("/api/pool/add", AddToPool)
 	r.POST("/api/pool/remove", RemoveFromPool)
+
+	// ── Logs API ──────────────────────────────────────────────────────────
+	r.GET("/logs", LogsPage)
+	r.GET("/api/logs", LogsAPI)
 
 }
 

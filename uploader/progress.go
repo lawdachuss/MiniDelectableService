@@ -3,6 +3,7 @@ package uploader
 import (
 	"io"
 	"sync"
+	"time"
 )
 
 // ProgressFunc is called with the host name, bytes read so far, and total bytes.
@@ -45,7 +46,17 @@ type ProgressReader struct {
 	host   string
 	fn     ProgressFunc
 	called bool // whether we've already sent the initial (0, total) report
+
+	lastReport time.Time
 }
+
+// progressThrottle is the minimum interval between progress callbacks.
+// Progress fires on every read (the HTTP transport reads in 32KB chunks), and
+// each callback is dispatched under a lock and may rebuild UI state — reporting
+// every few milliseconds for dozens of concurrent uploads wastes CPU and can
+// measurably reduce upload throughput.  The first and final reports are always
+// sent regardless of throttle state.
+const progressThrottle = 200 * time.Millisecond
 
 // NewProgressReader creates a ProgressReader that reports progress to the
 // global callback. Prefer NewProgressReaderWithCallback for per-upload progress.
@@ -60,11 +71,15 @@ func NewProgressReaderWithCallback(r io.Reader, total int64, host string, fn Pro
 }
 
 func (pr *ProgressReader) report(current, total int64) {
-	if pr.fn != nil {
-		pr.fn(pr.host, current, total)
-		return
+	now := time.Now()
+	if pr.lastReport.IsZero() || current >= total || now.Sub(pr.lastReport) >= progressThrottle {
+		pr.lastReport = now
+		if pr.fn != nil {
+			pr.fn(pr.host, current, total)
+			return
+		}
+		reportProgress(pr.host, current, total)
 	}
-	reportProgress(pr.host, current, total)
 }
 
 func (pr *ProgressReader) Read(p []byte) (int, error) {

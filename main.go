@@ -20,11 +20,13 @@ import (
 	"github.com/teacat/chaturbate-dvr/coordinator"
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/internal"
+	"github.com/teacat/chaturbate-dvr/logs"
 	"github.com/teacat/chaturbate-dvr/manager"
 	"github.com/teacat/chaturbate-dvr/notifier"
 	"github.com/teacat/chaturbate-dvr/router"
 	"github.com/teacat/chaturbate-dvr/server"
 	"github.com/teacat/chaturbate-dvr/site"
+	"github.com/teacat/chaturbate-dvr/uploader"
 	"github.com/urfave/cli/v2"
 )
 
@@ -332,10 +334,28 @@ func main() {
 				Value:   "",
 			},
 			&cli.StringFlag{
-				Name:    "seekstreaming-key",
-				Usage:   "API key for SeekStreaming uploads",
-				EnvVars: []string{"SEEKSTREAMING_KEY"},
+				Name:    "vidara-key",
+				Usage:   "API key for Vidara uploads",
+				EnvVars: []string{"VIDARA_KEY"},
 				Value:   "",
+			},
+			&cli.IntFlag{
+				Name:    "upload-max-concurrent",
+				Usage:   "Maximum number of video files uploading at once (0 = default 100)",
+				EnvVars: []string{"UPLOAD_MAX_CONCURRENT"},
+				Value:   100,
+			},
+			&cli.IntFlag{
+				Name:    "upload-host-concurrency",
+				Usage:   "Maximum concurrent uploads per file host (0 = default 8)",
+				EnvVars: []string{"UPLOAD_HOST_CONCURRENCY"},
+				Value:   8,
+			},
+			&cli.IntFlag{
+				Name:    "pipeline-workers",
+				Usage:   "Concurrent upload pipelines per channel queue (0 = default 3)",
+				EnvVars: []string{"PIPELINE_WORKERS"},
+				Value:   3,
 			},
 
 			&cli.StringFlag{
@@ -474,7 +494,12 @@ func main() {
 
 func start(c *cli.Context) error {
 	started := time.Now()
+
+	// Capture all stdout/stderr output so it is available via GET /api/logs
+	// and the /logs page. Must run before any logging or the web router.
+	logs.Install()
 	fmt.Println(logo)
+	fmt.Println("[startup] log capture enabled — view logs at /logs (API: /api/logs)")
 
 	var err error
 	server.Config, err = config.New(c)
@@ -482,6 +507,17 @@ func start(c *cli.Context) error {
 		return fmt.Errorf("new config: %w", err)
 	}
 	fmt.Printf("[startup] config loaded in %v\n", time.Since(started).Round(time.Millisecond))
+
+	// Apply upload throughput tuning before any upload goroutines start.
+	// SetUploadHostConcurrency also reconfigures per-host upload semaphores
+	// so an operator can raise/lower concurrency per host without a rebuild.
+	channel.SetUploadConcurrency(server.Config.UploadMaxConcurrent)
+	uploader.SetHostConcurrency(server.Config.UploadHostConcurrency)
+	channel.SetPipelineWorkers(server.Config.PipelineWorkers)
+	if server.Config.UploadMaxConcurrent > 0 {
+		fmt.Printf("[startup] upload concurrency: %d files max, %d per host, %d pipelines/channel\n",
+			server.Config.UploadMaxConcurrent, server.Config.UploadHostConcurrency, server.Config.PipelineWorkers)
+	}
 
 	// Refresh cookies from the site before loading settings so every start
 	// begins with fresh cookies (best-effort; requires Python + curl_cffi).

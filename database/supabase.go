@@ -60,7 +60,7 @@ func (c *Client) request(method, path string, body interface{}) (*http.Response,
 // - 503 PGRST002 — schema cache rebuilding after migration
 // - 400 PGRST204 — column not in schema cache yet (PostgREST needs to refresh)
 func (c *Client) requestWithRetry(method, path string, body interface{}) (*http.Response, error) {
-	const maxRetries = 5
+	const maxRetries = 3
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {

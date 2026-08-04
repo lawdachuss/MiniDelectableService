@@ -1119,9 +1119,9 @@ func IsAlreadyFullyUploaded(filePath string) bool {
 // This delegates to uploader.NewMultiHostUploader(...).AvailableHosts() so that
 // the set of hosts checked by IsAlreadyFullyUploaded is always identical to the
 // set the pipeline actually uploads to.  Previously this maintained a separate
-// hand-written list that drifted out of sync (it omitted SeekStreaming), which
-// caused the watcher to consider a file "fully uploaded" — and delete the local
-// copy — before SeekStreaming had received it.
+// hand-written list that drifted out of sync, which caused the watcher to
+// consider a file "fully uploaded" — and delete the local copy — before every
+// configured host had received it.
 func configuredUploadHosts() []string {
 	cfg := server.Config
 	if cfg == nil {
@@ -1133,7 +1133,7 @@ func configuredUploadHosts() []string {
 		cfg.StreamtapeKey,
 		cfg.MixdropEmail,
 		cfg.MixdropToken,
-		cfg.SeekStreamingKey,
+		cfg.VidaraKey,
 		nil,
 	)
 	return upl.AvailableHosts()
@@ -1153,9 +1153,6 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 	if cfg == nil {
 		return false
 	}
-
-	UploadSem <- struct{}{}
-	defer func() { <-UploadSem }()
 
 	filename := filepath.Base(filePath)
 
@@ -1184,17 +1181,13 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 		}
 	}
 
-	// Upload to all configured hosts — retry up to 3 times if all hosts fail.
-	const maxUploadAttempts = 3
-	const retryDelay = 60 * time.Second
-
 	upl := uploader.NewMultiHostUploader(
 		cfg.VoeSXAPIKey,
 		cfg.StreamtapeLogin,
 		cfg.StreamtapeKey,
 		cfg.MixdropEmail,
 		cfg.MixdropToken,
-		cfg.SeekStreamingKey,
+		cfg.VidaraKey,
 		nil, // no logger for orphan recovery
 	)
 
@@ -1222,14 +1215,11 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 			len(completedHosts), len(allHosts), len(hostsToTry))
 	}
 
-	var results []uploader.UploadResult
-	var success []uploader.UploadResult
-	for attempt := 1; attempt <= maxUploadAttempts; attempt++ {
-		if attempt > 1 && len(hostsToTry) == 0 {
-			break
-		}
+	// Use RetryManager for upload retries
+	var allResults []uploader.UploadResult
+	err := DoWithRetry("orphan-"+filename, func() error {
 		attemptResults := upl.UploadSelected(filePath, hostsToTry)
-		results = append(results, attemptResults...)
+		allResults = append(allResults, attemptResults...)
 
 		// Save journal entries for each result
 		if fileHash != "" {
@@ -1251,34 +1241,34 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 			}
 		}
 
-		success = uploader.GetSuccessfulUploads(results)
-		recoveryLogf(filename, "upload attempt %d/%d — %d/%d successful", attempt, maxUploadAttempts, len(success), len(allHosts))
+		success := uploader.GetSuccessfulUploads(attemptResults)
+		recoveryLogf(filename, "upload attempt — %d/%d successful", len(success), len(allHosts))
 		if len(success) >= len(allHosts) {
-			break
+			return nil
 		}
 
-		if attempt < maxUploadAttempts {
-			failedHosts := failedHostNames(results, completedHosts)
-			hostsToTry = failedHosts
-			if len(hostsToTry) > 0 {
-				recoveryLogf(filename, "%d hosts still pending — retrying in %s...", len(hostsToTry), retryDelay)
-				time.Sleep(retryDelay)
-			}
+		failedHosts := failedHostNames(attemptResults, completedHosts)
+		hostsToTry = failedHosts
+		if len(hostsToTry) == 0 {
+			return nil
 		}
-	}
 
-	if len(success) == 0 {
+		return fmt.Errorf("%d hosts still pending", len(hostsToTry))
+	}, WithUploadSem(), WithMaxAttempts(3), WithBaseBackoff(60*time.Second))
+	if err != nil {
 		recoveryLogf(filename, "[WARN] all upload attempts exhausted — file will be retried on next restart")
 		return false
 	}
 
-	// Build links map
+	// Build links map from all accumulated results
 	links := map[string]string{}
 	var embedURL string
-	for _, r := range success {
-		links[r.Host] = r.DownloadLink
-		if embedURL == "" {
-			embedURL = embedURLFromLink(r.Host, r.DownloadLink)
+	for _, r := range allResults {
+		if r.Error == nil && r.DownloadLink != "" {
+			links[r.Host] = r.DownloadLink
+			if embedURL == "" {
+				embedURL = embedURLFromLink(r.Host, r.DownloadLink)
+			}
 		}
 	}
 
@@ -1316,7 +1306,7 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 
 	// Delete local file only once ALL hosts have the file safely and metadata
 	// is persisted. Otherwise the file remains available for retry.
-	if cfg.DeleteLocalAfterUpload && len(success) > 0 && dbSaved {
+	if cfg.DeleteLocalAfterUpload && len(uploader.GetSuccessfulUploads(allResults)) > 0 && dbSaved {
 		DeleteSidecarFiles(filePath)
 		if err := removeFileWithRetry(filePath); err != nil {
 			recoveryLogf(filename, "could not remove local file: %v — will retry on next restart", err)
@@ -1352,8 +1342,9 @@ func collectPendingSegments(username string) []string {
 }
 
 // collectPendingSegmentsInDir returns sorted absolute paths of actual video
-// files in dir, filtering out sidecar files, zero-byte files, and
-// merged-*.mp4 files that were already consolidated.
+// files in dir, filtering out sidecar files and zero-byte files.  Previously
+// consolidated "merged-*.mp4" files ARE intentionally included: merging a
+// consolidated segment with newer ones preserves all of the recording content.
 func collectPendingSegmentsInDir(dir string) []string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1392,6 +1383,24 @@ func deletePendingSegments(username string) {
 		_ = os.Remove(filepath.Join(dir, e.Name()))
 	}
 	_ = os.Remove(dir)
+}
+
+// mergedPendingName returns a stable name for a consolidated pending segment:
+// "merged-" plus the oldest segment's base name, stripping any accumulated
+// "merged-" prefixes so repeated consolidations don't grow the filename
+// indefinitely (which could eventually exceed the Windows path length limit).
+func mergedPendingName(segments []string) string {
+	base := filepath.Base(segments[0])
+	base = strings.TrimPrefix(base, "merged-")
+	return "merged-" + base
+}
+
+// renameOverwriting moves src to dst, removing any existing dst first.  On
+// Windows os.Rename refuses to overwrite, and a stable merged-pending name can
+// already exist from a previous consolidation.
+func renameOverwriting(src, dst string) error {
+	_ = os.Remove(dst)
+	return os.Rename(src, dst)
 }
 
 // VideoDurationSeconds probes a video file and returns its duration in seconds.
@@ -1618,7 +1627,9 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			}
 		}
 		mu.Unlock()
-		return false
+		ch.Error("min-duration: probe failed and could not move %s to pending: %v — keeping it in place, NOT uploading",
+			filepath.Base(videoPath), err)
+		return true
 	}
 
 	if dur >= float64(minDur) {
@@ -1641,21 +1652,15 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 		mErr := mergeVideos(allInputs, mergedPath)
 		if mErr != nil {
 			os.Remove(mergedPath) // clean up partial output
-			ch.Error("min-duration: merge failed: %v — uploading current video separately, clearing pending segments", mErr)
-			for _, s := range mergeInputs {
-				os.Remove(s)
-			}
+			ch.Error("min-duration: merge failed: %v — uploading current video separately, KEEPING pending segments for a future merge", mErr)
 			return false
 		}
 
 		mergedDur, probeErr := VideoDurationSeconds(mergedPath)
-		if probeErr != nil || mergedDur < float64(minDur)*0.9 {
-			ch.Warn("min-duration: merged output for %s is %.1fs (expected >= %ds) — uploading current video separately",
+		if probeErr != nil || mergedDur < float64(minDur) {
+			ch.Warn("min-duration: merged output for %s is %.1fs (< %ds) — uploading current video separately, KEEPING pending segments",
 				filepath.Base(mergedPath), mergedDur, minDur)
 			os.Remove(mergedPath)
-			for _, s := range mergeInputs {
-				os.Remove(s)
-			}
 			return false
 		}
 
@@ -1680,15 +1685,16 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 	pendingDir := pendingSegmentsDir(ch.Config.Username)
 	if err := os.MkdirAll(pendingDir, 0777); err != nil {
 		mu.Unlock()
-		ch.Error("min-duration: cannot create pending dir %s: %v — uploading short video", pendingDir, err)
-		return false
+		ch.Error("min-duration: cannot create pending dir %s: %v — keeping %s in place, NOT uploading short video",
+			pendingDir, err, filepath.Base(videoPath))
+		return true
 	}
 
 	destPath := filepath.Join(pendingDir, filepath.Base(videoPath))
 	if err := os.Rename(videoPath, destPath); err != nil {
 		mu.Unlock()
-		ch.Error("min-duration: cannot move %s to pending: %v — uploading short video", filepath.Base(videoPath), err)
-		return false
+		ch.Error("min-duration: cannot move %s to pending: %v — keeping it in place, NOT uploading short video", filepath.Base(videoPath), err)
+		return true
 	}
 	ch.Info("min-duration: %s is %.1fs (< %ds) — deferred to pending", filepath.Base(videoPath), dur, minDur)
 
@@ -1696,7 +1702,10 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 	// combined duration. Only upload if the merged result meets the threshold.
 	segments := collectPendingSegments(ch.Config.Username)
 	if len(segments) > 1 {
-		mergedPath := filepath.Join(pendingDir, "merged-"+filepath.Base(destPath))
+		// Write to a unique scratch name first so the output can never collide
+		// with an existing "merged-*" input segment, then finalize below.
+		stableName := mergedPendingName(segments)
+		mergedPath := filepath.Join(pendingDir, fmt.Sprintf(".merging-%d-%s", time.Now().UnixNano(), stableName))
 		mergeInputs := make([]string, len(segments))
 		copy(mergeInputs, segments)
 		ch.Info("min-duration: merging %d pending segment(s)", len(mergeInputs))
@@ -1707,16 +1716,23 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			ch.Error("min-duration: merge failed: %v — segments remain pending for next recording", mErr)
 			return true
 		}
+		// Finalize to the stable name (best-effort; the scratch path is also valid).
+		stablePath := filepath.Join(pendingDir, stableName)
+		if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
+			mergedPath = stablePath
+		}
 		mu.Lock()
 
 		mergedDur, mErr := VideoDurationSeconds(mergedPath)
 		if mErr != nil {
-			ch.Warn("min-duration: could not probe merged result, uploading anyway: %v", mErr)
+			// Keep the merged result pending rather than risking an upload of
+			// unconfirmed duration — the min-duration guarantee must never be
+			// violated just because probing failed.
+			ch.Warn("min-duration: could not probe merged result (%v) — keeping pending", mErr)
 			for _, s := range mergeInputs {
 				os.Remove(s)
 			}
 			mu.Unlock()
-			ch.MoveToOutputDir(mergedPath)
 			return true
 		}
 
@@ -1736,20 +1752,6 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			ch.Info("min-duration: merged %d segments = %.1fs (< %ds) — still pending", len(mergeInputs), mergedDur, minDur)
 			for _, s := range mergeInputs {
 				os.Remove(s)
-			}
-			mergedDest := filepath.Join(pendingDir, "merged-"+filepath.Base(destPath))
-			if mErr := os.MkdirAll(pendingDir, 0777); mErr == nil {
-				if rErr := os.Rename(mergedPath, mergedDest); rErr != nil {
-					mu.Unlock()
-					ch.Error("min-duration: cannot keep merged result pending: %v — uploading anyway", rErr)
-					ch.MoveToOutputDir(mergedPath)
-					return true
-				}
-			} else {
-				mu.Unlock()
-				ch.Error("min-duration: cannot recreate pending dir: %v — uploading anyway", mErr)
-				ch.MoveToOutputDir(mergedPath)
-				return true
 			}
 			mu.Unlock()
 		}
@@ -1814,18 +1816,24 @@ func processAllPendingSegments() {
 			copy(segCopy, segments)
 			mu.Unlock()
 
-			mergedPath := filepath.Join(pendingSegmentsDir(username), "merged-"+filepath.Base(segments[0]))
+			pendingDir := pendingSegmentsDir(username)
+			stableName := mergedPendingName(segments)
+			// Write to a unique scratch name first so the output can never
+			// collide with an existing "merged-*" input, then finalize.
+			mergedPath := filepath.Join(pendingDir, fmt.Sprintf(".merging-%d-%s", time.Now().UnixNano(), stableName))
 			recoveryLogf(segments[0], "recovery: merging %d pending segments for %s", len(segments), username)
 			if err := mergeVideos(segCopy, mergedPath); err != nil {
 				os.Remove(mergedPath)
 				recoveryLogf(segments[0], "recovery: merge failed for %s: %v — leaving segments pending", username, err)
 				continue
 			}
+			// Finalize to the stable name (best-effort; the scratch path is also valid).
+			if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr == nil {
+				mergedPath = filepath.Join(pendingDir, stableName)
+			}
 
 			mergedDur, durErr := VideoDurationSeconds(mergedPath)
-			pendingDir := pendingSegmentsDir(username)
 			if durErr != nil || mergedDur < float64(minDur) {
-				mergedName := "merged-" + filepath.Base(segments[0])
 				if durErr != nil {
 					recoveryLogf(mergedPath, "recovery: could not probe merged duration (%v) — keeping pending", durErr)
 				} else {
@@ -1835,8 +1843,6 @@ func processAllPendingSegments() {
 				for _, s := range segCopy {
 					os.Remove(s)
 				}
-				_ = os.MkdirAll(pendingDir, 0777)
-				_ = os.Rename(mergedPath, filepath.Join(pendingDir, mergedName))
 				mu.Unlock()
 				continue
 			}
@@ -1854,8 +1860,6 @@ func processAllPendingSegments() {
 				for _, s := range segCopy {
 					os.Remove(s)
 				}
-				_ = os.MkdirAll(pendingDir, 0777)
-				_ = os.Rename(mergedPath, filepath.Join(pendingDir, "merged-"+filepath.Base(segments[0])))
 				mu.Unlock()
 				continue
 			}

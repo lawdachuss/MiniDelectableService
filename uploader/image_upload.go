@@ -6,7 +6,7 @@ import (
 )
 
 // MultiImageUploader uploads images to configured hosts in linear fallback
-// order: Pixhost.to → ImgBB → Catbox.moe.  Each host gets at most 2 retries.
+// order: Pixhost.to → ImgBB → Catbox.moe.  Each host gets at most 3 attempts.
 //
 // Sequential fallback is preferred over parallel upload because:
 //   - Pixhost supports JPEG, PNG, and GIF (all formats we generate), so it
@@ -49,7 +49,7 @@ func uploadWithRetries(maxAttempts int, label string, fn func() (string, error))
 // Upload tries Pixhost first, then ImgBB, then Catbox.moe.
 // Returns the URL, host name, or an error if all hosts fail.
 func (m *MultiImageUploader) Upload(filePath string) (url, host string, err error) {
-	url, err = uploadWithRetries(2, "Pixhost", func() (string, error) {
+	url, err = uploadWithRetries(3, "Pixhost", func() (string, error) {
 		return m.pixhost.Upload(filePath)
 	})
 	if err == nil {
@@ -57,7 +57,7 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 	}
 	pixhostErr := err
 
-	url, err = uploadWithRetries(2, "ImgBB", func() (string, error) {
+	url, err = uploadWithRetries(3, "ImgBB", func() (string, error) {
 		return m.imgbb.Upload(filePath)
 	})
 	if err == nil {
@@ -65,7 +65,7 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 	}
 	imgbbErr := err
 
-	url, err = uploadWithRetries(2, "Catbox", func() (string, error) {
+	url, err = uploadWithRetries(3, "Catbox", func() (string, error) {
 		return m.catbox.Upload(filePath)
 	})
 	if err == nil {

@@ -103,14 +103,13 @@ func TestPipelineQueueDedup(t *testing.T) {
 	}
 	pq := NewPipelineQueue(ch)
 
-	// Enqueue twice; the second must be dropped as a duplicate.
+	// Enqueue twice; the second must be dropped as a duplicate.  Use the
+	// monotonic accepted-counter rather than len(pipelines), because workers
+	// may already have dequeued the first pipeline for processing.
 	pq.EnqueueFile(path)
 	pq.EnqueueFile(path)
 
-	pq.mu.Lock()
-	n := len(pq.pipelines)
-	pq.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("expected 1 queued pipeline after duplicate enqueue, got %d", n)
+	if got := pq.EnqueuedCount(); got != 1 {
+		t.Fatalf("expected 1 accepted pipeline after duplicate enqueue, got %d", got)
 	}
 }

@@ -7,24 +7,24 @@ import (
 	"github.com/teacat/chaturbate-dvr/server"
 )
 
-// TestConfiguredUploadHostsIncludesSeekStreaming is a regression test for a
-// data-loss bug: configuredUploadHosts() previously maintained a hand-written
-// list that omitted SeekStreaming.  IsAlreadyFullyUploaded() uses this list to
-// decide whether the watcher may delete the local file, so when the other hosts
-// succeeded but SeekStreaming had not, the watcher deleted the file and
-// SeekStreaming never received it.
+// TestConfiguredUploadHostsIsDelegated is a regression test for a data-loss
+// bug: configuredUploadHosts() previously maintained a hand-written list that
+// drifted out of sync with the actual uploaders.  IsAlreadyFullyUploaded()
+// uses this list to decide whether the watcher may delete the local file, so
+// when a host was omitted from the list the watcher could delete the file
+// before that host had received it.
 //
 // The list must now exactly match uploader.NewMultiHostUploader(...).AvailableHosts().
-func TestConfiguredUploadHostsIncludesSeekStreaming(t *testing.T) {
+func TestConfiguredUploadHostsIsDelegated(t *testing.T) {
 	oldConfig := server.Config
 	defer func() { server.Config = oldConfig }()
 	server.Config = &entity.Config{
-		VoeSXAPIKey:      "key",
-		StreamtapeLogin:  "user",
-		StreamtapeKey:    "pass",
-		MixdropEmail:     "a@b.c",
-		MixdropToken:     "tok",
-		SeekStreamingKey: "ss-key",
+		VoeSXAPIKey:     "key",
+		StreamtapeLogin: "user",
+		StreamtapeKey:   "pass",
+		MixdropEmail:    "a@b.c",
+		MixdropToken:    "tok",
+		VidaraKey:       "vid-key",
 	}
 
 	hosts := configuredUploadHosts()
@@ -36,7 +36,7 @@ func TestConfiguredUploadHostsIncludesSeekStreaming(t *testing.T) {
 		}
 		return false
 	}
-	for _, want := range []string{"GoFile", "VOE.sx", "Streamtape", "Mixdrop", "SeekStreaming"} {
+	for _, want := range []string{"GoFile", "VOE.sx", "Streamtape", "Mixdrop", "Vidara"} {
 		if !has(want) {
 			t.Errorf("configuredUploadHosts() missing %q; got %v", want, hosts)
 		}

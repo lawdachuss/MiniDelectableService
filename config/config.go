@@ -227,7 +227,10 @@ func New(c *cli.Context) (*entity.Config, error) {
 		StreamtapeKey:           c.String("streamtape-key"),
 		MixdropEmail:            c.String("mixdrop-email"),
 		MixdropToken:            c.String("mixdrop-token"),
-		SeekStreamingKey:        c.String("seekstreaming-key"),
+		VidaraKey:               c.String("vidara-key"),
+		UploadMaxConcurrent:     c.Int("upload-max-concurrent"),
+		UploadHostConcurrency:   c.Int("upload-host-concurrency"),
+		PipelineWorkers:         c.Int("pipeline-workers"),
 
 		SupabaseURL:    c.String("supabase-url"),
 		SupabaseAPIKey: c.String("supabase-api-key"),

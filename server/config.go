@@ -25,6 +25,7 @@ type persistedSettings struct {
 	StreamtapeKey   string `json:"streamtape_key,omitempty"`
 	MixdropEmail    string `json:"mixdrop_email,omitempty"`
 	MixdropToken    string `json:"mixdrop_token,omitempty"`
+	VidaraKey       string `json:"vidara_key,omitempty"`
 	StripchatPDKey  string `json:"stripchat_pdkey,omitempty"`
 }
 
@@ -42,6 +43,7 @@ func SaveSettings() error {
 		StreamtapeKey:   Config.StreamtapeKey,
 		MixdropEmail:    Config.MixdropEmail,
 		MixdropToken:    Config.MixdropToken,
+		VidaraKey:       Config.VidaraKey,
 		StripchatPDKey:  Config.StripchatPDKey,
 	}
 	ConfigMu.RUnlock()
@@ -100,6 +102,9 @@ func LoadSettings() error {
 	if s.MixdropToken != "" {
 		Config.MixdropToken = s.MixdropToken
 	}
+	if s.VidaraKey != "" {
+		Config.VidaraKey = s.VidaraKey
+	}
 	if s.StripchatPDKey != "" {
 		Config.StripchatPDKey = s.StripchatPDKey
 	}
@@ -132,7 +137,7 @@ func extractCookie(cookieStr, name string) string {
 }
 
 // UpdateUploaderCredentials updates upload service credentials and protects concurrent access with a mutex.
-func UpdateUploaderCredentials(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken string) {
+func UpdateUploaderCredentials(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, vidaraKey string) {
 	ConfigMu.Lock()
 	if voeSXAPIKey != "" {
 		Config.VoeSXAPIKey = voeSXAPIKey
@@ -148,6 +153,9 @@ func UpdateUploaderCredentials(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixd
 	}
 	if mixdropToken != "" {
 		Config.MixdropToken = mixdropToken
+	}
+	if vidaraKey != "" {
+		Config.VidaraKey = vidaraKey
 	}
 	ConfigMu.Unlock()
 }

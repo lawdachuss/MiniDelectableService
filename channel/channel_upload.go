@@ -26,15 +26,19 @@ func embedURLFromLink(host, link string) string {
 		return link
 	case "Mixdrop":
 		return link
-	case "SeekStreaming":
+	case "Vidara":
+		code := link[strings.LastIndex(link, "/")+1:]
+		if code != "" {
+			return "https://vidara.so/e/" + code
+		}
 		return link
 	}
 	return ""
 }
 
 const (
-	maxChannelUploadAttempts = 8
-	channelUploadRetryDelay  = 5 * time.Second
+	maxChannelUploadAttempts = 3
+	channelUploadRetryDelay  = 3 * time.Second
 )
 
 // uploadFile uploads the given file to all configured hosts.
@@ -86,7 +90,7 @@ func (ch *Channel) uploadFile(filePath string, thumbURL, spriteURL, previewURL s
 		cfg.StreamtapeKey,
 		cfg.MixdropEmail,
 		cfg.MixdropToken,
-		cfg.SeekStreamingKey,
+		cfg.VidaraKey,
 		ch, // Channel implements uploader.Logger
 	)
 

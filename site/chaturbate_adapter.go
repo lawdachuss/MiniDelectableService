@@ -172,7 +172,7 @@ func (s *ChaturbateSite) GetRoomStatus(ctx context.Context, req *internal.Req, u
 		return nil
 	},
 		retry.Context(ctx),
-		retry.Attempts(5),
+		retry.Attempts(3),
 		retry.Delay(1*time.Second),
 		retry.MaxDelay(10*time.Second),
 		retry.DelayType(retry.BackOffDelay),

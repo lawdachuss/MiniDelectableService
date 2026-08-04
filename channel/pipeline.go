@@ -36,7 +36,26 @@ func (s Stage) String() string { return stageNames[s] }
 
 // maxPipelineRetries is the number of times a failed pipeline will be retried
 // across restarts before it is abandoned and its state row is deleted.
-const maxPipelineRetries = 5
+const maxPipelineRetries = 3
+
+// defaultPipelineWorkers is how many pipelines one channel's queue processes
+// concurrently.  More workers means a channel with a backlog of recordings
+// uploads several files at once instead of serially.  The global UploadSem
+// still caps total concurrent file uploads across all channels, so this only
+// increases parallelism, never violates the global cap.
+const defaultPipelineWorkers = 3
+
+var (
+	pipelineWorkers = defaultPipelineWorkers
+)
+
+// SetPipelineWorkers configures how many pipelines a channel queue processes
+// concurrently.  Call at startup before any queues are created.
+func SetPipelineWorkers(n int) {
+	if n > 0 {
+		pipelineWorkers = n
+	}
+}
 
 func stageFromString(s string) Stage {
 	for k, v := range stageNames {
@@ -61,6 +80,11 @@ type Pipeline struct {
 	Failed       bool   `json:"failed"`
 	LastError    string `json:"last_error"`
 	Retries      int    `json:"retries"`
+
+	// retried is set when the pipeline is re-queued after a failure.  The
+	// UploadWg token is released only on the first processing of a pipeline,
+	// so re-queued attempts never double-decrement it.
+	retried bool
 
 	// Channel metadata snapshot captured at enqueue time so stageSaveMetadata
 	// uses the state from when the file was recorded, not whatever a newer
@@ -196,7 +220,7 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 		cfg.StreamtapeKey,
 		cfg.MixdropEmail,
 		cfg.MixdropToken,
-		cfg.SeekStreamingKey,
+		cfg.VidaraKey,
 		ch,
 	)
 
@@ -222,8 +246,8 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 			completedHosts = nil
 			hostsToTry = allHosts
 		}
-		ch.Info("upload: %d/%d hosts already have this file — uploading to %d remaining",
-			len(completedHosts), len(allHosts), len(hostsToTry))
+ch.Info("upload: %d/%d hosts already have this file — uploading to %d remaining",
+		len(completedHosts), len(allHosts), len(hostsToTry))
 	}
 
 	var results []uploader.UploadResult
@@ -319,19 +343,12 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 		ch.SetUploadProgress(filename, status, pct/float64(len(allHosts)), hostCount, len(allHosts), totalCur, totalBytes, aggSpeed, hosts)
 	})
 
-	for attempt := 1; attempt <= maxChannelUploadAttempts; attempt++ {
-		if attempt > 1 && len(hostsToTry) == 0 {
-			break
-		}
-		var attemptResults []uploader.UploadResult
-		attemptResults = upl.UploadSelected(filePath, hostsToTry)
+	// Use RetryManager to handle upload retries in background
+	err := DoWithRetry("upload-"+p.FileHash, func() error {
+		attemptResults := upl.UploadSelected(filePath, hostsToTry)
 		results = append(results, attemptResults...)
 
-		success = uploader.GetSuccessfulUploads(results)
-		ch.SetUploadProgress(filename, fmt.Sprintf("uploaded to %d/%d hosts", len(success), len(allHosts)),
-			float64(len(success))/float64(len(allHosts))*100, len(success), len(allHosts),
-			0, 0, "", nil)
-
+		// Save journal entries for each result
 		if p.FileHash != "" {
 			stat, _ := os.Stat(filePath)
 			var filesize int64
@@ -351,24 +368,22 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 			}
 		}
 
+		success = uploader.GetSuccessfulUploads(results)
 		if len(success) >= len(allHosts) {
-			break
+			return nil
 		}
 
-		if attempt < maxChannelUploadAttempts {
-			failedHosts := failedHostNames(results, completedHosts)
-			hostsToTry = failedHosts
-			if len(hostsToTry) > 0 {
-				ch.Warn("upload: %d hosts still pending — retrying in %ds (attempt %d/%d)",
-					len(hostsToTry), int(channelUploadRetryDelay.Seconds()), attempt+1, maxChannelUploadAttempts)
-				time.Sleep(channelUploadRetryDelay)
-			}
+		// Some hosts failed — update hostsToTry for next retry
+		failedHosts := failedHostNames(results, completedHosts)
+		hostsToTry = failedHosts
+		if len(hostsToTry) == 0 {
+			return nil
 		}
-	}
 
-	if len(success) == 0 {
-		ch.Error("upload: all hosts failed for %s", filename)
-		return fmt.Errorf("all upload hosts failed for %s", filename)
+		return fmt.Errorf("%d hosts still pending", len(hostsToTry))
+	}, WithUploadSem(), WithMaxAttempts(maxChannelUploadAttempts), WithBaseBackoff(channelUploadRetryDelay))
+	if err != nil {
+		return err
 	}
 
 	// Store results
@@ -402,22 +417,6 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 	return nil
 }
 
-// posterFromHosts checks if any host provided an auto-generated poster URL.
-func (p *Pipeline) posterFromHosts() string {
-	if embedURL, ok := p.Links["SeekStreaming"]; ok {
-		videoID := uploader.ExtractSeekStreamingVideoID(embedURL)
-		if videoID != "" {
-			if cfg := server.Config; cfg != nil && cfg.SeekStreamingKey != "" {
-				posterURL, err := uploader.GetSeekStreamingPosterURL(cfg.SeekStreamingKey, videoID)
-				if err == nil && posterURL != "" {
-					return posterURL
-				}
-			}
-		}
-	}
-	return ""
-}
-
 // stageSaveMetadata persists recording metadata and all links to Supabase.
 func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 	// Retry thumbnail generation if it failed during StageThumbnailUpload.
@@ -428,9 +427,6 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 			p.SpriteURL = spriteURL
 			p.PreviewURL = previewURL
 			ch.Info("upload: generated thumbnails for %s (retry)", p.Filename)
-		} else if pu := p.posterFromHosts(); pu != "" {
-			p.ThumbURL = pu
-			ch.Info("upload: using auto-generated poster from host as thumbnail for %s", p.Filename)
 		} else {
 			ch.Warn("upload: thumbnail generation failed for %s (skipped)", p.Filename)
 		}
@@ -528,14 +524,18 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 }
 
 // PipelineQueue manages a per-channel ordered queue of pipelines.
-// Pipelines are processed sequentially (one at a time per channel).
+// Pipelines are processed concurrently by a small worker pool so a channel
+// with a backlog uploads several files in parallel.  Order within a channel is
+// best-effort FIFO (workers may finish out of order).
 type PipelineQueue struct {
 	pipelines []*Pipeline
 	mu        sync.Mutex
 	cond      *sync.Cond
 	wg        sync.WaitGroup
 	stopped   bool
-	started   bool // tracks whether the worker goroutine has been launched
+	started   bool           // tracks whether the worker goroutine has been launched
+	stopCh    chan struct{}  // closed on Stop() to cancel pending retry timers
+	enqueued  int            // total pipelines accepted (after dedup), incl. currently processing
 
 	ch      *Channel
 	history []entity.PendingEntry // last 50 completed/failed pipelines
@@ -543,12 +543,12 @@ type PipelineQueue struct {
 
 // NewPipelineQueue creates a new pipeline queue for a channel.
 func NewPipelineQueue(ch *Channel) *PipelineQueue {
-	pq := &PipelineQueue{ch: ch}
+	pq := &PipelineQueue{ch: ch, stopCh: make(chan struct{})}
 	pq.cond = sync.NewCond(&pq.mu)
 	return pq
 }
 
-// startOnce launches the worker goroutine on first use, and relaunches it if
+// startOnce launches the worker pool on first use, and relaunches it if
 // the queue was previously Stop()ed.  This keeps the queue reusable across
 // stop/start cycles instead of leaving it permanently dead after the first
 // Stop() — a latent footgun where later EnqueueFile calls would silently
@@ -556,17 +556,20 @@ func NewPipelineQueue(ch *Channel) *PipelineQueue {
 func (pq *PipelineQueue) startOnce() {
 	pq.mu.Lock()
 	// If the worker was previously stopped, reset so we can launch a fresh one.
-	// wg.Wait() in Stop() guarantees the old goroutine has exited by now, so
+	// wg.Wait() in Stop() guarantees the old goroutines have exited by now, so
 	// there is no double-launch risk.
 	if pq.started && pq.stopped {
 		pq.started = false
 		pq.stopped = false
+		pq.stopCh = make(chan struct{})
 	}
 	if !pq.started {
 		pq.started = true
 		pq.mu.Unlock()
-		pq.wg.Add(1)
-		go pq.processLoop()
+		for i := 0; i < pipelineWorkers; i++ {
+			pq.wg.Add(1)
+			go pq.processLoop()
+		}
 		return
 	}
 	pq.mu.Unlock()
@@ -576,12 +579,61 @@ func (pq *PipelineQueue) startOnce() {
 func (pq *PipelineQueue) Stop() {
 	pq.mu.Lock()
 	pq.stopped = true
+	close(pq.stopCh)
 	pq.mu.Unlock()
 	pq.cond.Broadcast()
 	pq.wg.Wait()
 }
 
-// processLoop is the worker goroutine that processes pipelines sequentially.
+// scheduleRetry re-queues a failed pipeline after a backoff delay so a
+// transient outage (all hosts down, Supabase hiccup) self-heals without manual
+// intervention.  The recording is always kept on disk — retries never delete
+// it.  The UploadWg token is NOT re-counted: processPipeline releases it only
+// on the first processing (p.retried), so re-queued attempts are free.
+//
+// If the queue is Stop()ed while the retry is pending, the retry is dropped;
+// the persisted state row and the on-disk file are both preserved, so
+// ResumePending (restart) and the orphan scan recover it.
+func (pq *PipelineQueue) scheduleRetry(p *Pipeline) bool {
+	if _, err := os.Stat(p.FilePath); err != nil {
+		// Recording vanished externally — nothing left to retry.
+		if delErr := server.DeletePipelineState(p.FileHash); delErr != nil {
+			pq.ch.Warn("pipeline: could not delete state for vanished %s: %v", p.Filename, delErr)
+		}
+		return false
+	}
+
+	retries := p.Retries
+	delay := 30 * time.Second << uint(min(retries-1, 5))
+	if delay > 10*time.Minute {
+		delay = 10 * time.Minute
+	}
+	p.retried = true
+	pq.ch.Warn("pipeline: %s will retry in %s (retry %d/%d)", p.Filename, delay, retries, maxPipelineRetries)
+
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-pq.stopCh:
+			return // queue shutting down — state was persisted, file kept on disk
+		}
+		pq.mu.Lock()
+		if pq.stopped {
+			pq.mu.Unlock()
+			return
+		}
+		MarkUploadInFlight(p.FilePath)
+		pq.pipelines = append(pq.pipelines, p)
+		pq.cond.Broadcast()
+		pq.mu.Unlock()
+	}()
+	return true
+}
+
+// processLoop is a single worker goroutine that processes pipelines from the
+// shared queue.  A PipelineQueue runs pipelineWorkers of these concurrently.
 func (pq *PipelineQueue) processLoop() {
 	defer pq.wg.Done()
 	for {
@@ -651,15 +703,59 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 	ch.Info("pipeline: processing %s (starting at stage %s)", filename, p.CurrentStage)
 
 	defer func() {
+		// Snapshot whether this is the pipeline's first processing BEFORE any
+		// retry logic runs: scheduleRetry marks p.retried synchronously, so
+		// the UploadWg token must be released based on this snapshot, not the
+		// flag's value after a retry has been scheduled.
+		firstRun := !p.retried
+
 		if r := recover(); r != nil {
 			ch.Error("pipeline: panic processing %s: %v", filename, r)
 			p.Failed = true
 			p.LastError = fmt.Sprintf("panic: %v", r)
 		}
-		ch.UploadWg.Done()
-		MarkUploadDone(p.FilePath)
-		// Record history
+
 		stageStr := p.CurrentStage.String()
+		if p.CurrentStage == StageDone || p.Failed {
+			switch {
+			case p.CurrentStage == StageDone:
+				if delErr := server.DeletePipelineState(p.FileHash); delErr != nil {
+					ch.Warn("pipeline: could not delete state for %s: %v", filename, delErr)
+				}
+			case p.Retries < maxPipelineRetries:
+				// Keep the recording and retry in-process with backoff.  The
+				// file is NEVER deleted on failure — losing a recording is
+				// worse than a retry loop, and stageUploadVideos skips hosts
+				// that already succeeded via the upload journal.
+				p.Retries++
+				if saveErr := server.SavePipelineState(p.toDBState()); saveErr != nil {
+					ch.Warn("pipeline: could not persist state for %s: %v", filename, saveErr)
+				}
+				if p.Failed {
+					pq.scheduleRetry(p)
+				}
+			default:
+				// Retries exhausted — keep the recording for recovery instead
+				// of deleting it.  Dropping the state row lets the startup and
+				// periodic orphan scan pick the file up and retry the upload.
+				ch.Error("pipeline: %s failed %d times, keeping file for recovery", filename, maxPipelineRetries)
+				if delErr := server.DeletePipelineState(p.FileHash); delErr != nil {
+					ch.Warn("pipeline: could not delete abandoned state for %s: %v", filename, delErr)
+				}
+			}
+			if m := server.Manager; m != nil {
+				m.PublishLog(ch.Config.Username, fmt.Sprintf("[pipeline] %s finished (stage=%s, failed=%v, retries=%d)", filename, p.CurrentStage, p.Failed, p.Retries))
+			}
+		}
+
+		// Release the upload token only on the first processing of a pipeline.
+		// Re-queued retries carry no new token, so they must not Done again.
+		if firstRun {
+			ch.UploadWg.Done()
+		}
+		MarkUploadDone(p.FilePath)
+
+		// Record history
 		if p.Failed || p.CurrentStage == StageDone {
 			pq.pushHistory(entity.PendingEntry{
 				Channel:  ch.Config.Username,
@@ -668,28 +764,6 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 				Failed:   p.Failed,
 				Error:    p.LastError,
 			})
-		}
-		if p.CurrentStage == StageDone || p.Failed {
-			if p.CurrentStage == StageDone {
-				if delErr := server.DeletePipelineState(p.FileHash); delErr != nil {
-					ch.Warn("pipeline: could not delete state for %s: %v", filename, delErr)
-				}
-			} else if p.Retries < maxPipelineRetries {
-				p.Retries++
-				if saveErr := server.SavePipelineState(p.toDBState()); saveErr != nil {
-					ch.Warn("pipeline: could not persist state for %s: %v", filename, saveErr)
-				}
-			} else {
-				// Retries exhausted — abandon the pipeline and clean up.
-				ch.Error("pipeline: %s failed %d times, abandoning", filename, p.Retries+1)
-				if delErr := server.DeletePipelineState(p.FileHash); delErr != nil {
-					ch.Warn("pipeline: could not delete abandoned state for %s: %v", filename, delErr)
-				}
-				deleteLocalFile(ch, filename, p.FilePath)
-			}
-			if m := server.Manager; m != nil {
-				m.PublishLog(ch.Config.Username, fmt.Sprintf("[pipeline] %s finished (stage=%s, failed=%v, retries=%d)", filename, p.CurrentStage, p.Failed, p.Retries))
-			}
 		}
 	}()
 
@@ -745,17 +819,15 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 			ch.Error("pipeline: thumbnail stage failed for %s: %v", filename, thumbErr)
 		}
 		if uploadErr != nil {
-			ch.Error("pipeline: upload stage failed for %s: %v", filename, uploadErr)
+			ch.Error("pipeline: upload stage failed for %s: %v — keeping recording for retry", filename, uploadErr)
 			p.Failed = true
 			p.LastError = uploadErr.Error()
-			deleteLocalFile(ch, filename, p.FilePath)
 			return
 		}
 		if len(p.Links) == 0 {
-			ch.Error("pipeline: upload stage produced no links for %s", filename)
+			ch.Error("pipeline: upload stage produced no links for %s — keeping recording for retry", filename)
 			p.Failed = true
 			p.LastError = "upload produced no links"
-			deleteLocalFile(ch, filename, p.FilePath)
 			return
 		}
 
@@ -824,6 +896,14 @@ func (pq *PipelineQueue) EnqueueFile(filePath string) {
 		return
 	}
 
+	// Dedup: this exact file is already queued or being processed (possibly by
+	// another worker in the pool).  Check before hashing so the second enqueue
+	// of a large file doesn't waste time on FastFileHash.
+	if IsUploadInFlight(filePath) {
+		pq.ch.Warn("pipeline: %s already uploading, skipping duplicate", base)
+		return
+	}
+
 	MarkUploadInFlight(filePath)
 
 	fileHash, hashErr := internal.FastFileHash(filePath)
@@ -887,8 +967,9 @@ func (pq *PipelineQueue) EnqueueFile(filePath string) {
 	pq.ch.stateMu.Unlock()
 
 	pq.pipelines = append(pq.pipelines, p)
+	pq.enqueued++
 	pq.mu.Unlock()
-	pq.cond.Signal()
+	pq.cond.Broadcast()
 
 	// Phase 1: Save basic recording metadata immediately so it's never lost
 	// even if the process is killed during upload. stageSaveMetadata later
@@ -924,6 +1005,14 @@ func (pq *PipelineQueue) EnqueueFile(filePath string) {
 	if hErr := server.SavePipelineState(p.toDBState()); hErr != nil {
 		pq.ch.Warn("pipeline: could not persist initial state for %s: %v", p.Filename, hErr)
 	}
+}
+
+// EnqueuedCount returns the total number of pipelines accepted by the queue
+// (after dedup), including those currently being processed.  It is monotonic.
+func (pq *PipelineQueue) EnqueuedCount() int {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return pq.enqueued
 }
 
 // ResumePending loads incomplete pipelines from Supabase and re-queues them.
@@ -965,9 +1054,10 @@ func (pq *PipelineQueue) ResumePending() {
 			continue
 		}
 		// Dedup: skip if a pipeline for this hash is already queued (e.g.
-		// ResumePending called twice, or the file was re-enqueued manually).
+		// ResumePending called twice, or the file was re-enqueued manually),
+		// or if this exact file is currently being processed by a worker.
 		pq.mu.Lock()
-		if pq.containsHash(s.FileHash) {
+		if pq.containsHash(s.FileHash) || IsUploadInFlight(s.FilePath) {
 			pq.mu.Unlock()
 			continue
 		}
@@ -976,8 +1066,9 @@ func (pq *PipelineQueue) ResumePending() {
 		pq.ch.UploadWg.Add(1)
 		pq.ch.Info("pipeline: resuming %s at stage %s (retry %d)", s.Filename, s.CurrentStage, s.Retries)
 		pq.pipelines = append(pq.pipelines, p)
+		pq.enqueued++
 		pq.mu.Unlock()
-		pq.cond.Signal()
+		pq.cond.Broadcast()
 	}
 }
 
@@ -991,20 +1082,5 @@ func formatSpeed(bytesPerSec float64) string {
 		return fmt.Sprintf("%.0f KB/s", bytesPerSec/1_000)
 	default:
 		return fmt.Sprintf("%.0f B/s", bytesPerSec)
-	}
-}
-
-// deleteLocalFile attempts to remove a local video file with retry.  Used by
-// pipeline failure paths to prevent disk filling when uploads fail or the
-// pipeline is abandoned.
-func deleteLocalFile(ch *Channel, filename, filePath string) {
-	if filePath == "" {
-		return
-	}
-	DeleteSidecarFiles(filePath)
-	if err := removeFileWithRetry(filePath); err != nil {
-		ch.Warn("pipeline: could not remove %s after failure: %v", filename, err)
-	} else {
-		ch.Info("pipeline: removed %s despite pipeline failure", filename)
 	}
 }

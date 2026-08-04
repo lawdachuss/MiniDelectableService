@@ -10,11 +10,6 @@ import (
 	"time"
 )
 
-// mixdropSem limits concurrent uploads to Mixdrop.
-const mixdropSemCap = 3
-
-var mixdropSem = make(chan struct{}, mixdropSemCap)
-
 // MixdropUploader handles uploading files to Mixdrop
 type MixdropUploader struct {
 	email  string
@@ -60,8 +55,8 @@ func (u *MixdropUploader) Upload(filePath string) (string, error) {
 
 // UploadWithProgress uploads a file to Mixdrop and reports progress through fn.
 func (u *MixdropUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	mixdropSem <- struct{}{}
-	defer func() { <-mixdropSem }()
+	release := acquireHostSem("Mixdrop")
+	defer release()
 
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {

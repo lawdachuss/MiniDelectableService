@@ -10,21 +10,21 @@ import (
 )
 
 const (
-	voeSXAPIBase = "https://voe.sx/api"
+	vidaraAPIBase = "https://api.vidara.so/v1"
 )
 
-// VoeSXUploader handles uploading files to VOE.sx
-type VoeSXUploader struct {
+// VidaraUploader handles uploading files to vidara.so
+type VidaraUploader struct {
 	apiKey string
 	client *http.Client
 }
 
-// NewVoeSXUploader creates a new VOE.sx uploader instance
-func NewVoeSXUploader(apiKey string) *VoeSXUploader {
-	return &VoeSXUploader{
+// NewVidaraUploader creates a new Vidara uploader instance
+func NewVidaraUploader(apiKey string) *VidaraUploader {
+	return &VidaraUploader{
 		apiKey: apiKey,
 		client: &http.Client{
-			Timeout: 120 * time.Minute,
+			Timeout: 120 * time.Minute, // Long timeout for large video uploads
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
@@ -36,38 +36,35 @@ func NewVoeSXUploader(apiKey string) *VoeSXUploader {
 	}
 }
 
-type voeSXServerResponse struct {
-	ServerTime string `json:"server_time"`
-	Msg        string `json:"msg"`
-	Message    string `json:"message"`
-	Status     int    `json:"status"`
-	Success    bool   `json:"success"`
-	Result     string `json:"result"`
+type vidaraServerResponse struct {
+	Msg    string `json:"msg"`
+	Status int    `json:"status"`
+	Result struct {
+		UploadServer string `json:"upload_server"`
+	} `json:"result"`
 }
 
-type voeSXUploadResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	File    struct {
-		ID                int    `json:"id"`
-		FileCode          string `json:"file_code"`
-		FileTitle         string `json:"file_title"`
-		EncodingNecessary bool   `json:"encoding_necessary"`
-	} `json:"file"`
+type vidaraUploadResponse struct {
+	URL      string `json:"url"`
+	Title    string `json:"title"`
+	VideoID  int64  `json:"video_id"`
+	Filecode string `json:"filecode"`
+	Msg      string `json:"msg"`
+	Status   int    `json:"status"`
 }
 
-// Upload uploads a file to VOE.sx and returns the view link
-func (u *VoeSXUploader) Upload(filePath string) (string, error) {
+// Upload uploads a file to Vidara and returns the view link
+func (u *VidaraUploader) Upload(filePath string) (string, error) {
 	return u.UploadWithProgress(filePath, nil)
 }
 
-// UploadWithProgress uploads a file to VOE.sx and reports progress through fn.
-func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
+// UploadWithProgress uploads a file to Vidara and reports progress through fn.
+func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
 	if u.apiKey == "" {
-		return "", fmt.Errorf("VOE.sx API key not configured")
+		return "", fmt.Errorf("Vidara API key not configured")
 	}
 
-	release := acquireHostSem("VOE.sx")
+	release := acquireHostSem("Vidara")
 	defer release()
 
 	var lastErr error
@@ -98,11 +95,9 @@ func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFun
 	return "", lastErr
 }
 
-// getUploadServer gets the upload server URL from VOE.sx API
-func (u *VoeSXUploader) getUploadServer() (string, error) {
-	url := fmt.Sprintf("%s/upload/server?key=%s", voeSXAPIBase, u.apiKey)
-
-	req, err := http.NewRequest("GET", url, nil)
+// getUploadServer gets the upload server URL from the Vidara API
+func (u *VidaraUploader) getUploadServer() (string, error) {
+	req, err := http.NewRequest("GET", vidaraAPIBase+"/upload/server?api_key="+u.apiKey, nil)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -118,32 +113,27 @@ func (u *VoeSXUploader) getUploadServer() (string, error) {
 		return "", fmt.Errorf("get upload server failed with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	var serverResp voeSXServerResponse
+	var serverResp vidaraServerResponse
 	if err := json.NewDecoder(resp.Body).Decode(&serverResp); err != nil {
 		return "", fmt.Errorf("decode server response: %w", err)
 	}
 
-	if !serverResp.Success || serverResp.Status != 200 {
-		return "", fmt.Errorf("server status not ok: %s (msg: %s)", serverResp.Msg, serverResp.Message)
+	if serverResp.Status != 200 || serverResp.Result.UploadServer == "" {
+		return "", fmt.Errorf("server status not ok: %d (msg: %s)", serverResp.Status, serverResp.Msg)
 	}
 
-	if serverResp.Result == "" {
-		return "", fmt.Errorf("no upload server URL in response")
-	}
-
-	return serverResp.Result, nil
+	return serverResp.Result.UploadServer, nil
 }
 
-func (u *VoeSXUploader) uploadFile(filePath string, progress ProgressFunc) (string, error) {
-	// Step 1: Get upload server
+func (u *VidaraUploader) uploadFile(filePath string, progress ProgressFunc) (string, error) {
 	uploadServer, err := u.getUploadServer()
 	if err != nil {
 		return "", fmt.Errorf("get upload server: %w", err)
 	}
 
 	body, contentLen, contentType, file, err := multipartStreamWithProgress(
-		map[string]string{"key": u.apiKey},
-		"file", filePath, "VOE.sx", progress,
+		map[string]string{"api_key": u.apiKey},
+		"file", filePath, "Vidara", progress,
 	)
 	if err != nil {
 		return "", fmt.Errorf("multipart stream: %w", err)
@@ -169,19 +159,17 @@ func (u *VoeSXUploader) uploadFile(filePath string, progress ProgressFunc) (stri
 		return "", fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	var uploadResp voeSXUploadResponse
+	var uploadResp vidaraUploadResponse
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
 		return "", fmt.Errorf("decode upload response: %w", err)
 	}
 
-	if !uploadResp.Success {
-		return "", fmt.Errorf("upload failed: %s", uploadResp.Message)
+	if uploadResp.URL == "" && uploadResp.Filecode == "" {
+		return "", fmt.Errorf("no file URL in response")
 	}
 
-	if uploadResp.File.FileCode == "" {
-		return "", fmt.Errorf("no file code in response")
+	if uploadResp.URL != "" {
+		return uploadResp.URL, nil
 	}
-
-	viewURL := fmt.Sprintf("https://voe.sx/%s", uploadResp.File.FileCode)
-	return viewURL, nil
+	return fmt.Sprintf("https://vidara.so/v/%s", uploadResp.Filecode), nil
 }

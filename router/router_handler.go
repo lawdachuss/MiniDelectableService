@@ -364,6 +364,7 @@ type UpdateConfigRequest struct {
 	StreamtapeKey   string `json:"streamtape_key" form:"streamtape_key"`
 	MixdropEmail    string `json:"mixdrop_email" form:"mixdrop_email"`
 	MixdropToken    string `json:"mixdrop_token" form:"mixdrop_token"`
+	VidaraKey       string `json:"vidara_key" form:"vidara_key"`
 	StripchatPDKey  string `json:"stripchat_pdkey" form:"stripchat_pdkey"`
 }
 
@@ -428,9 +429,9 @@ func UpdateConfig(c *gin.Context) {
 		server.ConfigMu.Unlock()
 	}
 
-	// Update uploader credentials (VOE.sx / Streamtape / Mixdrop)
-	if req.VoeSXAPIKey != "" || req.StreamtapeLogin != "" || req.StreamtapeKey != "" || req.MixdropEmail != "" || req.MixdropToken != "" {
-		server.UpdateUploaderCredentials(req.VoeSXAPIKey, req.StreamtapeLogin, req.StreamtapeKey, req.MixdropEmail, req.MixdropToken)
+	// Update uploader credentials (VOE.sx / Streamtape / Mixdrop / Vidara)
+	if req.VoeSXAPIKey != "" || req.StreamtapeLogin != "" || req.StreamtapeKey != "" || req.MixdropEmail != "" || req.MixdropToken != "" || req.VidaraKey != "" {
+		server.UpdateUploaderCredentials(req.VoeSXAPIKey, req.StreamtapeLogin, req.StreamtapeKey, req.MixdropEmail, req.MixdropToken, req.VidaraKey)
 	}
 
 	if err := server.SaveSettings(); err != nil {
@@ -890,6 +891,12 @@ func embedURLForHostLink(host, link string) string {
 		}
 		return link
 	}
+	if strings.Contains(normalizedHost, "vidara") || strings.Contains(normalizedLink, "vidara.so/") {
+		if code := extractFileCode(link); code != "" {
+			return "https://vidara.so/e/" + code
+		}
+		return link
+	}
 	if strings.Contains(normalizedHost, "gofile") || strings.Contains(normalizedLink, "gofile.io/") {
 		return ""
 	}
@@ -918,6 +925,11 @@ func videoURLForHostLink(host, link string) string {
 	case strings.Contains(normalizedHost, "mixdrop") || strings.Contains(normalizedLink, "mixdrop."):
 		if code := extractFileCode(link); code != "" {
 			return "https://mixdrop.ag/e/" + code
+		}
+		return link
+	case strings.Contains(normalizedHost, "vidara") || strings.Contains(normalizedLink, "vidara.so/"):
+		if code := extractFileCode(link); code != "" {
+			return "https://vidara.so/e/" + code
 		}
 		return link
 	case strings.Contains(normalizedHost, "gofile") || strings.Contains(normalizedLink, "gofile.io/"):

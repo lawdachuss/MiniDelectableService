@@ -201,7 +201,12 @@ type Config struct {
 	StreamtapeKey    string
 	MixdropEmail     string
 	MixdropToken     string
-	SeekStreamingKey string
+	VidaraKey        string
+
+	// Upload throughput tuning.
+	UploadMaxConcurrent   int // max video files uploading concurrently (0 = default 100)
+	UploadHostConcurrency int // max concurrent uploads per host (0 = default 8)
+	PipelineWorkers       int // concurrent pipelines per channel queue (0 = default 3)
 
 	SupabaseURL    string
 	SupabaseAPIKey string

@@ -14,11 +14,7 @@ import (
 
 const (
 	gofileAPIBase = "https://api.gofile.io"
-	// gofileSem limits concurrent uploads to GoFile — 5 is safe below rate-limit thresholds.
-	gofileSemCap = 5
 )
-
-var gofileSem = make(chan struct{}, gofileSemCap)
 
 // GoFileUploader handles uploading files to GoFile.io
 type GoFileUploader struct {
@@ -72,13 +68,13 @@ func (u *GoFileUploader) Upload(filePath string) (string, error) {
 
 // UploadWithProgress uploads a file to GoFile and reports progress through fn.
 func (u *GoFileUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	gofileSem <- struct{}{}
-	defer func() { <-gofileSem }()
+	release := acquireHostSem("GoFile")
+	defer release()
 
 	var downloadLink string
 	var lastErr error
 
-	maxAttempts := 4
+	maxAttempts := 3
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
 			time.Sleep(uploadBackoff(attempt-2, lastErr))
