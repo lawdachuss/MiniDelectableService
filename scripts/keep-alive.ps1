@@ -115,6 +115,41 @@ function Write-TunnelSummary {
   $lines += "_Last updated: $ts_"
   ($lines -join "`n") | Set-Content $env:GITHUB_STEP_SUMMARY -Encoding utf8
 }
+
+# Live clickable link. GitHub's web UI auto-linkifies URLs in ::notice annotations
+# and in raw log lines, but it redacts every ASCII hyphen when any secret contains
+# one (NODE_ID=node-3 masks '-' everywhere, turning the full trycloudflare.com URL
+# into ***). is.gd/tinyurl/v.gd short codes are [a-z0-9]-only, so they survive
+# masking and render as a clickable link while the job is still running (step
+# summaries only appear after the 6h loop completes or is cancelled).
+function Write-TunnelNotice {
+  param($url)
+  if (-not $url) { return }
+  [Console]::Out.WriteLine("::notice title=DVR Dashboard::$url")
+  $null = [System.Console]::Out.Flush()
+}
+
+# Short URL (mask-proof + clickable). is.gd/tinyurl/v.gd/clck.ru short codes are
+# [a-z0-9]-only, so they survive GitHub's hyphen secret-masking and stay linkified
+# by the web UI. Run in a background job; hardened with TLS 1.2 + provider list.
+$script:shortenSb = {
+  param($u)
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $enc = [uri]::EscapeDataString($u)
+  $urls = @(
+    "https://tinyurl.com/api-create.php?url=$enc",
+    "https://is.gd/create.php?format=simple&url=$enc",
+    "https://v.gd/create.php?format=simple&url=$enc",
+    "https://clck.ru/--?url=$enc"
+  )
+  foreach ($x in $urls) {
+    try {
+      $r = Invoke-RestMethod -Uri $x -TimeoutSec 10 -ErrorAction Stop
+      if ($r -and ("$r" -match '^https?://')) { return "$r" }
+    } catch {}
+  }
+  return $null
+}
 function Get-NodeId {
   if (-not [string]::IsNullOrWhiteSpace($env:NODE_ID)) { return $env:NODE_ID }
   if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY)) {
@@ -283,8 +318,10 @@ if ($tunnelUrl -and $myNodeId) {
   Write-Host "(OK) Tunnel URL: $(Show-Url $tunnelUrl)"; $null = [System.Console]::Out.Flush()
   # Write real (unmasked) URL to Step Summary — clickable markdown link
   Write-TunnelSummary $tunnelUrl
-  # Also emit as a GitHub Actions ::notice annotation (appears in the Annotations tab)
-  # and write to GITHUB_OUTPUT so it's accessible from other steps/jobs.
+  # NOTE: a live ::notice annotation (clickable in the Annotations tab / log
+  # while the job runs) is emitted by Write-TunnelNotice once the hyphen-free
+  # short URL is ready below — the full URL cannot be used there (hyphen masking).
+  # Also write to GITHUB_OUTPUT so it's accessible from other steps/jobs.
   if ($env:GITHUB_OUTPUT) {
     "tunnel_url=$tunnelUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
   }
@@ -301,8 +338,7 @@ if ($tunnelUrl -and $myNodeId) {
     )
     ($bannerLines -join "`n") | Set-Content $env:GITHUB_STEP_SUMMARY -Encoding utf8
   }
-  $sb = { param($u) $enc = [uri]::EscapeDataString($u); try { $r = Invoke-RestMethod -Uri "https://tinyurl.com/api-create.php?url=$enc" -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; try { $r = Invoke-RestMethod -Uri ('https://is.gd/create.php?format=simple&url=' + $enc) -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; return $null }
-  $shortUrlJob = Start-Job -ScriptBlock $sb -ArgumentList $tunnelUrl
+  $shortUrlJob = Start-Job -ScriptBlock $script:shortenSb -ArgumentList $tunnelUrl
   Update-NodeWebUrl $myNodeId "$tunnelUrl"
 } elseif ($funnelUrl -and $myNodeId) {
   Write-Host "(OK) Using Tailscale Funnel: $(Show-Url $funnelUrl)"; $null = [System.Console]::Out.Flush()
@@ -322,6 +358,7 @@ if ($shortUrlJob) {
     Write-Host "(OK) Dashboard: $(Show-Url $cachedShortUrl)"
     $null = [System.Console]::Out.Flush()
     Write-TunnelSummary $tunnelUrl $cachedShortUrl
+    Write-TunnelNotice $cachedShortUrl
   }
 }
 
@@ -381,8 +418,7 @@ while ($true) {
         Write-Host "(OK) Tunnel URL found on main-loop retry #${tunnelRetryCount}: $(Show-Url $tunnelUrl)"
         $null = [System.Console]::Out.Flush()
         Write-TunnelSummary $tunnelUrl
-        $sb = { param($u) $enc = [uri]::EscapeDataString($u); try { $r = Invoke-RestMethod -Uri "https://tinyurl.com/api-create.php?url=$enc" -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; try { $r = Invoke-RestMethod -Uri ('https://is.gd/create.php?format=simple&url=' + $enc) -TimeoutSec 10 -ErrorAction Stop; if ($r) { return "$r" } } catch {}; return $null }
-        $shortUrlJob = Start-Job -ScriptBlock $sb -ArgumentList $tunnelUrl
+        $shortUrlJob = Start-Job -ScriptBlock $script:shortenSb -ArgumentList $tunnelUrl
         Update-NodeWebUrl $myNodeId "$tunnelUrl"
       }
     }
@@ -408,6 +444,7 @@ while ($true) {
       Write-Host "(OK) Dashboard: $(Show-Url $cachedShortUrl)"
       $null = [System.Console]::Out.Flush()
       Write-TunnelSummary $tunnelUrl $cachedShortUrl
+      Write-TunnelNotice $cachedShortUrl
     }
   }
 
