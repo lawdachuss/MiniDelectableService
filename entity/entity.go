@@ -66,7 +66,7 @@ func (c *ChannelConfig) Sanitize() {
 		c.Resolution = 2160
 	}
 	if c.MaxDuration == 0 {
-		c.MaxDuration = 60
+		c.MaxDuration = 160
 	}
 	if c.Pattern == "" {
 		c.Pattern = "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"

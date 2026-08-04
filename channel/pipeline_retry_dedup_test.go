@@ -81,6 +81,50 @@ func TestPipelineQueueContainsHash(t *testing.T) {
 	}
 }
 
+// TestEnqueueFileClaimedSkipsInFlightEarlyOut is the regression test for the
+// MoveToOutputDir bug: that path marks a file in-flight BEFORE the move (so
+// the OutputDir watcher skips it) and then enqueues it.  The plain EnqueueFile
+// saw that marker, logged "already uploading, skipping duplicate", and never
+// added the pipeline — so freshly moved recordings were never uploaded until
+// the next restart.
+func TestEnqueueFileClaimedSkipsInFlightEarlyOut(t *testing.T) {
+	oldConfig := server.Config
+	defer func() { server.Config = oldConfig }()
+	server.Config = &entity.Config{}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alice_2025-01-01_12-00-00.mp4")
+	if err := os.WriteFile(path, []byte("video"), 0o666); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	ch := &Channel{
+		Config:   &entity.ChannelConfig{Username: "alice"},
+		LogCh:    make(chan string, 20),
+		UpdateCh: make(chan bool, 1),
+	}
+	pq := NewPipelineQueue(ch)
+
+	// Simulate MoveToOutputDir: the caller claims the file in-flight before
+	// enqueueing it.  EnqueueFileClaimed must STILL accept it.
+	MarkUploadInFlight(path)
+	t.Cleanup(func() { MarkUploadDone(path) })
+	pq.EnqueueFileClaimed(path)
+
+	if got := pq.EnqueuedCount(); got != 1 {
+		t.Fatalf("EnqueueFileClaimed: expected 1 accepted pipeline for a pre-marked file, got %d", got)
+	}
+
+	// The plain EnqueueFile must still treat a pre-marked file as a duplicate
+	// — the early-out is bypassed only by the claimed variant, so ordinary
+	// callers keep their dedup protection.
+	MarkUploadInFlight(filepath.Join(dir, "alice_2025-01-02_13-00-00.mp4"))
+	pq.EnqueueFile(filepath.Join(dir, "alice_2025-01-02_13-00-00.mp4"))
+	if got := pq.EnqueuedCount(); got != 1 {
+		t.Fatalf("EnqueueFile with pre-marked file: expected 1 accepted pipeline total (dedup active), got %d", got)
+	}
+}
+
 // TestPipelineQueueDedup verifies that EnqueueFile drops a duplicate when a
 // pipeline for the same file hash is already queued.  Without this guard, two
 // pipelines for one file would race on the same upload journal and double-add

@@ -381,6 +381,19 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 	return nil
 }
 
+// GetLocalChannels implements coordinator.ChannelManager.
+// Returns the list of usernames of channels active on this node.
+func (m *Manager) GetLocalChannels() []string {
+	var list []string
+	m.Channels.Range(func(key, value interface{}) bool {
+		if username, ok := key.(string); ok {
+			list = append(list, username)
+		}
+		return true
+	})
+	return list
+}
+
 // RemoveChannelForReassignment implements coordinator.ChannelManager.
 // Removes a channel from this node when it's been reassigned to another node.
 func (m *Manager) RemoveChannelForReassignment(username string) error {

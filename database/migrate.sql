@@ -58,11 +58,35 @@ CREATE TABLE IF NOT EXISTS channels (
     max_filesize INTEGER DEFAULT 0,
     compress BOOLEAN DEFAULT FALSE,
     created_at BIGINT NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    -- Channel profile columns (kept in sync with migrate-channel-profiles.sql
+    -- and supabase/migrations/*channel_profiles.sql).  These are written by
+    -- database.Client.SaveChannelProfile and read by the archive site.
+    follower_count      INTEGER        NOT NULL DEFAULT 0,
+    location            TEXT           NOT NULL DEFAULT '',
+    real_name           TEXT           NOT NULL DEFAULT '',
+    body_decorations    TEXT           NOT NULL DEFAULT '',
+    smoke_drink         TEXT           NOT NULL DEFAULT '',
+    body_type           TEXT           NOT NULL DEFAULT '',
+    display_birthday    TEXT           NOT NULL DEFAULT '',
+    display_age         INTEGER        NOT NULL DEFAULT 0,
+    about_me            TEXT           NOT NULL DEFAULT '',
+    wish_list           TEXT           NOT NULL DEFAULT '',
+    fan_club_cost       INTEGER        NOT NULL DEFAULT 0,
+    sex                 TEXT           NOT NULL DEFAULT '',
+    subgender           TEXT           NOT NULL DEFAULT '',
+    interested_in       JSONB          NOT NULL DEFAULT '[]',
+    photo_sets          JSONB          NOT NULL DEFAULT '[]',
+    social_medias       JSONB          NOT NULL DEFAULT '[]',
+    last_broadcast      TEXT           NOT NULL DEFAULT '',
+    room_status         TEXT           NOT NULL DEFAULT '',
+    avatar_url          TEXT           NOT NULL DEFAULT '',
+    profile_scraped_at  TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_channels_username ON channels(username);
 CREATE INDEX IF NOT EXISTS idx_channels_created_at ON channels(created_at);
+CREATE INDEX IF NOT EXISTS idx_channels_profile_scraped_at ON channels(profile_scraped_at DESC);
 
 -- ============================================================================
 -- 2. RECORDINGS

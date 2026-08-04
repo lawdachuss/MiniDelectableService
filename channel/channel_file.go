@@ -546,8 +546,14 @@ func qualityArgsForEncoder(encoder string, quality int) []string {
 func (ch *Channel) MoveToOutputDir(srcPath string) string {
 	// Enqueue the file into the pipeline for thumbnail → upload → metadata → cleanup.
 	// The pipeline handles all lifecycle (semaphore, waitgroup, state persistence).
+	//
+	// EnqueueFileClaimed is used because every path here marks the file
+	// in-flight before enqueueing (to keep the OutputDir watcher from
+	// double-claiming it).  The plain EnqueueFile would see that marker and
+	// drop the enqueue as a "duplicate" — leaving the freshly moved recording
+	// permanently stuck, never uploaded until the next restart.
 	enqueue := func(filePath string) {
-		ch.PipelineQueue.EnqueueFile(filePath)
+		ch.PipelineQueue.EnqueueFileClaimed(filePath)
 	}
 
 	if server.Config == nil || server.Config.OutputDir == "" {
@@ -600,10 +606,6 @@ func resolvePathForLog(path string) string {
 		return abs
 	}
 	return path
-}
-
-func (ch *Channel) generatePreviewAndUpload(filePath string) {
-	ch.PipelineQueue.EnqueueFile(filePath)
 }
 
 // uniqueDestPath returns path if it does not exist, otherwise appends
@@ -831,15 +833,22 @@ func CleanupOrphanedFiles() {
 					return
 				}
 
-				if MaybeDeferToPending(info.path) {
-					_ = stem
-					return
-				}
-				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
-				UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
-				DeleteSidecarFiles(info.path)
+			if MaybeDeferToPending(info.path) {
 				_ = stem
-			}()
+				return
+			}
+			// Never race another flow that owns this file right now (an active
+			// channel pipeline or the OutputDir watcher).  Their in-flight
+			// marker is cleared when they finish; the periodic scan (or the
+			// manual rescan) picks the file back up afterwards.
+			if IsUploadInFlight(info.path) {
+				return
+			}
+			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
+			UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
+			DeleteSidecarFiles(info.path)
+			_ = stem
+		}()
 		}
 
 		// Process orphaned split A/V pairs (mux them first, then upload)
@@ -857,7 +866,7 @@ func CleanupOrphanedFiles() {
 					continue
 				}
 				// No muxed result either — upload the video part on its own.
-				if !MaybeDeferToPending(vInfo.path) {
+				if !MaybeDeferToPending(vInfo.path) && !IsUploadInFlight(vInfo.path) {
 					thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(vInfo.path)
 					UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL)
 				}
@@ -881,7 +890,7 @@ func CleanupOrphanedFiles() {
 				if err := muxVideoAudio(vInfo.path, aInfo.path, muxedPath); err != nil {
 					recoveryLogf(vInfo.name, "recovery: mux failed for %s: %v — uploading video-only", stem, err)
 					// Fall back to uploading just the video track
-					if !MaybeDeferToPending(vInfo.path) {
+					if !MaybeDeferToPending(vInfo.path) && !IsUploadInFlight(vInfo.path) {
 						thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(vInfo.path)
 						UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL)
 					}
@@ -894,10 +903,19 @@ func CleanupOrphanedFiles() {
 				os.Remove(aInfo.path)
 
 				// Generate thumbnails, upload, and clean up
-				if !MaybeDeferToPending(muxedPath) {
-					thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(muxedPath)
-					UploadOrphanedFile(muxedPath, thumbURL, spriteURL, previewURL)
+				if MaybeDeferToPending(muxedPath) {
+					DeleteSidecarFiles(muxedPath)
+					os.Remove(muxedPath)
+					return
 				}
+				// Another flow (watcher/pipeline) already owns the freshly muxed
+				// file — let it finish; never upload or delete it out from
+				// under that upload.
+				if IsUploadInFlight(muxedPath) {
+					return
+				}
+				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(muxedPath)
+				UploadOrphanedFile(muxedPath, thumbURL, spriteURL, previewURL)
 				DeleteSidecarFiles(muxedPath)
 				os.Remove(muxedPath)
 			}()

@@ -624,6 +624,14 @@ func (pq *PipelineQueue) scheduleRetry(p *Pipeline) bool {
 			pq.mu.Unlock()
 			return
 		}
+		// Dedup: if ResumePending (or a prior retry) already re-queued this
+		// same file while we were waiting out the backoff, don't append a
+		// second pipeline that would race the first on the same upload
+		// journal.
+		if pq.containsHash(p.FileHash) {
+			pq.mu.Unlock()
+			return
+		}
 		MarkUploadInFlight(p.FilePath)
 		pq.pipelines = append(pq.pipelines, p)
 		pq.cond.Broadcast()
@@ -875,6 +883,20 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 	ch.SetUploadProgress("", "", 0, 0, 0, 0, 0, "", nil)
 }
 
+// pathQueued returns true if a pipeline for this exact file path is already
+// waiting in the queue (not yet popped by a worker).  Uses the path rather than
+// the hash so the dedup diagnostic can run without hashing a large file.
+func (pq *PipelineQueue) pathQueued(filePath string) bool {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	for _, p := range pq.pipelines {
+		if p.FilePath == filePath {
+			return true
+		}
+	}
+	return false
+}
+
 // containsHash returns true if a pipeline with the given file hash is already
 // waiting in the queue.  Caller must hold pq.mu.
 func (pq *PipelineQueue) containsHash(fileHash string) bool {
@@ -891,6 +913,21 @@ func (pq *PipelineQueue) containsHash(fileHash string) bool {
 
 // EnqueueFile creates a pipeline for a finalized video file and adds it to the queue.
 func (pq *PipelineQueue) EnqueueFile(filePath string) {
+	pq.enqueueFile(filePath, false)
+}
+
+// EnqueueFileClaimed enqueues a file whose in-flight marker has ALREADY been
+// set by the caller.  Used by MoveToOutputDir, which marks the destination
+// in-flight before the move so the OutputDir watcher can never double-claim
+// the freshly relocated recording.  Skipping the IsUploadInFlight early-out
+// is safe because the marker was set by us moments ago and no pipeline for
+// this brand-new path can exist yet; the queue's hash-based duplicate check
+// (containsHash) still drops genuine duplicates.
+func (pq *PipelineQueue) EnqueueFileClaimed(filePath string) {
+	pq.enqueueFile(filePath, true)
+}
+
+func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool) {
 	base := filepath.Base(filePath)
 	if !videoExt(base) || isSidecar(base) {
 		return
@@ -899,8 +936,20 @@ func (pq *PipelineQueue) EnqueueFile(filePath string) {
 	// Dedup: this exact file is already queued or being processed (possibly by
 	// another worker in the pool).  Check before hashing so the second enqueue
 	// of a large file doesn't waste time on FastFileHash.
-	if IsUploadInFlight(filePath) {
-		pq.ch.Warn("pipeline: %s already uploading, skipping duplicate", base)
+	//
+	// alreadyClaimed bypasses the check: the caller set the marker itself (so
+	// the watcher skips the file) and must not have that same marker mistaken
+	// for an existing pipeline — otherwise the recording is never enqueued.
+	if !alreadyClaimed && IsUploadInFlight(filePath) {
+		// Log the actual upload state so dedup issues are diagnosable: if a
+		// marker is set but no pipeline owns the file (not queued, not being
+		// processed), the marker is stale and the file may be stranded until
+		// restart or a manual rescan.
+		inQueue := pq.pathQueued(filePath)
+		beingProcessed := pq.ch.UploadEntry().Filename == base
+		pq.ch.Warn("pipeline: %s already uploading — skipping duplicate "+
+			"(in-queue=%v being-processed=%v in-flight-markers=%d)",
+			base, inQueue, beingProcessed, InFlightCount())
 		return
 	}
 

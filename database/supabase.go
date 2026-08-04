@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -312,6 +313,18 @@ func (c *Client) GetAllChannels() ([]Channel, error) {
 	var channels []Channel
 	err := c.get("/channels?order=created_at.desc&limit=50000", &channels)
 	return channels, err
+}
+
+// ChannelExists reports whether a channel with the given username exists in
+// the channels table, matching case-insensitively (cam-site usernames are
+// case-insensitive, so "Alice" and "alice" are the same channel).
+func (c *Client) ChannelExists(username string) (bool, error) {
+	var channels []Channel
+	err := c.get(fmt.Sprintf("/channels?username=ilike.%s&limit=1", url.QueryEscape(username)), &channels)
+	if err != nil {
+		return false, err
+	}
+	return len(channels) > 0, nil
 }
 
 // DeleteChannel removes a channel
@@ -798,12 +811,13 @@ type Node struct {
 	Hostname        string `json:"hostname"`
 	InstanceLabel   string `json:"instance_label"`
 	SoftwareVersion string `json:"software_version"`
-	Status          string `json:"status"`
-	CurrentLoad     int    `json:"current_load"`
-	LastHeartbeat   string `json:"last_heartbeat,omitempty"`
-	WebURL          string `json:"web_url"`
-	CreatedAt       string `json:"created_at,omitempty"`
-	UpdatedAt       string `json:"updated_at,omitempty"`
+	Status          string     `json:"status"`
+	CurrentLoad     int        `json:"current_load"`
+	LastHeartbeat   string     `json:"last_heartbeat,omitempty"`
+	WebURL          string     `json:"web_url"`
+	SessionDeadline *time.Time `json:"session_deadline,omitempty"`
+	CreatedAt       string     `json:"created_at,omitempty"`
+	UpdatedAt       string     `json:"updated_at,omitempty"`
 }
 
 // UpsertNode registers or updates a node.
@@ -896,6 +910,42 @@ func (c *Client) GetDeadNodes(timeout time.Duration) ([]string, error) {
 	return ids, nil
 }
 
+// GetNodesWithImminentDeadline returns online nodes whose session_deadline is
+// within `window` from now. Used to migrate a node's channels away BEFORE the
+// node is killed (e.g. GitHub's 6-hour runner limit).
+func (c *Client) GetNodesWithImminentDeadline(window time.Duration) ([]Node, error) {
+	cutoff := time.Now().Add(window).UTC().Format(time.RFC3339)
+	var nodes []Node
+	err := c.get(fmt.Sprintf("/nodes?session_deadline=not.is.null&session_deadline=lt.%s&status=eq.online&order=node_id.asc",
+		url.QueryEscape(cutoff)), &nodes)
+	if err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// ReassignChannel atomically moves a channel_assignments row from one node to
+// another via the reassign_channel RPC (SELECT ... FOR UPDATE SKIP LOCKED), so
+// even when several nodes race to migrate the same channel only one wins.
+func (c *Client) ReassignChannel(username, site, fromNode, toNode string) error {
+	body := map[string]interface{}{
+		"p_username":  username,
+		"p_site":      site,
+		"p_from_node": fromNode,
+		"p_to_node":   toNode,
+	}
+	resp, err := c.requestWithRetry("POST", "/rpc/reassign_channel", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	return nil
+}
+
 // ============================================================================
 // CHANNEL ASSIGNMENTS
 // ============================================================================
@@ -932,26 +982,17 @@ type AssignmentStats struct {
 }
 
 // ClaimChannels atomically claims up to `limit` unassigned channels for this node.
-// Returns the rows that were successfully claimed (empty slice if none available).
+// Uses the PostgreSQL claim_channels RPC, which locks candidate rows with
+// SELECT ... FOR UPDATE SKIP LOCKED so two nodes can never claim the same
+// channel concurrently (no TOCTOU between a GET and a PATCH).  Returns the
+// rows that were successfully claimed (empty slice if none available).
 func (c *Client) ClaimChannels(nodeID string, limit int) ([]ChannelAssignment, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
 	body := map[string]interface{}{
-		"assigned_node":  nodeID,
-		"status":         "claimed",
-		"assigned_at":    now,
-		"last_heartbeat": now,
+		"p_node_id": nodeID,
+		"p_limit":   limit,
 	}
 
-	// Claim any unassigned channel regardless of current is_live status.  The
-	// claimed channel is watched by the manager and recorded when it actually
-	// goes live; filtering to is_live=true here would starve claims whenever the
-	// liveness check hasn't run yet (it updates is_live only every ~120s), and
-	// would prevent a node from ever picking up a channel that's offline at claim
-	// time but starts broadcasting later.  Fair-share still prefers releasing
-	// offline channels first (see ReleaseExcessChannels).
-	resp, err := c.requestWithRetry("PATCH",
-		fmt.Sprintf("/channel_assignments?assigned_node=is.null&status=eq.unassigned&order=username.asc&limit=%d", limit),
-		body)
+	resp, err := c.requestWithRetry("POST", "/rpc/claim_channels", body)
 	if err != nil {
 		return nil, err
 	}
@@ -970,20 +1011,18 @@ func (c *Client) ClaimChannels(nodeID string, limit int) ([]ChannelAssignment, e
 }
 
 // ClaimSpecificChannel atomically claims one specific channel for this node.
-// Returns true if the channel was successfully claimed, false if it was already taken.
+// Uses the PostgreSQL claim_specific_channel RPC (SELECT ... FOR UPDATE SKIP
+// LOCKED) to prevent two nodes from claiming the same channel concurrently.
+// Returns true if the channel was successfully claimed, false if it was
+// already taken.
 func (c *Client) ClaimSpecificChannel(username, site, nodeID string) (bool, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
 	body := map[string]interface{}{
-		"assigned_node":  nodeID,
-		"status":         "claimed",
-		"assigned_at":    now,
-		"last_heartbeat": now,
+		"p_username": username,
+		"p_site":     site,
+		"p_node_id":  nodeID,
 	}
 
-	resp, err := c.requestWithRetry("PATCH",
-		fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s&assigned_node=is.null&status=eq.unassigned",
-			url.QueryEscape(username), url.QueryEscape(site)),
-		body)
+	resp, err := c.requestWithRetry("POST", "/rpc/claim_specific_channel", body)
 	if err != nil {
 		return false, err
 	}
@@ -1044,6 +1083,59 @@ func (c *Client) ReleaseExcessChannels(nodeID string, limit int) ([]ChannelAssig
 	// Step 2: PATCH only those specific channels
 	usernames := make([]string, len(target))
 	for i, ca := range target {
+		usernames[i] = ca.Username
+	}
+
+	resp, err := c.requestWithRetry("PATCH",
+		fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&username=in.(%s)",
+			url.QueryEscape(nodeID), joinEscaped(usernames)),
+		map[string]interface{}{
+			"assigned_node": nil,
+			"status":        "unassigned",
+		})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var released []ChannelAssignment
+	if err := json.NewDecoder(resp.Body).Decode(&released); err != nil {
+		return nil, fmt.Errorf("decode released: %w", err)
+	}
+	return released, nil
+}
+
+// ReleaseExcessOfflineChannels releases up to `limit` OFFLINE channels from this
+// node back to unassigned. Unlike ReleaseExcessChannels it NEVER releases a
+// live or recording channel, so a node's in-progress recordings are left alone
+// during fair-share rebalancing. Channels are selected offline-first, then
+// alphabetically, to be deterministic.
+func (c *Client) ReleaseExcessOfflineChannels(nodeID string, limit int) ([]ChannelAssignment, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	// Offline channels only, and exclude any still marked 'recording' (a node may
+	// briefly lag the liveness flag, so this protects a channel that is actually
+	// being recorded from being interrupted).
+	var offline []ChannelAssignment
+	err := c.get(
+		fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&status=neq.unassigned&status=neq.recording&is_live=eq.false&select=username,site&order=username.asc&limit=%d",
+			url.QueryEscape(nodeID), limit), &offline)
+	if err != nil {
+		return nil, err
+	}
+	if len(offline) == 0 {
+		return nil, nil
+	}
+
+	usernames := make([]string, len(offline))
+	for i, ca := range offline {
 		usernames[i] = ca.Username
 	}
 
@@ -1152,38 +1244,88 @@ func (c *Client) GetAllAssignments() ([]ChannelAssignment, error) {
 	return assignments, err
 }
 
+// countRows returns the exact number of rows matching the given PostgREST
+// filter path, using a HEAD request with Prefer: count=exact (the total is
+// returned in the Content-Range header).  This avoids fetching up to 50k rows
+// just to count them and never silently truncates at the fetch limit.
+// Transient failures (5xx, 429, 408, network) are retried so a schema-cache
+// rebuild or blip doesn't abort the caller's cycle.
+func (c *Client) countRows(path string) (int, error) {
+	const maxRetries = 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		n, retryable, err := c.countRowsOnce(path)
+		if err == nil {
+			return n, nil
+		}
+		if !retryable || attempt >= maxRetries-1 {
+			return 0, err
+		}
+		time.Sleep(retryBackoff(attempt))
+	}
+	return 0, fmt.Errorf("count failed after %d attempts", maxRetries)
+}
+
+func (c *Client) countRowsOnce(path string) (int, bool, error) {
+	req, err := http.NewRequest(http.MethodHead, c.URL+"/rest/v1"+path, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	req.Header.Set("apikey", c.APIKey)
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Prefer", "count=exact")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return 0, true, err // transport error — retryable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		return 0, true, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		return 0, false, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// Content-Range: <start>-<end>/<total>  (total is "*" without count=exact)
+	cr := resp.Header.Get("Content-Range")
+	if cr == "" {
+		return 0, false, fmt.Errorf("missing Content-Range header")
+	}
+	idx := strings.LastIndex(cr, "/")
+	if idx < 0 {
+		return 0, false, fmt.Errorf("malformed Content-Range: %s", cr)
+	}
+	total := strings.TrimSpace(cr[idx+1:])
+	if total == "*" {
+		return 0, false, fmt.Errorf("count not provided")
+	}
+	n, err := strconv.Atoi(total)
+	if err != nil {
+		return 0, false, fmt.Errorf("parse Content-Range total %q: %w", total, err)
+	}
+	return n, false, nil
+}
+
 // GetAssignmentStats returns total live channels and total alive nodes for fair-share calculation.
 func (c *Client) GetAssignmentStats() (*AssignmentStats, error) {
 	stats := &AssignmentStats{}
+	var err error
 
-	// Count all channels in the pool (used for informational purposes)
-	var all []ChannelAssignment
-	err := c.get("/channel_assignments?select=username&limit=50000", &all)
-	if err != nil {
+	// Exact counts via HEAD (no 50k-row fetches, no silent truncation).
+	if stats.TotalPoolChannels, err = c.countRows("/channel_assignments"); err != nil {
 		return nil, err
 	}
-	stats.TotalPoolChannels = len(all)
-
-	// Count only live channels for fair-share distribution
-	var live []ChannelAssignment
-	err = c.get("/channel_assignments?is_live=eq.true&select=username&limit=50000", &live)
-	if err != nil {
+	if stats.TotalLiveChannels, err = c.countRows("/channel_assignments?is_live=eq.true"); err != nil {
 		return nil, err
 	}
-	stats.TotalLiveChannels = len(live)
-
-	// Count total unassigned channels
-	var unassigned []ChannelAssignment
-	err = c.get("/channel_assignments?status=eq.unassigned&select=username&limit=50000", &unassigned)
-	if err != nil {
+	if stats.TotalUnassigned, err = c.countRows("/channel_assignments?status=eq.unassigned"); err != nil {
 		return nil, err
 	}
-	stats.TotalUnassigned = len(unassigned)
 
-	// Count nodes with active assignments
+	// Distinct assigned nodes can't be counted via REST, so fetch and dedupe.
 	var assigned []ChannelAssignment
-	err = c.get("/channel_assignments?assigned_node=not.is.null&select=assigned_node&limit=50000", &assigned)
-	if err != nil {
+	if err := c.get("/channel_assignments?assigned_node=not.is.null&select=assigned_node&limit=50000", &assigned); err != nil {
 		return nil, err
 	}
 	assignedNodes := make(map[string]bool)
@@ -1192,7 +1334,6 @@ func (c *Client) GetAssignmentStats() (*AssignmentStats, error) {
 	}
 	stats.TotalAssignedNodes = len(assignedNodes)
 
-	// Count alive nodes
 	aliveNodes, err := c.GetAliveNodes()
 	if err != nil {
 		return nil, err
@@ -1203,46 +1344,51 @@ func (c *Client) GetAssignmentStats() (*AssignmentStats, error) {
 }
 
 // CountMyAssignments returns the number of channels assigned to a node.
-// Uses a count query rather than loading all rows.
+// Uses an exact HEAD count rather than loading all rows.
 func (c *Client) CountMyAssignments(nodeID string) (int, error) {
-	var assignments []ChannelAssignment
-	err := c.get(fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&status=neq.unassigned&select=username&limit=50000",
-		url.QueryEscape(nodeID)), &assignments)
-	if err != nil {
-		return 0, err
-	}
-	return len(assignments), nil
+	return c.countRows(fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&status=neq.unassigned",
+		url.QueryEscape(nodeID)))
 }
 
-// SetChannelsLive bulk-updates is_live=true for the given usernames.
-func (c *Client) SetChannelsLive(usernames []string) error {
-	if len(usernames) == 0 {
+// compositeOrFilter builds a PostgREST or=(and(a.eq.x,b.eq.y),...) filter for a
+// list of composite-key (username, site) pairs.  channel_assignments has a
+// composite primary key (username, site), so filters must address both columns
+// or they would wrongly touch the same username on the other site.
+func compositeOrFilter(pairs [][2]string) string {
+	parts := make([]string, len(pairs))
+	for i, p := range pairs {
+		parts[i] = fmt.Sprintf("and(username.eq.%s,site.eq.%s)",
+			url.QueryEscape(p[0]), url.QueryEscape(p[1]))
+	}
+	return "or=(" + strings.Join(parts, ",") + ")"
+}
+
+// SetChannelsLive bulk-updates is_live=true for the given (username, site)
+// pairs.  Composite filters ensure a same-named channel on the other site is
+// never toggled.
+func (c *Client) SetChannelsLive(pairs [][2]string) error {
+	if len(pairs) == 0 {
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	return c.patch(
-		fmt.Sprintf("/channel_assignments?username=in.(%s)&is_live=eq.false",
-			joinEscaped(usernames)),
+		fmt.Sprintf("/channel_assignments?%s&is_live=eq.false", compositeOrFilter(pairs)),
 		map[string]interface{}{
 			"is_live":         true,
 			"live_checked_at": now,
 		})
 }
 
-// SetChannelsNotLive bulk-updates is_live=false for channels NOT in the given list.
-func (c *Client) SetChannelsNotLive(usernames []string) error {
+// SetChannelsNotLive bulk-updates is_live=false for every channel EXCEPT the
+// given (username, site) pairs.  An empty pair list marks the whole pool
+// not-live.
+func (c *Client) SetChannelsNotLive(pairs [][2]string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	if len(usernames) == 0 {
-		// Mark all as not live
-		return c.patch("/channel_assignments?is_live=eq.true",
-			map[string]interface{}{
-				"is_live":         false,
-				"live_checked_at": now,
-			})
+	filter := "/channel_assignments?is_live=eq.true"
+	if len(pairs) > 0 {
+		filter = "/channel_assignments?not." + compositeOrFilter(pairs) + "&is_live=eq.true"
 	}
-	return c.patch(
-		fmt.Sprintf("/channel_assignments?username=not.in.(%s)&is_live=eq.true",
-			joinEscaped(usernames)),
+	return c.patch(filter,
 		map[string]interface{}{
 			"is_live":         false,
 			"live_checked_at": now,

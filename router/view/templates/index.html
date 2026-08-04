@@ -91,6 +91,15 @@
             transition: all 0.2s ease;
         }
         .btn-secondary:hover { background: rgba(255,255,255,0.08); color: #e4e4e7; border-color: rgba(255,255,255,0.15); }
+        /* Realtime duplicate-channel checker in the Add Channel dialog */
+        .add-check {
+            min-height: 16px; font-size: 11px; font-weight: 500; margin-top: 8px;
+            padding: 4px 10px; border-radius: 8px; display: none;
+        }
+        .add-check.ok { display: block; background: rgba(16,185,129,0.1); color: #10b981; border: 1px solid rgba(16,185,129,0.2); }
+        .add-check.exists { display: block; background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
+        .add-check.checking { display: block; background: rgba(255,255,255,0.04); color: #9ca3af; border: 1px solid rgba(255,255,255,0.08); }
+        html:not(.dark) .add-check.checking { background: rgba(0,0,0,0.03); color: #71717a; border-color: var(--border-color); }
         .dialog-overlay { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; }
         .section-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: #3f3f46; }
 
@@ -682,8 +691,8 @@
 </dialog>
 
 <!-- ═══════════════════ ADD CHANNEL DIALOG ═══════════════════ -->
-<dialog id="create-dialog" class="text-zinc-100 rounded-2xl w-full max-w-[540px] max-h-[90vh] overflow-y-auto p-0 border-0 shadow-2xl" style="background:#12121a;border:1px solid rgba(255,255,255,0.08)">
-    <form action="/create_channel" method="POST">
+<dialog id="create-dialog" class="text-zinc-100 rounded-2xl w-full max-w-[540px] max-h-[90vh] overflow-y-auto p-0 border-0 shadow-2xl" style="background:#12121a;border:1px solid rgba(255,255,255,0.08)" onclose="resetAddChannelCheck()">
+    <form action="/create_channel" method="POST" onsubmit="return allowAddChannelSubmit()">
         <!-- Header -->
         <div class="flex items-center justify-between px-4 sm:px-6 py-5" style="border-bottom:1px solid rgba(255,255,255,0.06)">
             <div class="flex items-center gap-3">
@@ -702,7 +711,7 @@
             <!-- Site -->
             <div>
                 <label class="block text-xs font-semibold text-zinc-400 mb-2 uppercase tracking-wider">Site</label>
-                <select name="site" id="add-channel-site" class="input-field select-field" onchange="updateDomainPrefix()">
+                <select name="site" id="add-channel-site" class="input-field select-field" onchange="updateDomainPrefix(); checkAddChannel()">
                     <option value="chaturbate">Chaturbate</option>
                     <option value="stripchat">Stripchat</option>
                 </select>
@@ -713,10 +722,11 @@
                 <label class="block text-xs font-semibold text-zinc-400 mb-2 uppercase tracking-wider">Channel Username</label>
                 <div class="flex rounded-xl overflow-hidden" style="border:1px solid rgba(255,255,255,0.08)">
                     <span id="domain-prefix" class="flex items-center px-3 text-[11px] text-zinc-600 shrink-0" style="background:rgba(255,255,255,0.03);border-right:1px solid rgba(255,255,255,0.08)">{{ .Config.Domain }}</span>
-                    <input type="text" name="username" autofocus required
+                    <input type="text" name="username" id="add-channel-username" autofocus required
                            class="flex-1 bg-transparent px-3 py-2.5 text-sm text-zinc-200 focus:outline-none placeholder-zinc-700"
-                           placeholder="username" />
+                           placeholder="username" oninput="checkAddChannel()" />
                 </div>
+                <div id="add-channel-check" class="add-check"></div>
                 <p class="text-[11px] text-zinc-600 mt-1.5">Comma-separate multiple usernames to add them all at once.</p>
             </div>
 
@@ -788,7 +798,7 @@
 
         <div class="flex justify-end gap-2 px-4 sm:px-6 pb-5">
             <button type="button" onclick="this.closest('dialog').close()" class="btn-secondary">Cancel</button>
-            <button type="submit" class="btn-primary flex items-center gap-2">
+            <button type="submit" id="add-channel-submit" class="btn-primary flex items-center gap-2">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M12 5v14m-7-7h14"/></svg>
                 Add Channel
             </button>
@@ -1738,6 +1748,114 @@ function updateDomainPrefix() {
     } else {
         prefix.textContent = '{{ .Config.Domain }}';
     }
+}
+
+// ── Realtime duplicate-channel checker (uses /api/pool/check) ────────────────
+var addCheckTimer = null;
+var addCheckSeq = 0;
+var addCheckHasDup = false;
+var addCheckInFlight = false;
+
+// Reset the checker state when the dialog closes so reopening it never shows
+// a stale "already exists" message or a disabled submit button.
+function resetAddChannelCheck() {
+    clearTimeout(addCheckTimer);
+    addCheckSeq++;
+    addCheckInFlight = false;
+    addCheckHasDup = false;
+    var status = document.getElementById('add-channel-check');
+    var submit = document.getElementById('add-channel-submit');
+    if (status) { status.className = 'add-check'; status.textContent = ''; }
+    if (submit) submit.disabled = false;
+}
+
+function checkAddChannel() {
+    var input = document.getElementById('add-channel-username');
+    var status = document.getElementById('add-channel-check');
+    var submit = document.getElementById('add-channel-submit');
+    if (!input || !status || !submit) return;
+
+    var names = input.value.split(',').map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+    clearTimeout(addCheckTimer);
+    addCheckSeq++;
+    addCheckInFlight = true;
+
+    if (names.length === 0) {
+        addCheckInFlight = false;
+        addCheckHasDup = false;
+        status.className = 'add-check';
+        status.textContent = '';
+        submit.disabled = false;
+        return;
+    }
+
+    status.className = 'add-check checking';
+    status.textContent = 'Checking\u2026';
+    submit.disabled = true;
+
+    addCheckTimer = setTimeout(function() {
+        var seq = addCheckSeq;
+        var site = document.getElementById('add-channel-site').value;
+        var state = { dups: [], errors: 0, done: 0, total: names.length };
+
+        function finishAddCheck() {
+            if (seq !== addCheckSeq) return;
+            if (state.done < state.total) return;
+            addCheckInFlight = false;
+            if (state.dups.length > 0) {
+                addCheckHasDup = true;
+                status.className = 'add-check exists';
+                status.textContent = '\u26a0 ' + state.dups.join(', ') +
+                    (state.dups.length > 1 ? ' already exist \u2014 add skipped' : ' already exists \u2014 add skipped');
+                submit.disabled = true;
+            } else if (state.errors > 0) {
+                // Checker unavailable \u2014 don't block the user.
+                addCheckHasDup = false;
+                status.className = 'add-check';
+                status.textContent = '';
+                submit.disabled = false;
+            } else {
+                addCheckHasDup = false;
+                status.className = 'add-check ok';
+                status.textContent = '\u2713 Available \u2014 channel will be added';
+                submit.disabled = false;
+            }
+        }
+
+        names.forEach(function(name) {
+            // Timeout so a hung request can never leave the dialog locked.
+            var ctrl = new AbortController();
+            var t = setTimeout(function() { ctrl.abort(); }, 5000);
+            fetch('/api/pool/check?username=' + encodeURIComponent(name) + '&site=' + encodeURIComponent(site), { signal: ctrl.signal })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (seq !== addCheckSeq) return;
+                    clearTimeout(t);
+                    state.done++;
+                    if (data.exists) state.dups.push(name);
+                    finishAddCheck();
+                })
+                .catch(function() {
+                    if (seq !== addCheckSeq) return;
+                    clearTimeout(t);
+                    state.done++;
+                    state.errors++;
+                    finishAddCheck();
+                });
+        });
+    }, 350);
+}
+
+// Block native form submission if a check is pending or the last one flagged a
+// duplicate. (Pressing Enter submits even when the submit button is disabled,
+// so the onsubmit guard re-validates before letting the form through.)
+function allowAddChannelSubmit() {
+    if (addCheckInFlight) return false; // check running \u2014 status line shows why
+    if (addCheckHasDup) {
+        checkAddChannel();
+        return false;
+    }
+    return true;
 }
 </script>
 

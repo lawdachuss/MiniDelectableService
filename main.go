@@ -755,8 +755,13 @@ func (l *liveChecker) IsLive(ctx context.Context, siteName, username string) boo
 func startTunnel(port string) {
 	cloudflaredPath, err := exec.LookPath("cloudflared")
 	if err != nil {
-		fmt.Println("💡 Install cloudflared (winget install Cloudflare.cloudflared) for a public tunnel URL")
-		return
+		// Check for a cached cloudflared binary.
+		if p := config.CachedCloudflaredBin(); p != "" {
+			cloudflaredPath = p
+		} else {
+			fmt.Println("💡 Install cloudflared (winget install Cloudflare.cloudflared) for a public tunnel URL")
+			return
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

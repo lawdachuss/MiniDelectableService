@@ -22,7 +22,9 @@ SUPABASE_API_KEY="your-anon-key"
 
 In Supabase SQL Editor, run:
 ```sql
--- See database/migrate.sql for full schema
+-- See database/migrate-combined.sql (recommended: single run, safe on fresh
+-- AND existing databases) or database/migrate.sql (fresh installs only — it
+-- DROPS all existing data)
 ```
 
 The `app_settings` table stores cookies under key `dvr_settings`.
@@ -243,6 +245,8 @@ COOKIES="your_cookies"
 
 ## References
 
-- `database/migrate.sql` - Full database schema
+- `database/migrate-combined.sql` - **Recommended.** Single-run, non-destructive full schema + profile columns + multi-instance bootstrap (safe on fresh and existing databases)
+- `database/migrate.sql` - Full schema for fresh installs only (drops all existing data)
+- `database/migrate-channel-profiles.sql` - Profile columns migration (already included in the combined script)
 - `server/config.go` - Cookie load/save logic
 - `server/db.go` - Supabase integration

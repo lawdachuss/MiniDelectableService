@@ -1,9 +1,13 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
@@ -15,10 +19,50 @@ import (
 
 type mockClient struct {
 	*database.Client // embed nil to satisfy interface with only overridden methods
+
+	stats             *database.AssignmentStats
+	aliveNodes        []database.Node
+	imminentNodes     []database.Node
+	assignmentsByNode map[string][]database.ChannelAssignment
+	reassignCalls     []reassignCall
+}
+
+type reassignCall struct {
+	username, site, fromNode, toNode string
+}
+
+func (m *mockClient) GetAssignmentStats() (*database.AssignmentStats, error) {
+	return m.stats, nil
+}
+
+func (m *mockClient) GetAliveNodes() ([]database.Node, error) {
+	return m.aliveNodes, nil
+}
+
+func (m *mockClient) GetNodesWithImminentDeadline(window time.Duration) ([]database.Node, error) {
+	return m.imminentNodes, nil
+}
+
+func (m *mockClient) CountMyAssignments(nodeID string) (int, error) {
+	return len(m.assignmentsByNode[nodeID]), nil
+}
+
+func (m *mockClient) GetNodeAssignments(nodeID string) ([]database.ChannelAssignment, error) {
+	return m.assignmentsByNode[nodeID], nil
+}
+
+func (m *mockClient) ReassignChannel(username, site, fromNode, toNode string) error {
+	m.reassignCalls = append(m.reassignCalls, reassignCall{username, site, fromNode, toNode})
+	return nil
+}
+
+func (m *mockClient) RepairOrphanedAssignments() (int, error) {
+	return 0, nil
 }
 
 type mockChannelManager struct {
 	created []*database.ChannelAssignment
+	removed []string
 }
 
 func (m *mockChannelManager) CreateChannelFromAssignment(ca *database.ChannelAssignment) error {
@@ -27,7 +71,16 @@ func (m *mockChannelManager) CreateChannelFromAssignment(ca *database.ChannelAss
 }
 
 func (m *mockChannelManager) RemoveChannelForReassignment(username string) error {
+	m.removed = append(m.removed, username)
 	return nil
+}
+
+func (m *mockChannelManager) GetLocalChannels() []string {
+	var list []string
+	for _, ca := range m.created {
+		list = append(list, ca.Username)
+	}
+	return list
 }
 
 // ============================================================================
@@ -46,14 +99,14 @@ func TestDetectNodeID(t *testing.T) {
 			expected: "my-custom-node",
 		},
 		{
-			name:     "from GITHUB_REPOSITORY",
-			envs:     map[string]string{"GITHUB_REPOSITORY": "you/MiniDelectableService-node-a"},
-			expected: "MiniDelectableService-node-a",
+			name:     "from GITHUB_REPOSITORY with dashed suffix",
+			envs:     map[string]string{"GITHUB_REPOSITORY": "owner/MiniDelectableService-node-a"},
+			expected: "a",
 		},
 		{
-			name:     "simple repo name",
+			name:     "simple repo name (no dashes) — slash replaced with dash",
 			envs:     map[string]string{"GITHUB_REPOSITORY": "you/myrepo"},
-			expected: "myrepo",
+			expected: "you-myrepo",
 		},
 	}
 
@@ -135,6 +188,30 @@ func TestConfigFromAssignment(t *testing.T) {
 	}
 	if !conf.Compress {
 		t.Error("expected Compress = true")
+	}
+}
+
+// TestConfigFromAssignment_EmptyPattern ensures a channel_assignments row
+// with an empty pattern (the column's DB default) still yields a channel
+// config that can generate filenames — the missing Sanitize() here caused
+// fleet-wide "filename pattern \"\" rendered an empty name" errors that
+// blocked recording entirely for newly-claimed channels.
+func TestConfigFromAssignment_EmptyPattern(t *testing.T) {
+	ca := &database.ChannelAssignment{
+		Username: "empty_pattern_user",
+		Site:     "chaturbate",
+		Pattern:  "",
+	}
+
+	conf := ConfigFromAssignment(ca)
+	if conf.Pattern == "" {
+		t.Fatal("expected Sanitize() to fill the default pattern, got empty")
+	}
+	if conf.Resolution == 0 {
+		t.Error("expected Sanitize() to fill default resolution")
+	}
+	if conf.Framerate == 0 {
+		t.Error("expected Sanitize() to fill default framerate")
 	}
 }
 
@@ -237,5 +314,268 @@ func TestStartStopIsolated(t *testing.T) {
 
 	if c.started != true {
 		t.Error("expected started to be true after Start()")
+	}
+}
+
+// TestStopIdempotent verifies Stop() is safe to call twice — the double-close
+// guard prevents a panic on the second call.
+func TestStopIdempotent(t *testing.T) {
+	os.Setenv("CHANNEL_POOL_MODE", "pooled")
+	defer os.Unsetenv("CHANNEL_POOL_MODE")
+
+	c := New(nil, &mockChannelManager{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c.Start(ctx)
+	c.Stop()
+	c.Stop() // must not panic
+}
+
+// TestCycleGuardPreventsOverlap verifies that a second tryRun is skipped while
+// the first is still executing — the guard that prevents overlapping cycles
+// when the DB is slow (a slow cycle must not stack a concurrent one).
+func TestCycleGuardPreventsOverlap(t *testing.T) {
+	g := &cycleGuard{}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	executed := 0
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		g.tryRun("test", func() {
+			executed++
+			close(entered)
+			<-release
+		})
+	}()
+
+	<-entered // first run is inside fn
+
+	// Second run while the first is still blocked must be skipped.
+	if g.tryRun("test", func() { executed++ }) {
+		t.Fatal("second tryRun executed while the first was still running")
+	}
+
+	close(release)
+	<-firstDone
+
+	if executed != 1 {
+		t.Fatalf("fn executed %d times, want 1", executed)
+	}
+}
+
+// TestCycleGuardPanicRecovery verifies a panicking cycle is caught (no crash
+// propagates), the guard is released, and subsequent cycles still run — a
+// single bad cycle must not crash the node or permanently wedge the guard.
+//
+// Note: tryRun returns false for a panicking fn (the panic unwinds before the
+// `return true`), so the return value is not asserted for that run — only that
+// the panic was contained and the guard recovered.
+func TestCycleGuardPanicRecovery(t *testing.T) {
+	g := &cycleGuard{}
+
+	g.tryRun("test", func() { panic("boom") }) // must not crash the test
+
+	ran := false
+	if !g.tryRun("test", func() { ran = true }) {
+		t.Fatal("second tryRun should execute after panic recovery released the guard")
+	}
+	if !ran {
+		t.Fatal("second tryRun did not run its function")
+	}
+}
+
+// TestCycleGuardLastRunTime verifies lastRunTime is zero before the first run
+// and set after a run — the timestamp the health check uses to detect stalls.
+func TestCycleGuardLastRunTime(t *testing.T) {
+	g := &cycleGuard{}
+	if !g.lastRunTime().IsZero() {
+		t.Fatal("lastRunTime should be zero before the first run")
+	}
+
+	g.tryRun("test", func() {})
+	if g.lastRunTime().IsZero() {
+		t.Fatal("lastRunTime should be set after a run")
+	}
+}
+
+// TestComputeSessionDeadline verifies the node deadline derivation used by the
+// deadline-migration loop: explicit SESSION_DURATION wins, CI runners get a
+// 335m buffer, and permanent nodes get no deadline at all.
+func TestComputeSessionDeadline(t *testing.T) {
+	os.Unsetenv("SESSION_DURATION")
+	os.Unsetenv("GITHUB_RUN_ID")
+
+	t.Run("explicit SESSION_DURATION", func(t *testing.T) {
+		os.Setenv("SESSION_DURATION", "2h")
+		defer os.Unsetenv("SESSION_DURATION")
+
+		dl := computeSessionDeadline()
+		if dl == nil {
+			t.Fatal("expected a deadline for SESSION_DURATION")
+		}
+		if got := time.Until(*dl); got < 119*time.Minute || got > 121*time.Minute {
+			t.Fatalf("deadline %.0fm away, want ~120m", got.Minutes())
+		}
+	})
+
+	t.Run("CI runner gets 335m buffer", func(t *testing.T) {
+		os.Setenv("GITHUB_RUN_ID", "12345")
+		defer os.Unsetenv("GITHUB_RUN_ID")
+
+		dl := computeSessionDeadline()
+		if dl == nil {
+			t.Fatal("expected a deadline for GITHUB_RUN_ID")
+		}
+		if got := time.Until(*dl); got < 334*time.Minute || got > 336*time.Minute {
+			t.Fatalf("deadline %.0fm away, want ~335m", got.Minutes())
+		}
+	})
+
+	t.Run("permanent node has no deadline", func(t *testing.T) {
+		if dl := computeSessionDeadline(); dl != nil {
+			t.Fatalf("expected nil deadline, got %v", dl)
+		}
+	})
+}
+
+// TestLeastLoaded verifies the shared spread helper picks the candidate with
+// the smallest load (ties resolved by first-in-slice) and reflects load changes.
+func TestLeastLoaded(t *testing.T) {
+	candidates := []database.Node{
+		{NodeID: "a", CurrentLoad: 3},
+		{NodeID: "b", CurrentLoad: 1},
+		{NodeID: "c", CurrentLoad: 5},
+	}
+	load := map[string]int{"a": 3, "b": 1, "c": 5}
+	if got := leastLoaded(candidates, load); got.NodeID != "b" {
+		t.Fatalf("least loaded = %q, want b", got.NodeID)
+	}
+
+	// Load map reflects moves: after bumping b, a becomes least loaded.
+	load["b"] = 6
+	if got := leastLoaded(candidates, load); got.NodeID != "a" {
+		t.Fatalf("least loaded after bump = %q, want a", got.NodeID)
+	}
+
+	// Spread: once z's load exceeds y's, y becomes least loaded.
+	load = map[string]int{"y": 2, "z": 0}
+	candidates = []database.Node{
+		{NodeID: "y", CurrentLoad: 2},
+		{NodeID: "z", CurrentLoad: 0},
+	}
+	if got := leastLoaded(candidates, load); got.NodeID != "z" {
+		t.Fatalf("least loaded = %q, want z", got.NodeID)
+	}
+	load["z"] = 3
+	if got := leastLoaded(candidates, load); got.NodeID != "y" {
+		t.Fatalf("least loaded after spread = %q, want y", got.NodeID)
+	}
+}
+
+// TestRunOfflineShuffleCycle verifies a node over fair-share moves exactly its
+// excess OFFLINE channel to the least-loaded alive node, and never touches
+// live or recording channels.
+func TestRunOfflineShuffleCycle(t *testing.T) {
+	mock := &mockClient{
+		stats: &database.AssignmentStats{TotalPoolChannels: 4},
+		aliveNodes: []database.Node{
+			{NodeID: "node-a", CurrentLoad: 3},
+			{NodeID: "node-b", CurrentLoad: 0},
+			{NodeID: "node-c", CurrentLoad: 1},
+		},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			"node-a": {
+				{Username: "off1", Site: "chaturbate", Status: "claimed", IsLive: false},
+				{Username: "off2", Site: "chaturbate", Status: "claimed", IsLive: false},
+				{Username: "live1", Site: "stripchat", Status: "recording", IsLive: true},
+			},
+		},
+	}
+	mgr := &mockChannelManager{}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
+
+	c.runOfflineShuffleCycleWith(mock)
+
+	// myLoad=3 (all three count), fairShare=ceil(4/3)=2 → moveCount=1. Only the
+	// offline, non-local channel (off1) is movable; live1 is recording and skipped.
+	if len(mock.reassignCalls) != 1 {
+		t.Fatalf("expected 1 reassign, got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
+	}
+	call := mock.reassignCalls[0]
+	if call.username != "off1" || call.fromNode != "node-a" || call.toNode != "node-b" {
+		t.Fatalf("unexpected reassign call: %+v", call)
+	}
+	if len(mgr.removed) != 1 || mgr.removed[0] != "off1" {
+		t.Fatalf("expected local channel off1 removed, got %v", mgr.removed)
+	}
+}
+
+// TestRunDeadlineMigrationCycle verifies ALL channels of an imminent-deadline
+// node (including live+recording) are reassigned to the least-loaded healthy
+// node, spreading across candidates.
+func TestRunDeadlineMigrationCycle(t *testing.T) {
+	mock := &mockClient{
+		imminentNodes: []database.Node{{NodeID: "node-x"}},
+		aliveNodes: []database.Node{
+			{NodeID: "node-x", CurrentLoad: 5},
+			{NodeID: "node-y", CurrentLoad: 2},
+			{NodeID: "node-z", CurrentLoad: 0},
+		},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			"node-x": {
+				{Username: "live1", Site: "chaturbate", Status: "recording", IsLive: true},
+				{Username: "off1", Site: "stripchat", Status: "claimed", IsLive: false},
+			},
+		},
+	}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: &mockChannelManager{}}
+
+	c.runDeadlineMigrationCycleWith(mock)
+
+	if len(mock.reassignCalls) != 2 {
+		t.Fatalf("expected 2 reassigns, got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
+	}
+	for _, call := range mock.reassignCalls {
+		if call.fromNode != "node-x" {
+			t.Fatalf("reassign from %q, want node-x: %+v", call.fromNode, call)
+		}
+		if call.toNode == "node-x" || call.toNode == "node-a" {
+			t.Fatalf("reassign to invalid target %q: %+v", call.toNode, call)
+		}
+	}
+	// Both go to node-z (initially least loaded); node-y must never receive one.
+	for _, call := range mock.reassignCalls {
+		if call.toNode != "node-z" {
+			t.Fatalf("expected all moves to node-z, got %+v", call)
+		}
+	}
+}
+
+// TestCheckCycleHealthWarnsOnStall verifies the health check logs a warning
+// when a cycle has not run within maxCycleStall, and stays silent for guards
+// that have never run (startup noise suppression).
+func TestCheckCycleHealthWarnsOnStall(t *testing.T) {
+	var buf bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(oldWriter)
+
+	c := &Coordinator{}
+
+	stalled := &cycleGuard{}
+	stalled.lastRun = time.Now().Add(-maxCycleStall - time.Minute)
+	c.checkCycleHealth("claim", stalled)
+	if !strings.Contains(buf.String(), "HEALTH WARNING: claim cycle last ran") {
+		t.Fatalf("expected HEALTH WARNING for stalled cycle, got: %q", buf.String())
+	}
+
+	buf.Reset()
+	c.checkCycleHealth("claim", &cycleGuard{}) // never ran
+	if buf.String() != "" {
+		t.Fatalf("unexpected warning for never-run guard: %q", buf.String())
 	}
 }

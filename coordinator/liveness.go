@@ -15,27 +15,31 @@ func (c *Coordinator) StartLiveCheckLoop(ctx context.Context) {
 		return
 	}
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	const name = "live-check"
+	const interval = 120 * time.Second
 
+	c.runLoopWithRestart(ctx, name, interval, func(stopCh <-chan struct{}, tickerC <-chan time.Time) {
 		// Random initial delay (0-30s) to prevent thundering herd
-		time.Sleep(time.Duration(rand.Intn(30)) * time.Second)
-
-		ticker := time.NewTicker(120 * time.Second)
-		defer ticker.Stop()
+		randDelay := time.Duration(rand.Intn(30)) * time.Second
+		select {
+		case <-time.After(randDelay):
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		}
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-c.stopCh:
+			case <-stopCh:
 				return
-			case <-ticker.C:
-				c.runLiveCheck()
+			case <-tickerC:
+				c.cycleGuardLiveCheck.tryRun(name, c.runLiveCheck)
 			}
 		}
-	}()
+	})
 }
 
 // runLiveCheck checks all channels in the pool and updates their is_live status.
@@ -54,24 +58,26 @@ func (c *Coordinator) runLiveCheck() {
 		return
 	}
 
-	// Check liveness for each channel
-	var liveUsernames []string
+	// Check liveness for each channel.  Pairs are (username, site) because the
+	// channel_assignments primary key is composite — a username alone can exist
+	// on both sites and must not be toggled together.
+	var livePairs [][2]string
 	for _, ca := range assignments {
 		if c.LiveCheck.IsLive(ctx, ca.Site, ca.Username) {
-			liveUsernames = append(liveUsernames, ca.Username)
+			livePairs = append(livePairs, [2]string{ca.Username, ca.Site})
 		}
 	}
 
 	// Bulk-update is_live flags
-	if len(liveUsernames) > 0 {
-		if err := c.Client.SetChannelsLive(liveUsernames); err != nil {
+	if len(livePairs) > 0 {
+		if err := c.Client.SetChannelsLive(livePairs); err != nil {
 			log.Printf("[coordinator] live check: set live error: %v", err)
 		}
-		if err := c.Client.SetChannelsNotLive(liveUsernames); err != nil {
+		if err := c.Client.SetChannelsNotLive(livePairs); err != nil {
 			log.Printf("[coordinator] live check: set not live error: %v", err)
 		}
 	} else {
-		if err := c.Client.SetChannelsNotLive([]string{}); err != nil {
+		if err := c.Client.SetChannelsNotLive(nil); err != nil {
 			log.Printf("[coordinator] live check: set all not live error: %v", err)
 		}
 	}

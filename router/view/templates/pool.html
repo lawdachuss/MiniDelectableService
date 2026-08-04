@@ -56,9 +56,15 @@
             display: flex; align-items: center; justify-content: space-between;
             margin-bottom: 28px; padding-bottom: 16px;
             border-bottom: 1px solid var(--border-color);
-        }
-        .header h1 { font-family: 'Outfit', sans-serif; font-weight: 800; font-size: 22px; margin: 0; }
-        .nav-links { display: flex; gap: 12px; align-items: center; }
+        }		.header h1 { font-family: 'Outfit', sans-serif; font-weight: 800; font-size: 22px; margin: 0; display: flex; align-items: center; gap: 10px; }
+		.mode-badge {
+			font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+			padding: 3px 10px; border-radius: 6px;
+			background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.25);
+			vertical-align: middle;
+		}
+		.mode-badge.pooled { background: rgba(59,130,246,0.12); color: #3b82f6; border-color: rgba(59,130,246,0.25); }
+		.nav-links { display: flex; gap: 12px; align-items: center; }
         .nav-links a {
             font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 8px;
             background: var(--bg-input); border: 1px solid var(--border-subtle);
@@ -89,9 +95,12 @@
             border-radius: 4px; text-transform: uppercase; letter-spacing: 0.04em;
         }
         .status-badge.live { background: rgba(16,185,129,0.15); color: #10b981; }
-        .status-badge.claimed { background: rgba(59,130,246,0.15); color: #3b82f6; }
-        .status-badge.unassigned { background: rgba(245,158,11,0.15); color: #f59e0b; }
-        .status-badge.offline { background: rgba(113,113,122,0.12); color: #71717a; }
+        .status-badge.claimed { background: rgba(59,130,246,0.15); color: #3b82f6; }		.status-badge.unassigned { background: rgba(245,158,11,0.15); color: #f59e0b; }
+		.status-badge.paused { background: rgba(245,158,11,0.15); color: #f59e0b; }
+		.status-badge.connecting { background: rgba(59,130,246,0.15); color: #3b82f6; }
+		.status-badge.offline { background: rgba(113,113,122,0.12); color: #71717a; }
+		.status-badge.local { background: rgba(139,92,246,0.14); color: #a78bfa; }
+		.status-badge.pool { background: rgba(59,130,246,0.12); color: #60a5fa; }
         .mono { font-family: ui-monospace, monospace; font-size: 11px; }
         .empty-state { padding: 24px; text-align: center; color: var(--text-muted); font-size: 12px; }
         .btn-action {
@@ -103,9 +112,8 @@
         .btn-action-del:hover { background: rgba(239,68,68,0.2); color: #ef4444; }
         .add-form {
             display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
-            padding: 12px; background: var(--bg-card); border: 1px solid var(--border-color);
-            border-radius: 12px; margin-bottom: 16px;
-        }
+            padding: 12px; background: var(--bg-card); border: 1px solid var(--border-color);			border-radius: 12px; margin-bottom: 2px;
+		}
         .add-form input, .add-form select {
             padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border-color);
             background: var(--bg-input); color: var(--text-primary); font-size: 12px;
@@ -115,14 +123,24 @@
             padding: 6px 14px; border-radius: 6px; border: none;
             background: var(--accent); color: #fff; font-size: 12px; font-weight: 600;
             cursor: pointer;
-        }
-        .add-form button:hover { opacity: 0.85; }
+        }		.add-form button:hover:not(:disabled) { opacity: 0.85; transform: translateY(-1px); }
+		.add-form button:disabled { opacity: 0.45; cursor: not-allowed; }
+		.check-status {
+			min-height: 18px; margin: 4px 0 14px 0; font-size: 11px; font-weight: 500;
+			padding: 4px 12px; border-radius: 8px; display: flex; align-items: center; gap: 6px;
+		}
+		.check-status:empty { padding: 0; margin: 0 0 14px 0; min-height: 0; }
+		.check-status.ok { background: rgba(16,185,129,0.1); color: #10b981; border: 1px solid rgba(16,185,129,0.2); }
+		.check-status.exists { background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
+		.check-status.checking { background: var(--bg-input); color: var(--text-muted); border: 1px solid var(--border-color); }
     </style>
 </head>
 <body>
 <div class="layout">
-    <div class="header">
-        <h1>Channel Pool</h1>
+    <div class="header">		<h1>
+			Channel Pool
+			{{ if eq .Mode "pooled" }}<span class="mode-badge pooled">● Pooled</span>{{ else }}<span class="mode-badge">● Isolated</span>{{ end }}
+		</h1>
         <div class="nav-links">
             <a href="/">← Dashboard</a>
             <a href="/admin">Admin</a>
@@ -133,35 +151,34 @@
         </div>
     </div>
 
-    <div class="add-form">
-        <select id="pool-site">
-            <option value="chaturbate">Chaturbate</option>
-            <option value="stripchat">Stripchat</option>
-        </select>
-        <input type="text" id="pool-username" placeholder="Username" />
+    <div class="add-form">		<select id="pool-site" onchange="checkPoolChannel()">
+			<option value="chaturbate">Chaturbate</option>
+			<option value="stripchat">Stripchat</option>
+		</select>
+		<input type="text" id="pool-username" placeholder="Username" autocomplete="off" spellcheck="false" oninput="checkPoolChannel()" />
         <select id="pool-resolution">
-            <option value="2160">4K — 2160p</option>
-            <option value="1440" selected>2K — 1440p</option>
+            <option value="2160" selected>4K — 2160p</option>
+            <option value="1440">2K — 1440p</option>
             <option value="1080">FHD — 1080p</option>
             <option value="720">HD — 720p</option>
         </select>
         <select id="pool-framerate">
             <option value="60" selected>60 FPS</option>
             <option value="30">30 FPS</option>
-        </select>
-        <button onclick="addToPool()">Add to Pool</button>
-    </div>
+        </select>		<button id="pool-add-btn" onclick="addToPool()">Add to Pool</button>
+	</div>
+	<div id="pool-check-status" class="check-status"></div>
 
-    {{ if .Assignments }}
-    <div class="section">
-        <h2 class="section-title">Assignments <span class="count">{{ len .Assignments }}</span></h2>
+	{{ if .Entries }}
+	<div class="section">
+		<h2 class="section-title">Channels <span class="count">{{ len .Entries }}</span></h2>
         <div class="table-wrap">
             <table>
-                <thead>
-                    <tr>
-                        <th>Channel</th>
-                        <th>Site</th>
-                        <th>Node</th>
+                <thead>					<tr>
+						<th>Channel</th>
+						<th>Site</th>
+						<th>Source</th>
+						<th>Node</th>
                         <th>Status</th>
                         <th>Live</th>
                         <th>Resolution</th>
@@ -170,26 +187,37 @@
                         <th>Actions</th>
                     </tr>
                 </thead>
-                <tbody>
-                    {{ range .Assignments }}
-                    <tr>
-                        <td><strong>{{ .Username }}</strong></td>
-                        <td>{{ .Site }}</td>
-                        <td class="mono">
+                <tbody>					{{ range .Entries }}
+					<tr>
+						<td><strong>{{ .Username }}</strong></td>
+						<td>{{ .Site }}</td>
+						<td>
+							{{ if eq .Source "pool" }}
+								<span class="status-badge pool">Pool</span>
+							{{ else }}
+								<span class="status-badge local">Local</span>
+							{{ end }}
+						</td>
+						<td class="mono">
                             {{ if .AssignedNode }}
                             {{ .AssignedNode }}
                             {{ else }}
                             <span style="color:var(--text-muted)">—</span>
                             {{ end }}
                         </td>
-                        <td>
-                            {{ if eq .Status "claimed" }}
-                                <span class="status-badge claimed">Claimed</span>
-                            {{ else if eq .Status "unassigned" }}
-                                <span class="status-badge unassigned">Unassigned</span>
-                            {{ else }}
-                                <span class="status-badge">{{ .Status }}</span>
-                            {{ end }}
+                        <td>							{{ if eq .Status "claimed" }}
+								<span class="status-badge claimed">Claimed</span>
+							{{ else if eq .Status "unassigned" }}
+								<span class="status-badge unassigned">Unassigned</span>
+							{{ else if eq .Status "recording" }}
+								<span class="status-badge live">Recording</span>
+							{{ else if eq .Status "paused" }}
+								<span class="status-badge paused">Paused</span>
+							{{ else if eq .Status "connecting" }}
+								<span class="status-badge connecting">Connecting</span>
+							{{ else }}
+								<span class="status-badge offline">{{ .Status }}</span>
+							{{ end }}
                         </td>
                         <td>
                             {{ if .IsLive }}
@@ -197,10 +225,15 @@
                             {{ else }}
                                 <span class="status-badge offline">Offline</span>
                             {{ end }}
-                        </td>
-                        <td class="mono">{{ .Resolution }}p</td>
-                        <td class="mono">{{ .Framerate }}fps</td>
-                        <td class="mono">{{ .AssignedAt }}</td>
+                        </td>						<td class="mono">
+							{{ if .Resolution }}{{ .Resolution }}p{{ else }}<span style="color:var(--text-muted)">—</span>{{ end }}
+						</td>
+						<td class="mono">
+							{{ if .Framerate }}{{ .Framerate }}fps{{ else }}<span style="color:var(--text-muted)">—</span>{{ end }}
+						</td>
+						<td class="mono">
+							{{ if .AssignedAt }}{{ .AssignedAt }}{{ else }}<span style="color:var(--text-muted)">—</span>{{ end }}
+						</td>
                         <td>
                             <button class="btn-action btn-action-del" onclick="removeFromPool('{{ .Username }}', '{{ .Site }}')" title="Remove">✕</button>
                         </td>
@@ -216,13 +249,65 @@
 </div>
 
 <script>
+var poolCheckTimer = null;
+var poolCheckSeq = 0; // guards against stale out-of-order check responses
+
+function checkPoolChannel() {
+    var username = document.getElementById('pool-username').value.trim();
+    var status = document.getElementById('pool-check-status');
+    var btn = document.getElementById('pool-add-btn');
+    clearTimeout(poolCheckTimer);
+    poolCheckSeq++; // invalidate any in-flight response
+
+    if (!username) {
+        status.className = 'check-status';
+        status.textContent = '';
+        btn.disabled = false;
+        btn.textContent = 'Add to Pool';
+        return;
+    }
+
+    status.className = 'check-status checking';
+    status.textContent = 'Checking \u201c' + username + '\u201d\u2026';
+    btn.disabled = true;
+
+    poolCheckTimer = setTimeout(function() {
+        var seq = poolCheckSeq;
+        var site = document.getElementById('pool-site').value;
+        fetch('/api/pool/check?username=' + encodeURIComponent(username) + '&site=' + encodeURIComponent(site))
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (seq !== poolCheckSeq) return; // stale response, ignore
+                if (data.exists) {
+                    status.className = 'check-status exists';
+                    status.textContent = '\u26a0 ' + data.message + ' \u2014 adding will be skipped';
+                    btn.disabled = true;
+                } else {
+                    status.className = 'check-status ok';
+                    status.textContent = '\u2713 Available \u2014 channel will be added';
+                    btn.disabled = false;
+                }
+            })
+            .catch(function() {
+                if (seq !== poolCheckSeq) return;
+                status.className = 'check-status';
+                status.textContent = '';
+                btn.disabled = false;
+            });
+    }, 350);
+}
+
 function addToPool() {
     var site = document.getElementById('pool-site').value;
     var username = document.getElementById('pool-username').value.trim();
     if (!username) return;
     var resolution = parseInt(document.getElementById('pool-resolution').value);
     var framerate = parseInt(document.getElementById('pool-framerate').value);
+    var btn = document.getElementById('pool-add-btn');
+    var status = document.getElementById('pool-check-status');
 
+    btn.disabled = true;
+    btn.textContent = 'Adding\u2026';
     fetch('/api/pool/add', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -230,10 +315,20 @@ function addToPool() {
     }).then(function(r) {
         if (r.ok) {
             location.reload();
-        } else {
-            return r.text().then(function(t) { alert('Failed: ' + t); });
+            return;
         }
-    }).catch(function(e) { alert('Error: ' + e); });
+        return r.json().catch(function() { return null; }).then(function(data) {
+            btn.disabled = false;
+            btn.textContent = 'Add to Pool';
+            var msg = (data && data.error) ? data.error : ('Failed: HTTP ' + r.status);
+            status.className = 'check-status exists';
+            status.textContent = '\u26a0 ' + msg;
+        });
+    }).catch(function(e) {
+        btn.disabled = false;
+        btn.textContent = 'Add to Pool';
+        alert('Error: ' + e);
+    });
 }
 
 function removeFromPool(username, site) {

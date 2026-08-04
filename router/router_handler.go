@@ -117,49 +117,7 @@ func AdminPage(c *gin.Context) {
 	uploads := server.Manager.UploadEntries()
 
 	// ── Orphans ──
-	dirs := []string{"videos"}
-	if server.Config.OutputDir != "" {
-		dirs = append(dirs, server.Config.OutputDir)
-	}
-	uploaded := map[string]bool{}
-	allRecs, _ := server.GetDBClient().GetAllRecordings()
-	for i := range allRecs {
-		uploaded[allRecs[i].Filename] = true
-	}
-	var orphans []orphanEntry
-	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			ext := strings.ToLower(filepath.Ext(name))
-			if ext != ".mp4" && ext != ".mkv" {
-				continue
-			}
-			if strings.Contains(name, ".video.") || strings.Contains(name, ".audio.") || strings.Contains(name, ".muxed.") {
-				continue
-			}
-			if uploaded[name] {
-				continue
-			}
-			info, err := e.Info()
-			if err != nil {
-				continue
-			}
-			orphans = append(orphans, orphanEntry{
-				Path:     filepath.Join(dir, name),
-				Filename: name,
-				Size:     info.Size(),
-				ModTime:  info.ModTime().Format(time.RFC3339),
-				Age:      time.Since(info.ModTime()).Round(time.Hour).String(),
-			})
-		}
-	}
+	orphans := scanOrphanFiles()
 
 	// ── Session info ──
 	var sessionActive bool
@@ -1009,16 +967,27 @@ func TriggerSessionStop(c *gin.Context) {
 }
 
 func ListOrphans(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"orphans": scanOrphanFiles()})
+}
+
+// scanOrphanFiles scans videos/ and the configured OutputDir for video files
+// that exist on disk but have no Supabase recording entry (orphans).
+// Sidecar parts (.video./.audio./.muxed.) are excluded — they are handled by
+// the recovery pipeline (CleanupOrphanedFiles), not the orphan list.
+func scanOrphanFiles() []orphanEntry {
 	dirs := []string{"videos"}
-	if server.Config.OutputDir != "" {
+	if server.Config != nil && server.Config.OutputDir != "" {
 		dirs = append(dirs, server.Config.OutputDir)
 	}
 
 	// Load all recordings once to avoid N+1 queries
 	uploaded := map[string]bool{}
-	allRecs, _ := server.GetDBClient().GetAllRecordings()
-	for i := range allRecs {
-		uploaded[allRecs[i].Filename] = true
+	if dbClient := server.GetDBClient(); dbClient != nil {
+		if allRecs, err := dbClient.GetAllRecordings(); err == nil {
+			for i := range allRecs {
+				uploaded[allRecs[i].Filename] = true
+			}
+		}
 	}
 
 	var orphans []orphanEntry
@@ -1039,16 +1008,13 @@ func ListOrphans(c *gin.Context) {
 			if strings.Contains(name, ".video.") || strings.Contains(name, ".audio.") || strings.Contains(name, ".muxed.") {
 				continue
 			}
-
 			if uploaded[name] {
 				continue // not orphaned — already uploaded
 			}
-
 			info, err := e.Info()
 			if err != nil {
 				continue
 			}
-
 			orphans = append(orphans, orphanEntry{
 				Path:     filepath.Join(dir, name),
 				Filename: name,
@@ -1058,8 +1024,7 @@ func ListOrphans(c *gin.Context) {
 			})
 		}
 	}
-
-	c.JSON(http.StatusOK, gin.H{"orphans": orphans})
+	return orphans
 }
 
 // RetryOrphan triggers thumbnail generation + upload for one or more orphan
@@ -1111,6 +1076,89 @@ func RetryOrphan(c *gin.Context) {
 	wg.Wait()
 
 	c.JSON(http.StatusOK, gin.H{"results": results})
+}
+
+// rescanResult is one file's outcome from a manual output-dir rescan.
+type rescanResult struct {
+	Path   string `json:"path"`
+	Status string `json:"status"` // "uploaded" | "failed"
+	Error  string `json:"error,omitempty"`
+}
+
+// RescanOutputDir manually rescans the output directories and immediately
+// runs every orphaned file through thumbnail generation + upload, without
+// waiting for a restart or the periodic orphan-cleanup timer.
+//
+// This is a rescue action for stuck recordings: unlike the normal pipeline it
+// force-uploads files even when a stale in-flight marker is present (the
+// "already uploading, skipping duplicate" race that strands a moved file until
+// restart).  UploadOrphanedFile re-marks the file in-flight and the upload
+// journal dedups hosts that already have it, so a forced re-upload can never
+// duplicate work that already completed.
+//
+// Two deliberate trade-offs:
+//   - The request blocks until every upload attempt finishes (up to 3 retries
+//     with 60s backoff per file), matching RetryOrphan.  The spawned uploads
+//     are not tied to the request context, so they keep running even if the
+//     browser or a tunnel drops the connection — only the JSON summary is
+//     lost.
+//   - A file the pipeline is GENUINELY mid-upload on right now can be
+//     double-kicked (both uploaders may read an empty journal before either
+//     writes).  Harm is bounded: it is the same file re-uploaded, and
+//     SaveRecordingWithLinks upserts by filename.
+func RescanOutputDir(c *gin.Context) {
+	orphans := scanOrphanFiles()
+	if len(orphans) == 0 {
+		c.JSON(http.StatusOK, gin.H{"found": 0, "uploaded": 0, "failed": 0, "results": []rescanResult{}})
+		return
+	}
+
+	sem := make(chan struct{}, 5)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	results := make([]rescanResult, 0, len(orphans))
+
+	for _, o := range orphans {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			res := rescanResult{Path: path, Status: "uploaded"}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						res = rescanResult{Path: path, Status: "failed", Error: fmt.Sprintf("panic: %v", r)}
+					}
+				}()
+				thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(path)
+				if !channel.UploadOrphanedFile(path, thumbURL, spriteURL, previewURL) {
+					res = rescanResult{Path: path, Status: "failed", Error: "upload did not complete successfully"}
+				}
+			}()
+
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}(o.Path)
+	}
+	wg.Wait()
+
+	uploaded, failed := 0, 0
+	for _, r := range results {
+		if r.Status == "failed" {
+			failed++
+		} else {
+			uploaded++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"found":    len(orphans),
+		"uploaded": uploaded,
+		"failed":   failed,
+		"results":  results,
+	})
 }
 
 var (
@@ -1352,27 +1400,93 @@ func NodesPage(c *gin.Context) {
 
 // ─── Pool Editor ──────────────────────────────────────────────────────────────
 
+// PoolEntry is a unified row for the pool editor page.  It represents either a
+// distributed channel assignment (pooled mode, source="pool") or a locally
+// configured channel (isolated mode, source="local").
+type PoolEntry struct {
+	Username     string
+	Site         string
+	AssignedNode string
+	Status       string
+	IsLive       bool
+	Resolution   int
+	Framerate    int
+	AssignedAt   string
+	Source       string // "pool" (channel_assignments) or "local" (configured channels)
+}
+
 // PoolData represents the data structure for the pool editor page.
 type PoolData struct {
-	Assignments []database.ChannelAssignment
+	Entries []PoolEntry
+	Mode    string
+}
+
+// poolEntries returns the unified pool rows for the editor page.  In pooled
+// mode (CHANNEL_POOL_MODE=pooled) the channel_assignments table is the source
+// of truth; in isolated mode the locally configured channels (server.Manager)
+// are shown so the page is never empty when channels exist.
+func poolEntries() ([]PoolEntry, string) {
+	mode := server.ChannelPoolMode()
+	var entries []PoolEntry
+
+	if server.IsPooledMode() {
+		client := server.GetDBClient()
+		if client == nil {
+			return nil, mode
+		}
+		assignments, err := client.GetAllAssignments()
+		if err != nil {
+			fmt.Printf("[WARN] failed to load assignments: %v\n", err)
+			return nil, mode
+		}
+		for _, a := range assignments {
+			entries = append(entries, PoolEntry{
+				Username:     a.Username,
+				Site:         a.Site,
+				AssignedNode: a.AssignedNode,
+				Status:       a.Status,
+				IsLive:       a.IsLive,
+				Resolution:   a.Resolution,
+				Framerate:    a.Framerate,
+				AssignedAt:   a.AssignedAt,
+				Source:       "pool",
+			})
+		}
+		return entries, mode
+	}
+
+	// Isolated mode — show the locally configured channels.
+	if server.Manager != nil {
+		for _, ch := range server.Manager.ChannelInfo() {
+			status := "offline"
+			switch {
+			case ch.IsPaused:
+				status = "paused"
+			case ch.IsOnline:
+				status = "recording"
+			case ch.IsConnecting:
+				status = "connecting"
+			}
+			entries = append(entries, PoolEntry{
+				Username:   ch.Username,
+				Site:       ch.Site,
+				Status:     status,
+				IsLive:     ch.IsOnline,
+				Source:     "local",
+			})
+		}
+	}
+	return entries, mode
 }
 
 // PoolPage renders the pool editor page.
 func PoolPage(c *gin.Context) {
 	c.Header("Cache-Control", "public, max-age=15")
 
-	client := server.GetDBClient()
-	var assignments []database.ChannelAssignment
-	if client != nil {
-		var err error
-		assignments, err = client.GetAllAssignments()
-		if err != nil {
-			fmt.Printf("[WARN] failed to load assignments: %v\n", err)
-		}
-	}
-
+	entries, mode := poolEntries()
 	c.HTML(200, "pool.html", &PoolData{
-		Assignments: assignments,
+		Entries: entries,
+		Mode:    mode,
 	})
 }
 
@@ -1395,21 +1509,71 @@ func GetNodesJSON(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"nodes": nodes})
 }
 
-// GetPoolJSON returns all assignments as JSON.
+// GetPoolJSON returns all pool entries as JSON (assignments in pooled mode,
+// configured channels in isolated mode).
 func GetPoolJSON(c *gin.Context) {
+	entries, mode := poolEntries()
+	c.JSON(http.StatusOK, gin.H{"mode": mode, "entries": entries})
+}
+
+// PoolCheckResponse is the JSON response for the realtime pool channel checker.
+type PoolCheckResponse struct {
+	Exists  bool   `json:"exists"`
+	Source  string `json:"source,omitempty"`
+	Message string `json:"message"`
+}
+
+// poolChannelExists reports whether a channel already exists in any known
+// location: locally configured channels, the shared pool (channel_assignments,
+// pooled mode only), or the Supabase channels table.  Returns the source name
+// and a human-readable message describing where the duplicate was found.
+func poolChannelExists(username, site string) (bool, string, string) {
+	// 1. Locally configured channels (this node / instance).
+	if server.Manager != nil {
+		for _, ch := range server.Manager.ChannelInfo() {
+			if strings.EqualFold(ch.Username, username) {
+				return true, "configured",
+					fmt.Sprintf("Channel %q already exists — it is already configured on this node", username)
+			}
+		}
+	}
+
 	client := server.GetDBClient()
 	if client == nil {
-		c.JSON(http.StatusOK, gin.H{"assignments": []database.ChannelAssignment{}})
-		return
+		return false, "", ""
 	}
 
-	assignments, err := client.GetAllAssignments()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	// 2. Shared pool (channel_assignments) — relevant only in pooled mode.
+	if server.IsPooledMode() {
+		if a, err := client.GetAssignment(username, site); err == nil && a != nil {
+			return true, "pool", fmt.Sprintf("Channel %q is already in the pool", username)
+		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"assignments": assignments})
+	// 3. Supabase channels table (case-insensitive).
+	if exists, err := client.ChannelExists(username); err == nil && exists {
+		return true, "database", fmt.Sprintf("Channel %q already exists in the database", username)
+	}
+
+	return false, "", ""
+}
+
+// CheckPoolChannel checks in realtime whether a channel already exists
+// (configured locally, in the pool, or in the database) so the pool editor can
+// skip duplicates before submitting.
+func CheckPoolChannel(c *gin.Context) {
+	username := strings.TrimSpace(c.Query("username"))
+	if username == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "username is required"})
+		return
+	}
+	site := strings.TrimSpace(c.Query("site"))
+	if site == "" {
+		site = "chaturbate"
+	}
+
+	exists, source, message := poolChannelExists(username, site)
+	c.JSON(http.StatusOK, PoolCheckResponse{Exists: exists, Source: source, Message: message})
 }
 
 // PoolAddRequest is the request body for adding a channel to the pool.
@@ -1420,7 +1584,10 @@ type PoolAddRequest struct {
 	Framerate  int    `json:"framerate" form:"framerate"`
 }
 
-// AddToPool adds a channel to the shared pool.
+// AddToPool adds a channel to the pool.  In pooled mode this creates a
+// channel_assignments row; in isolated mode it adds a locally configured
+// channel.  Duplicates are rejected with a 409 so the UI can show why the
+// add was skipped.
 func AddToPool(c *gin.Context) {
 	var req PoolAddRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1432,22 +1599,43 @@ func AddToPool(c *gin.Context) {
 		req.Site = "chaturbate"
 	}
 	if req.Resolution == 0 {
-		req.Resolution = 1440
+		req.Resolution = 2160
 	}
 	if req.Framerate == 0 {
 		req.Framerate = 60
+	}
+	req.Username = strings.TrimSpace(req.Username)
+
+	// Duplicate guard: never add a channel that already exists anywhere.
+	if exists, _, message := poolChannelExists(req.Username, req.Site); exists {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": message})
+		return
+	}
+
+	if !server.IsPooledMode() {
+		// Isolated mode: create a locally configured channel.
+		if server.Manager == nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "manager not initialized"})
+			return
+		}
+		conf := &entity.ChannelConfig{
+			Site:       req.Site,
+			Username:   req.Username,
+			Framerate:  req.Framerate,
+			Resolution: req.Resolution,
+			CreatedAt:  time.Now().Unix(),
+		}
+		if err := server.Manager.CreateChannel(conf, true); err != nil {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
 	}
 
 	client := server.GetDBClient()
 	if client == nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Supabase not configured"})
-		return
-	}
-
-	// Check if already in pool
-	existing, err := client.GetAssignment(req.Username, req.Site)
-	if err == nil && existing != nil {
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "channel already in pool"})
 		return
 	}
 
@@ -1473,7 +1661,9 @@ type PoolRemoveRequest struct {
 	Site     string `json:"site"`
 }
 
-// RemoveFromPool removes a channel from the shared pool.
+// RemoveFromPool removes a channel from the pool.  In pooled mode the
+// channel_assignments row is deleted; in isolated mode the locally configured
+// channel is stopped and removed.
 func RemoveFromPool(c *gin.Context) {
 	var req PoolRemoveRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1483,6 +1673,19 @@ func RemoveFromPool(c *gin.Context) {
 
 	if req.Site == "" {
 		req.Site = "chaturbate"
+	}
+
+	if !server.IsPooledMode() {
+		if server.Manager == nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "manager not initialized"})
+			return
+		}
+		if err := server.Manager.StopChannel(req.Username); err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
 	}
 
 	client := server.GetDBClient()

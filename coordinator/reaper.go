@@ -15,25 +15,20 @@ func (c *Coordinator) StartReaperLoop(ctx context.Context) {
 
 	const heartbeatTimeout = 180 * time.Second
 	const reaperInterval = 120 * time.Second
+	const name = "reaper"
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-
-		ticker := time.NewTicker(reaperInterval)
-		defer ticker.Stop()
-
+	c.runLoopWithRestart(ctx, name, reaperInterval, func(stopCh <-chan struct{}, tickerC <-chan time.Time) {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-c.stopCh:
+			case <-stopCh:
 				return
-			case <-ticker.C:
-				c.runReapCycle(heartbeatTimeout)
+			case <-tickerC:
+				c.cycleGuardReaper.tryRun(name, func() { c.runReapCycle(heartbeatTimeout) })
 			}
 		}
-	}()
+	})
 }
 
 // runReapCycle finds dead nodes and reclaims their channel assignments.

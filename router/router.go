@@ -91,6 +91,7 @@ func SetupViews(r *gin.Engine) {
 	// Orphan management API
 	r.GET("/api/orphans", ListOrphans)
 	r.POST("/api/orphans/retry", RetryOrphan)
+	r.POST("/api/orphans/rescan", RescanOutputDir)
 	r.DELETE("/api/orphans", DeleteOrphans)
 
 	// Thumbnail proxy API
@@ -109,6 +110,7 @@ func SetupViews(r *gin.Engine) {
 	// ── Nodes & Pool API ──────────────────────────────────────────────────
 	r.GET("/api/nodes", GetNodesJSON)
 	r.GET("/api/pool", GetPoolJSON)
+	r.GET("/api/pool/check", CheckPoolChannel)
 	r.POST("/api/pool/add", AddToPool)
 	r.POST("/api/pool/remove", RemoveFromPool)
 

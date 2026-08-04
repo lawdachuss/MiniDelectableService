@@ -6,7 +6,6 @@ import (
 	"hash/fnv"
 	"log"
 	"math"
-	"strings"
 	"time"
 
 	"github.com/teacat/chaturbate-dvr/database"
@@ -20,32 +19,38 @@ func (c *Coordinator) StartClaimLoop(ctx context.Context) {
 		return
 	}
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	const name = "claim"
+	const interval = 60 * time.Second
 
+	c.runLoopWithRestart(ctx, name, interval, func(stopCh <-chan struct{}, tickerC <-chan time.Time) {
 		// Stagger initial delay by node-ID hash so nodes don't all
 		// claim on the same cycle and race for the same channels.
 		// Base delay 5s + up to 10s spread.
 		h := fnv.New32a()
 		h.Write([]byte(c.NodeID))
 		stagger := 5*time.Second + time.Duration(h.Sum32()%10)*time.Second
-		time.Sleep(stagger)
 
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
+		select {
+		case <-time.After(stagger):
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		}
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-c.stopCh:
+			case <-stopCh:
 				return
-			case <-ticker.C:
-				c.runClaimCycle()
+			case <-tickerC:
+				// cycleGuard skips this tick if the previous claim cycle is
+				// still running (slow DB), instead of stacking a second one.
+				c.cycleGuardClaim.tryRun(name, c.runClaimCycle)
 			}
 		}
-	}()
+	})
 }
 
 // ReleaseChannel releases a single channel back to the pool.
@@ -62,13 +67,76 @@ func (c *Coordinator) ReleaseChannel(username, site string) {
 // runClaimCycle executes one iteration of the fair-share claiming algorithm.
 // Claims channels if this node has less than its fair share, releases channels
 // if it has more than its fair share (only when multiple nodes are alive).
+// Skips entirely when draining (graceful shutdown in progress).
 func (c *Coordinator) runClaimCycle() {
+	// Don't claim new channels during draining — the node is shutting down
+	// and new channels would just need to be released immediately.
+	c.mu.Lock()
+	draining := c.draining
+	c.mu.Unlock()
+	if draining {
+		return
+	}
+	// Don't claim while fenced (DB unreachable / partitioned) — claiming would
+	// fight the healthy nodes that took over our released channels.
+	if c.isFenced() {
+		return
+	}
+	// Reconcile needs the manager (to start/stop local channels).  In normal
+	// pooled wiring the manager is always present, but guard anyway so a nil
+	// manager can never panic the cycle.
+	if c.Manager == nil {
+		return
+	}
 	// Self-heal: repair rows stuck with assigned_node set but status=unassigned.
 	// These rows are invisible to both claim and release, causing a deadlock.
 	if repaired, err := c.Client.RepairOrphanedAssignments(); err != nil {
 		log.Printf("[coordinator] claim cycle: repair orphaned error: %v", err)
 	} else if repaired > 0 {
 		log.Printf("[coordinator] repaired %d orphaned assignment(s) (assigned_node set but status=unassigned)", repaired)
+	}
+
+	// Reconcile database assignments with local manager channels.
+	// This ensures we stop any channel that got reassigned away (e.g. by reaper)
+	// and start any channel assigned to us that we missed or failed to start.
+	dbAssignments, err := c.Client.GetNodeAssignments(c.NodeID)
+	if err != nil {
+		log.Printf("[coordinator] claim cycle: get node assignments error: %v", err)
+		return
+	}
+
+	localChannels := c.Manager.GetLocalChannels()
+
+	// 1. Remove local channels that are no longer assigned to this node in DB
+	dbMap := make(map[string]database.ChannelAssignment)
+	for _, a := range dbAssignments {
+		dbMap[a.Username] = a
+	}
+
+	for _, lc := range localChannels {
+		if _, ok := dbMap[lc]; !ok {
+			log.Printf("[coordinator] reconciliation: channel %s is running locally but not assigned to this node in DB. Removing.", lc)
+			if err := c.Manager.RemoveChannelForReassignment(lc); err != nil {
+				log.Printf("[coordinator] reconciliation error removing channel %s: %v", lc, err)
+			}
+		}
+	}
+
+	// 2. Start channels that are assigned to this node in DB but not running locally
+	for _, a := range dbAssignments {
+		found := false
+		for _, lc := range localChannels {
+			if lc == a.Username {
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Printf("[coordinator] reconciliation: channel %s is assigned in DB but not running locally. Starting.", a.Username)
+			if err := c.Manager.CreateChannelFromAssignment(&a); err != nil {
+				log.Printf("[coordinator] reconciliation error starting channel %s: %v", a.Username, err)
+			}
+		}
 	}
 
 	stats, err := c.Client.GetAssignmentStats()
@@ -82,35 +150,49 @@ func (c *Coordinator) runClaimCycle() {
 	if totalNodes == 0 {
 		totalNodes = 1
 	}
-	// In pooled mode, assume at least 2 nodes to prevent one node from claiming
-	// everything before other nodes register their heartbeats.
-	if strings.HasPrefix(c.NodeID, "node-") && totalNodes < 2 {
-		totalNodes = 2
-	}
-	// Fair-share is based on the total pool, not live-channel count.  A DVR is
-	// expected to claim channels that are offline at claim time and record them
-	// when they go live, so all pool channels count toward distribution.  Using
-	// live-channel count would zero out fair-share whenever the liveness loop
-	// (every ~120s) hasn't run, starving all claims.
+
 	fairShare := int(math.Ceil(float64(totalPool) / float64(totalNodes)))
 
-	myLoad, err := c.Client.CountMyAssignments(c.NodeID)
-	if err != nil {
-		log.Printf("[coordinator] claim cycle: count error: %v", err)
-		return
+	// Count live vs offline assignments from the already-fetched dbAssignments.
+	// This avoids a redundant CountMyAssignments call and lets us do live-aware
+	// fair-share: live channels consume a node's capacity, so a node with many
+	// live channels claims fewer offline ones.
+	myLiveCount := 0
+	myLoad := 0
+	for _, a := range dbAssignments {
+		if a.Status == "unassigned" {
+			continue
+		}
+		myLoad++
+		if a.IsLive || a.Status == "recording" {
+			myLiveCount++
+		}
 	}
 
-	// Release excess channels if we have more than our fair share
-	if myLoad > fairShare && totalNodes > 1 {
-		excess := myLoad - fairShare
-		released, err := c.Client.ReleaseExcessChannels(c.NodeID, excess)
+	// Live-aware capacity: a node's live channels count against its fair-share.
+	// A node with 8 live channels and fairShare=10 gets at most 2 offline slots.
+	effectiveCapacity := fairShare
+	if myLiveCount > effectiveCapacity {
+		effectiveCapacity = myLiveCount // never release live channels
+	}
+	maxOfflineAllowed := effectiveCapacity - myLiveCount
+	if maxOfflineAllowed < 0 {
+		maxOfflineAllowed = 0
+	}
+	myOfflineCount := myLoad - myLiveCount
+
+	// Release excess OFFLINE channels if we have more offline than allowed.
+	// Live+recording channels are NEVER released here.
+	if myOfflineCount > maxOfflineAllowed && totalNodes > 1 {
+		excess := myOfflineCount - maxOfflineAllowed
+		released, err := c.Client.ReleaseExcessOfflineChannels(c.NodeID, excess)
 		if err != nil {
 			log.Printf("[coordinator] claim cycle: release excess error: %v", err)
 			return
 		}
 		if len(released) > 0 {
-			log.Printf("[coordinator] released %d excess channel(s) (load: %d -> %d, fairShare: %d, totalPool: %d)",
-				len(released), myLoad, myLoad-len(released), fairShare, totalPool)
+			log.Printf("[coordinator] released %d excess offline channel(s) (offline: %d -> %d, live: %d, fairShare: %d, totalPool: %d)",
+				len(released), myOfflineCount, myOfflineCount-len(released), myLiveCount, fairShare, totalPool)
 			for _, ca := range released {
 				if c.Manager != nil {
 					c.Manager.RemoveChannelForReassignment(ca.Username)
@@ -120,17 +202,17 @@ func (c *Coordinator) runClaimCycle() {
 		return // let next cycle do the claiming to avoid races
 	}
 
-	// Claim channels if we have fewer than our fair share
-	if myLoad < fairShare {
-		budget := fairShare - myLoad
+	// Claim offline channels up to our maxOfflineAllowed budget
+	if myOfflineCount < maxOfflineAllowed {
+		budget := maxOfflineAllowed - myOfflineCount
 		claimed, err := c.Client.ClaimChannels(c.NodeID, budget)
 		if err != nil {
 			log.Printf("[coordinator] claim cycle: claim error: %v", err)
 			return
 		}
 		if len(claimed) > 0 {
-			log.Printf("[coordinator] claimed %d new channel(s) (load: %d -> %d, fairShare: %d, totalPool: %d)",
-				len(claimed), myLoad, myLoad+len(claimed), fairShare, totalPool)
+			log.Printf("[coordinator] claimed %d new channel(s) (offline: %d -> %d, live: %d, fairShare: %d, totalPool: %d)",
+				len(claimed), myOfflineCount, myOfflineCount+len(claimed), myLiveCount, fairShare, totalPool)
 			for _, ca := range claimed {
 				if c.Manager != nil {
 					if err := c.Manager.CreateChannelFromAssignment(&ca); err != nil {
@@ -139,7 +221,12 @@ func (c *Coordinator) runClaimCycle() {
 				}
 			}
 		}
+		return // claimed or error, nothing more to do this cycle
 	}
+
+	// Nothing to claim or release this cycle — log for visibility
+	log.Printf("[coordinator] claim cycle: nothing to do (offline: %d, live: %d, fairShare: %d, maxOfflineAllowed: %d, totalPool: %d)",
+		myOfflineCount, myLiveCount, fairShare, maxOfflineAllowed, totalPool)
 }
 
 // CreateChannelAssignment creates a channel_assignments row for a new channel.
@@ -193,7 +280,7 @@ func (c *Coordinator) DeleteChannelAssignment(username, site string) error {
 
 // ConfigFromAssignment converts a ChannelAssignment back to a ChannelConfig.
 func ConfigFromAssignment(ca *database.ChannelAssignment) *entity.ChannelConfig {
-	return &entity.ChannelConfig{
+	conf := &entity.ChannelConfig{
 		Site:                    ca.Site,
 		Username:                ca.Username,
 		Framerate:               ca.Framerate,
@@ -205,6 +292,13 @@ func ConfigFromAssignment(ca *database.ChannelAssignment) *entity.ChannelConfig 
 		MinDurationBeforeUpload: ca.MinDurationBeforeUpload,
 		CreatedAt:               time.Now().Unix(),
 	}
+	// channel_assignments.pattern defaults to '' in the database, so a row
+	// created without an explicit pattern would otherwise produce a channel
+	// that can never generate a filename (GenerateFilename refuses an empty
+	// name). Sanitize fills the default pattern — and the other defaults —
+	// so every path that rebuilds a config from an assignment is safe.
+	conf.Sanitize()
+	return conf
 }
 
 // MarshalPool marshals a slice of ChannelConfig into JSON bytes.

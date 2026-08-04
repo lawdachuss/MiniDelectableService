@@ -1,8 +1,11 @@
 package config
 
 import (
+	"archive/zip"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -116,7 +119,226 @@ func ffmpegBin() string {
 	if p := autoDetectFFmpeg(); p != "" {
 		return p
 	}
+	if p := cachedFFmpegBin(); p != "" {
+		return p
+	}
 	return "ffmpeg"
+}
+
+// cacheDir returns the local cache directory for downloaded binaries.
+func cacheDir() string {
+	dir := filepath.Join(os.Getenv("LOCALAPPDATA"), "chaturbate-dvr", "bin")
+	os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// cachedFFmpegBin returns the path to a cached FFmpeg static build, or ""
+// if none is cached.
+func cachedFFmpegBin() string {
+	candidates := []string{
+		filepath.Join(cacheDir(), "ffmpeg.exe"),
+		filepath.Join(cacheDir(), "ffmpeg"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// EnsureFFmpegCached downloads a static FFmpeg build to the local cache
+// directory if no cached binary is found.  Returns the path to the cached
+// binary or "" if the download fails.
+func EnsureFFmpegCached() string {
+	if p := cachedFFmpegBin(); p != "" {
+		return p
+	}
+
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+
+	url := "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+	zipPath := filepath.Join(cacheDir(), "ffmpeg-static.zip")
+	extractDir := filepath.Join(cacheDir(), "ffmpeg-extract")
+
+	fmt.Println("[FFMPEG] Downloading static build to cache...")
+	if err := downloadFile(url, zipPath); err != nil {
+		fmt.Printf("[FFMPEG] Download failed: %v\n", err)
+		return ""
+	}
+
+	fmt.Println("[FFMPEG] Extracting...")
+	if err := extractZip(zipPath, extractDir); err != nil {
+		fmt.Printf("[FFMPEG] Extract failed: %v\n", err)
+		return ""
+	}
+
+	// Find the ffmpeg.exe inside the extracted directory.
+	var ffmpegExe string
+	filepath.WalkDir(extractDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && strings.EqualFold(d.Name(), "ffmpeg.exe") {
+			ffmpegExe = path
+			return io.EOF // stop walking
+		}
+		return nil
+	})
+
+	if ffmpegExe == "" {
+		fmt.Println("[FFMPEG] ffmpeg.exe not found in archive")
+		return ""
+	}
+
+	dest := filepath.Join(cacheDir(), "ffmpeg.exe")
+	if err := os.Rename(ffmpegExe, dest); err != nil {
+		// Copy instead of rename if across volumes
+		if copyErr := copyFile(ffmpegExe, dest); copyErr != nil {
+			fmt.Printf("[FFMPEG] Could not cache binary: %v\n", copyErr)
+			return ""
+		}
+	}
+
+	// Clean up the zip and extract dir.
+	os.Remove(zipPath)
+	os.RemoveAll(extractDir)
+
+	fmt.Printf("[FFMPEG] Cached to %s\n", dest)
+	return dest
+}
+
+// CachedCloudflaredBin returns the path to a cached cloudflared binary, or ""
+// if none is cached.
+func CachedCloudflaredBin() string {
+	return cachedCloudflaredBin()
+}
+
+// cachedCloudflaredBin returns the path to a cached cloudflared binary, or ""
+// if none is cached.
+func cachedCloudflaredBin() string {
+	candidates := []string{
+		filepath.Join(cacheDir(), "cloudflared.exe"),
+		filepath.Join(cacheDir(), "cloudflared"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// EnsureCloudflaredCached downloads cloudflared to the local cache directory
+// if no cached binary is found.  Returns the path to the cached binary or ""
+// if the download fails.
+func EnsureCloudflaredCached() string {
+	if p := cachedCloudflaredBin(); p != "" {
+		return p
+	}
+
+	url := "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+	dest := filepath.Join(cacheDir(), "cloudflared.exe")
+
+	fmt.Println("[CLOUDFLARED] Downloading to cache...")
+	if err := downloadFile(url, dest); err != nil {
+		fmt.Printf("[CLOUDFLARED] Download failed: %v\n", err)
+		return ""
+	}
+
+	fmt.Printf("[CLOUDFLARED] Cached to %s\n", dest)
+	return dest
+}
+
+// downloadFile downloads a file from url to dst.
+func downloadFile(url, dst string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+// copyFile copies src to dst.
+func copyFile(src, dst string) error {
+	from, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer from.Close()
+
+	to, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer to.Close()
+
+	_, err = io.Copy(to, from)
+	return err
+}
+
+// extractZip extracts a zip file to dst.
+func extractZip(zipPath, dst string) error {
+	r, err := os.Open(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	fi, err := r.Stat()
+	if err != nil {
+		return err
+	}
+	z, err := zip.NewReader(r, fi.Size())
+	if err != nil {
+		return err
+	}
+
+	for _, f := range z.File {
+		target := filepath.Join(dst, f.Name)
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(target, 0o755)
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		w, err := os.Create(target)
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		_, err = io.Copy(w, rc)
+		rc.Close()
+		w.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ffprobeBin returns a working ffprobe path, trying in order:

@@ -382,6 +382,35 @@
         .btn-delete { background: rgba(239,68,68,0.15); color: #ef4444; }
         .btn-delete:hover { background: rgba(239,68,68,0.25); }
 
+        .rescan-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-top: 10px;
+        }
+        .rescan-row .filter-input { margin-top: 0; flex: 1; }
+        .btn-rescan {
+            font-size: 11px;
+            font-weight: 700;
+            padding: 8px 14px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            background: var(--accent);
+            color: #fff;
+            white-space: nowrap;
+            transition: opacity 0.15s, transform 0.1s;
+        }
+        .btn-rescan:hover { opacity: 0.85; }
+        .btn-rescan:active { transform: scale(0.97); }
+        .btn-rescan:disabled { opacity: 0.5; cursor: not-allowed; }
+        .rescan-status {
+            font-size: 11px;
+            margin-top: 8px;
+            min-height: 15px;
+            font-weight: 600;
+        }
+
         .edit-link {
             font-size: 11px;
             font-weight: 600;
@@ -912,7 +941,11 @@
     <details class="section">
         <summary><span class="arrow">▶</span> Orphan Files <span class="count">{{ len .Orphans }}</span></summary>
         <div class="section-body">
-            <input type="text" class="filter-input" id="orphan-search" placeholder="Search orphan files..." oninput="filterOrphans()">
+            <div class="rescan-row">
+                <input type="text" class="filter-input" id="orphan-search" placeholder="Search orphan files..." oninput="filterOrphans()">
+                <button class="btn-rescan" id="rescan-btn" onclick="rescanOutputDir()" title="Scan the output dir and upload every orphan immediately — rescues files stuck by a stale 'already uploading' marker">↻ Rescan &amp; Upload</button>
+            </div>
+            <div class="rescan-status" id="rescan-status"></div>
             <table class="admin-table">
                 <thead>
                     <tr>
@@ -1065,7 +1098,7 @@ function retryOrphan(path, btn) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({paths: [path]})
     }).then(function(r) { return r.json(); }).then(function(data) {
-        if (data.length > 0 && data[0].status === 'queued') {
+        if (data.length > 0 && data[0].status === 'success') {
             btn.textContent = 'Queued';
             btn.style.opacity = '0.5';
             setTimeout(function() { location.reload(); }, 3000);
@@ -1079,6 +1112,40 @@ function retryOrphan(path, btn) {
         btn.style.background = 'rgba(239,68,68,0.15)';
         btn.style.color = '#ef4444';
     });
+}
+
+function rescanOutputDir() {
+    var btn = document.getElementById('rescan-btn');
+    var status = document.getElementById('rescan-status');
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = '↻ Rescanning...';
+    if (status) {
+        status.textContent = 'Scanning output dir for orphans...';
+        status.style.color = 'var(--text-secondary)';
+    }
+    fetch('/api/orphans/rescan', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var msg = 'Found ' + data.found + ' file' + (data.found === 1 ? '' : 's');
+            if (data.uploaded > 0) msg += ' — ' + data.uploaded + ' uploaded';
+            if (data.failed > 0) msg += ' — ' + data.failed + ' failed';
+            btn.textContent = '↻ Rescan & Upload';
+            btn.disabled = false;
+            if (status) {
+                status.textContent = (data.failed > 0 ? '⚠ ' : '✅ ') + msg;
+                status.style.color = data.failed > 0 ? '#ef4444' : '#10b981';
+            }
+            setTimeout(function() { location.reload(); }, 4000);
+        })
+        .catch(function() {
+            btn.textContent = '↻ Retry';
+            btn.disabled = false;
+            if (status) {
+                status.textContent = '❌ Rescan failed — check server logs';
+                status.style.color = '#ef4444';
+            }
+        });
 }
 
 function deleteOrphan(path, btn) {

@@ -5,6 +5,7 @@ package coordinator
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,8 +118,13 @@ func TestIntegrationClaimChannels(t *testing.T) {
 		}
 	}()
 
-	// Claim up to 2 channels (regardless of is_live).  Claims are ordered by
-	// username asc, so ch1 and ch2 should be claimed; ch3 stays unassigned.
+	// Claim up to 2 channels (regardless of is_live).  The claim_channels RPC
+	// randomizes order (ORDER BY RANDOM(), SKIP LOCKED), so ANY 2 unassigned
+	// channels may be claimed — exactly two must be (limit honored), both
+	// assigned to us, and none double-claimed.  Because this runs against a live
+	// pool that may contain foreign unassigned channels (e.g. a real channel
+	// waiting to be claimed), a claimed row may occasionally be a foreign one;
+	// the assertions below are written to be correct either way.
 	claimed, err := client.ClaimChannels(testNodeID, 2)
 	if err != nil {
 		t.Fatalf("ClaimChannels error: %v", err)
@@ -137,14 +143,40 @@ func TestIntegrationClaimChannels(t *testing.T) {
 		}
 	}
 
-	// ch3 is the 3rd in order, so it was NOT claimed (limit was 2) — not because
-	// of any is_live filter.
-	remaining, err := client.GetAssignment(testNodeID+"-ch3", "chaturbate")
-	if err != nil {
-		t.Fatalf("GetAssignment error: %v", err)
+	// Of our 3 test channels, exactly (2 - foreignClaimed) must have been
+	// claimed, where foreignClaimed is how many non-test rows the RPC picked
+	// (only possible when a foreign unassigned channel exists in the pool).
+	claimedSet := make(map[string]bool, len(claimed))
+	foreignClaimed := 0
+	for _, c := range claimed {
+		claimedSet[c.Username] = true
+		if !strings.HasPrefix(c.Username, testNodeID+"-") {
+			foreignClaimed++
+		}
 	}
-	if remaining != nil && remaining.AssignedNode != "" {
-		t.Error("ch3 should not have been claimed (beyond limit)")
+	channels := []struct {
+		username string
+		site     string
+	}{
+		{testNodeID + "-ch1", "chaturbate"},
+		{testNodeID + "-ch2", "stripchat"},
+		{testNodeID + "-ch3", "chaturbate"},
+	}
+	testClaimed := 0
+	for _, ch := range channels {
+		a, err := client.GetAssignment(ch.username, ch.site)
+		if err != nil {
+			t.Fatalf("GetAssignment(%s) error: %v", ch.username, err)
+		}
+		if a != nil && a.AssignedNode == testNodeID {
+			testClaimed++
+			if !claimedSet[ch.username] {
+				t.Errorf("%s assigned to us but not in claimed response", ch.username)
+			}
+		}
+	}
+	if want := 2 - foreignClaimed; testClaimed != want {
+		t.Errorf("%d of our test channels claimed, want %d (foreign rows claimed: %d)", testClaimed, want, foreignClaimed)
 	}
 }
 
@@ -155,12 +187,20 @@ func TestIntegrationFairShareAcrossNodes(t *testing.T) {
 	nodeA := testNodeID + "-a"
 	nodeB := testNodeID + "-b"
 
-	// Register both nodes
+	// Register both nodes and heartbeat them so GetAliveNodes sees them as alive.
+	// Register() alone relies on the last_heartbeat column default, which only
+	// fires on a fresh INSERT — on a re-run against an existing node row the
+	// upsert merge leaves the stale heartbeat, so the node looks dead and
+	// fair-share computes 0.  Heartbeating mirrors what the heartbeat loop does
+	// in production.
 	for _, id := range []string{nodeA, nodeB} {
 		coord := New(client, &mockChannelManager{})
 		coord.NodeID = id
 		coord.Mode = entity.PoolModePooled
 		coord.Register()
+		if err := client.HeartbeatNode(id, 0); err != nil {
+			t.Fatalf("HeartbeatNode(%s) error: %v", id, err)
+		}
 	}
 	defer func() {
 		_ = client.UpdateNodeStatus(nodeA, "offline")
@@ -188,8 +228,13 @@ func TestIntegrationFairShareAcrossNodes(t *testing.T) {
 		}
 	}()
 
-	// Simulate fair-share claim by each node
-	// With 2 alive nodes and 6 live channels, fair share = ceil(6/2) = 3 each
+	// Simulate fair-share claim by each node.
+	// With 2 alive nodes and 6 live channels, fair share = ceil(6/2) = 3 each.
+	// The pool may also contain foreign unassigned channels (real channels
+	// waiting to be claimed) — the RPC randomizes, so a foreign row may win a
+	// slot.  We track how many foreign rows each node claimed so the final
+	// assertion stays correct either way.
+	foreignClaimed := 0
 	for _, id := range []string{nodeA, nodeB} {
 		stats, err := client.GetAssignmentStats()
 		if err != nil {
@@ -203,10 +248,20 @@ func TestIntegrationFairShareAcrossNodes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ClaimChannels for %s error: %v", id, err)
 		}
-		t.Logf("Node %s claimed %d channels (fair share = %d)", id, len(claimed), fairShare)
+		for _, c := range claimed {
+			if !strings.HasPrefix(c.Username, testNodeID+"-") {
+				foreignClaimed++
+				// Release foreign rows immediately — they belong to the real pool.
+				if err := client.ReleaseChannel(c.Username, c.Site); err != nil {
+					t.Logf("warning: could not release foreign row %s: %v", c.Username, err)
+				}
+			}
+		}
+		t.Logf("Node %s claimed %d channels (fair share = %d, foreign: %d)", id, len(claimed), fairShare, foreignClaimed)
 	}
 
-	// Verify total claimed = 6 (no double-claiming)
+	// Verify total claimed = 6 (no double-claiming), minus any foreign rows the
+	// RPC grabbed (which we released).  No test channel may be claimed twice.
 	all, err := client.GetAllAssignments()
 	if err != nil {
 		t.Fatalf("GetAllAssignments error: %v", err)
@@ -223,8 +278,15 @@ func TestIntegrationFairShareAcrossNodes(t *testing.T) {
 			}
 		}
 	}
-	if totalClaimed != 6 {
-		t.Errorf("total claimed = %d, want 6 (all channels should be assigned)", totalClaimed)
+	// Every claim slot that did NOT go to a foreign row must have gone to one of
+	// our 6 test channels (each test channel is claimed at most once).  Use >=
+	// rather than == because fairShare is computed from the LIVE pool: if a real
+	// production channel is live mid-test, fairShare inflates, claim slots exceed
+	// the candidate count, and ALL test channels get claimed (totalClaimed = 6
+	// while 6 - foreignClaimed < 6).  The invariant that must always hold is that
+	// no claim slot was wasted on a foreign row at the expense of a test channel.
+	if totalClaimed < 6-foreignClaimed {
+		t.Errorf("total test channels claimed = %d, want >= %d (foreign rows claimed: %d)", totalClaimed, 6-foreignClaimed, foreignClaimed)
 	}
 
 	// Verify no channel is assigned to both nodes
@@ -264,6 +326,93 @@ func TestIntegrationNodeStatusTransitions(t *testing.T) {
 	node, _ = client.GetNode(testNodeID)
 	if node.Status != "offline" {
 		t.Errorf("status = %q, want offline", node.Status)
+	}
+}
+
+// TestIntegrationDeadlineMigrationPrimitives verifies the DB layer behind the
+// deadline-migration loop on real PostgREST: finding nodes with an imminent
+// session_deadline and atomically reassigning a channel off them.
+func TestIntegrationDeadlineMigrationPrimitives(t *testing.T) {
+	client := skipIfNoSupabase(t)
+
+	deadlineNode := testNodeID + "-deadline"
+	targetNode := testNodeID + "-target"
+	defer func() {
+		_ = client.UpdateNodeStatus(deadlineNode, "offline")
+		_ = client.UpdateNodeStatus(targetNode, "offline")
+	}()
+
+	// Node whose session deadline is ~5 minutes away (imminent for a 10m window).
+	dl := time.Now().Add(5 * time.Minute).UTC()
+	if err := client.UpsertNode(&database.Node{
+		NodeID:          deadlineNode,
+		Hostname:        "test-host-deadline",
+		Status:          "online",
+		SessionDeadline: &dl,
+	}); err != nil {
+		t.Fatalf("UpsertNode(deadline) error: %v", err)
+	}
+	if err := client.HeartbeatNode(deadlineNode, 1); err != nil {
+		t.Fatalf("HeartbeatNode(deadline) error: %v", err)
+	}
+
+	// Healthy target node (no deadline).
+	if err := client.UpsertNode(&database.Node{
+		NodeID:   targetNode,
+		Hostname: "test-host-target",
+		Status:   "online",
+	}); err != nil {
+		t.Fatalf("UpsertNode(target) error: %v", err)
+	}
+	if err := client.HeartbeatNode(targetNode, 0); err != nil {
+		t.Fatalf("HeartbeatNode(target) error: %v", err)
+	}
+
+	// A channel assigned to the deadline node.
+	assignment := database.ChannelAssignment{
+		Username:     testNodeID + "-mig-ch",
+		Site:         "chaturbate",
+		AssignedNode: deadlineNode,
+		Status:       "claimed",
+		IsLive:       true,
+		Framerate:    60,
+		Resolution:   1080,
+	}
+	if err := client.BulkInsertAssignments([]database.ChannelAssignment{assignment}); err != nil {
+		t.Fatalf("BulkInsertAssignments error: %v", err)
+	}
+	defer func() { _ = client.DeleteAssignment(assignment.Username, assignment.Site) }()
+
+	// GetNodesWithImminentDeadline must surface the deadline node.
+	imminent, err := client.GetNodesWithImminentDeadline(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("GetNodesWithImminentDeadline error: %v", err)
+	}
+	found := false
+	for _, n := range imminent {
+		if n.NodeID == deadlineNode {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("deadline node %q not in imminent list (window 10m, deadline +5m)", deadlineNode)
+	}
+
+	// ReassignChannel moves the channel off the deadline node atomically.
+	if err := client.ReassignChannel(assignment.Username, assignment.Site, deadlineNode, targetNode); err != nil {
+		t.Fatalf("ReassignChannel error: %v", err)
+	}
+	got, err := client.GetAssignment(assignment.Username, assignment.Site)
+	if err != nil {
+		t.Fatalf("GetAssignment error: %v", err)
+	}
+	if got == nil || got.AssignedNode != targetNode {
+		assigned := "<nil>"
+		if got != nil {
+			assigned = got.AssignedNode
+		}
+		t.Fatalf("assignment assigned to %q, want %q", assigned, targetNode)
 	}
 }
 

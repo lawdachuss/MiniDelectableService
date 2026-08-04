@@ -39,6 +39,16 @@ func IsUploadInFlight(filePath string) bool {
 	return ok
 }
 
+// InFlightCount returns the number of files currently marked in-flight.
+// Exposed for diagnostics: a count far larger than the number of active
+// pipelines suggests stale markers were left behind by a crashed flow — the
+// "already uploading, skipping duplicate" failure mode.
+func InFlightCount() int {
+	pendingUploadsMu.Lock()
+	defer pendingUploadsMu.Unlock()
+	return len(pendingUploads)
+}
+
 func normalizeUploadPath(filePath string) string {
 	if abs, err := filepath.Abs(filePath); err == nil {
 		return filepath.Clean(abs)
