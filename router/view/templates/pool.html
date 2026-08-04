@@ -4,13 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="stylesheet" href="/static/styles/app.css?v=5" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="dns-prefetch" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="preload" as="style" onload="this.onload=null;this.rel='stylesheet'"
           href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Outfit:wght@400;500;600;700;800;900&display=swap" />
     <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Outfit:wght@400;500;600;700;800;900&display=swap" /></noscript>
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
-    <title>Channel Pool — StreamBate</title>
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+    <link rel="manifest" href="/static/site.webmanifest">
+    <title>Pool — StreamBate</title>
     <script>
         (function(){
             if (localStorage.getItem('darkMode') === 'true' ||
@@ -31,6 +34,7 @@
             --border-color: rgba(255,255,255,0.06);
             --border-subtle: rgba(255,255,255,0.08);
             --accent: #d4a053;
+            --accent-glow: rgba(212,160,83,0.3);
         }
         html:not(.dark) {
             --bg-body: #f4f4f5;
@@ -50,317 +54,586 @@
             margin: 0;
             padding: 0;
             font-size: 13px;
+            line-height: 1.5;
         }
-        .layout { max-width: 1200px; margin: 0 auto; padding: 24px 32px; }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        .pool-layout {
+            max-width: 1440px;
+            margin: 0 auto;
+            padding: 24px 32px;
+        }
+
         .header {
-            display: flex; align-items: center; justify-content: space-between;
-            margin-bottom: 28px; padding-bottom: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
             border-bottom: 1px solid var(--border-color);
-        }		.header h1 { font-family: 'Outfit', sans-serif; font-weight: 800; font-size: 22px; margin: 0; display: flex; align-items: center; gap: 10px; }
-		.mode-badge {
-			font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
-			padding: 3px 10px; border-radius: 6px;
-			background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.25);
-			vertical-align: middle;
-		}
-		.mode-badge.pooled { background: rgba(59,130,246,0.12); color: #3b82f6; border-color: rgba(59,130,246,0.25); }
-		.nav-links { display: flex; gap: 12px; align-items: center; }
-        .nav-links a {
-            font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 8px;
-            background: var(--bg-input); border: 1px solid var(--border-subtle);
-            color: var(--text-secondary); transition: all 0.2s; text-decoration: none;
         }
-        .nav-links a:hover { background: var(--bg-card); color: var(--text-primary); text-decoration: none; }
-        .section { margin-bottom: 28px; }
-        .section-title {
-            font-family: 'Outfit', sans-serif; font-size: 16px; font-weight: 700;
-            margin: 0 0 10px 0; display: flex; align-items: center; gap: 8px;
+        .header h1 {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 800;
+            font-size: 22px;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
-        .section-title .count {
-            font-size: 11px; font-weight: 600; color: var(--text-muted);
-            background: var(--bg-input); padding: 2px 8px; border-radius: 6px;
+        .mode-badge {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            padding: 3px 10px;
+            border-radius: 6px;
+            background: rgba(245,158,11,0.12);
+            color: #f59e0b;
+            border: 1px solid rgba(245,158,11,0.25);
+            vertical-align: middle;
         }
-        .table-wrap { overflow-x: auto; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; }
-        table { width: 100%; border-collapse: collapse; font-size: 12px; }
-        th {
-            text-align: left; font-size: 10px; font-weight: 700; text-transform: uppercase;
-            letter-spacing: 0.06em; color: var(--text-muted); padding: 10px 12px;
-            border-bottom: 1px solid var(--border-color); white-space: nowrap;
+        .mode-badge.pooled {
+            background: rgba(59,130,246,0.12);
+            color: #3b82f6;
+            border-color: rgba(59,130,246,0.25);
         }
-        td { padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.03); vertical-align: middle; }
-        tr:last-child td { border-bottom: none; }
-        tr:hover td { background: rgba(255,255,255,0.02); }
-        .status-badge {
-            display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px;
-            border-radius: 4px; text-transform: uppercase; letter-spacing: 0.04em;
+        .nav-links {
+            display: flex;
+            gap: 12px;
+            align-items: center;
         }
-        .status-badge.live { background: rgba(16,185,129,0.15); color: #10b981; }
-        .status-badge.claimed { background: rgba(59,130,246,0.15); color: #3b82f6; }		.status-badge.unassigned { background: rgba(245,158,11,0.15); color: #f59e0b; }
-		.status-badge.paused { background: rgba(245,158,11,0.15); color: #f59e0b; }
-		.status-badge.connecting { background: rgba(59,130,246,0.15); color: #3b82f6; }
-		.status-badge.offline { background: rgba(113,113,122,0.12); color: #71717a; }
-		.status-badge.local { background: rgba(139,92,246,0.14); color: #a78bfa; }
-		.status-badge.pool { background: rgba(59,130,246,0.12); color: #60a5fa; }
-        .mono { font-family: ui-monospace, monospace; font-size: 11px; }
-        .empty-state { padding: 24px; text-align: center; color: var(--text-muted); font-size: 12px; }
-        .btn-action {
-            font-size: 11px; padding: 3px 8px; border-radius: 4px; border: none;
-            cursor: pointer; font-weight: 600; background: rgba(255,255,255,0.06);
-            color: var(--text-secondary); transition: background 0.15s;
-        }
-        .btn-action:hover { background: rgba(255,255,255,0.12); }
-        .btn-action-del:hover { background: rgba(239,68,68,0.2); color: #ef4444; }
-        .add-form {
-            display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
-            padding: 12px; background: var(--bg-card); border: 1px solid var(--border-color);			border-radius: 12px; margin-bottom: 2px;
-		}
-        .add-form input, .add-form select {
-            padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border-color);
-            background: var(--bg-input); color: var(--text-primary); font-size: 12px;
-        }
-        .add-form input:focus, .add-form select:focus { outline: none; border-color: var(--accent); }
-        .add-form button {
-            padding: 6px 14px; border-radius: 6px; border: none;
-            background: var(--accent); color: #fff; font-size: 12px; font-weight: 600;
+        .nav-links a, .nav-btn {
+            font-size: 12px;
+            font-weight: 600;
+            padding: 6px 14px;
+            border-radius: 8px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-secondary);
+            transition: all 0.2s;
             cursor: pointer;
-        }		.add-form button:hover:not(:disabled) { opacity: 0.85; transform: translateY(-1px); }
-		.add-form button:disabled { opacity: 0.45; cursor: not-allowed; }
-		.check-status {
-			min-height: 18px; margin: 4px 0 14px 0; font-size: 11px; font-weight: 500;
-			padding: 4px 12px; border-radius: 8px; display: flex; align-items: center; gap: 6px;
-		}
-		.check-status:empty { padding: 0; margin: 0 0 14px 0; min-height: 0; }
-		.check-status.ok { background: rgba(16,185,129,0.1); color: #10b981; border: 1px solid rgba(16,185,129,0.2); }
-		.check-status.exists { background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
-		.check-status.checking { background: var(--bg-input); color: var(--text-muted); border: 1px solid var(--border-color); }
+        }
+        .nav-links a:hover, .nav-btn:hover {
+            background: var(--bg-card);
+            color: var(--text-primary);
+            text-decoration: none;
+        }
+
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 12px 16px;
+        }
+        .stat-card .label {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+        }
+        .stat-card .value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 24px;
+            font-weight: 800;
+            margin-top: 2px;
+        }
+
+        .add-form {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            padding: 14px 16px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .add-form select, .add-form input {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border-subtle);
+            background: var(--bg-input);
+            color: var(--text-primary);
+            font-family: 'DM Sans', sans-serif;
+            font-size: 13px;
+        }
+        .add-form select:focus, .add-form input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .add-form .btn-primary {
+            padding: 8px 18px;
+            border-radius: 8px;
+            border: none;
+            background: var(--accent);
+            color: #fff;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: opacity 0.15s;
+        }
+        .add-form .btn-primary:hover { opacity: 0.85; }
+        .add-form .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+        .username-wrap { position: relative; display: inline-flex; align-items: center; }
+        .username-wrap input { padding-right: 28px; min-width: 160px; }
+        #pool-check-indicator {
+            position: absolute; right: 8px;
+            font-size: 14px; pointer-events: none;
+        }
+        .dup-hint {
+            font-size: 11px; color: var(--accent); font-weight: 600;
+            display: none;
+        }
+        .dup-hint.show { display: inline; }
+
+        .table-wrap {
+            overflow-x: auto;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+        }
+        table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        thead tr { border-bottom: 1px solid var(--border-color); }
+        th {
+            text-align: left;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            padding: 10px 14px;
+            white-space: nowrap;
+        }
+        td {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border-color);
+            vertical-align: middle;
+        }
+        tr:last-child td { border-bottom: none; }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 3px 9px;
+            border-radius: 20px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            white-space: nowrap;
+        }
+        .badge-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+        .badge-claimed { background: rgba(96,165,250,0.15); color: #60a5fa; }
+        .badge-claimed .badge-dot { background: #60a5fa; }
+        .badge-unassigned { background: rgba(251,191,36,0.15); color: #fbbf24; }
+        .badge-unassigned .badge-dot { background: #fbbf24; }
+        .badge-paused { background: rgba(245,158,11,0.15); color: #f59e0b; }
+        .badge-paused .badge-dot { background: #f59e0b; }
+        .badge-live { background: rgba(52,211,153,0.15); color: #34d399; }
+        .badge-live .badge-dot { background: #34d399; }
+        .badge-offline { background: rgba(107,114,128,0.12); color: #6b7280; }
+        .badge-offline .badge-dot { background: #6b7280; }
+
+        .site-pill {
+            font-size: 10px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+        .site-pill.chaturbate { background: rgba(255,138,76,0.13); color: #ff8a4c; }
+        .site-pill.stripchat { background: rgba(236,72,153,0.13); color: #ec4899; }
+
+        .uname { font-weight: 700; font-size: 13px; }
+        .node-id {
+            font-family: 'DM Sans', monospace;
+            font-size: 11px;
+            color: var(--text-secondary);
+            background: var(--bg-input);
+            padding: 2px 7px;
+            border-radius: 5px;
+        }
+        .ts { font-size: 10px; color: var(--text-muted); }
+
+        .btn-del {
+            font-size: 11px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-weight: 700;
+            background: rgba(248,113,113,0.15);
+            color: #f87171;
+        }
+        .btn-del:hover { background: rgba(248,113,113,0.3); }
+
+        .empty-state {
+            padding: 60px 24px;
+            text-align: center;
+            color: var(--text-muted);
+        }
+        .empty-state p { margin: 4px 0; }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        .section-header h2 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            margin: 0;
+        }
+        .count-badge {
+            font-size: 10px;
+            font-weight: 700;
+            padding: 1px 8px;
+            border-radius: 20px;
+            background: var(--bg-input);
+            color: var(--text-secondary);
+        }
+
+        .res-chip {
+            font-size: 10px;
+            font-weight: 500;
+            padding: 2px 7px;
+            border-radius: 4px;
+        }
+        .res-chip.high { background: rgba(192,132,252,0.12); color: #c084fc; }
+        .res-chip.mid { background: rgba(52,211,153,0.12); color: #34d399; }
+        .res-chip.low { background: rgba(251,191,36,0.12); color: #fbbf24; }
     </style>
 </head>
 <body>
-<div class="layout">
-    <div class="header">		<h1>
-			Channel Pool
-			{{ if eq .Mode "pooled" }}<span class="mode-badge pooled">● Pooled</span>{{ else }}<span class="mode-badge">● Isolated</span>{{ end }}
-		</h1>
+<div class="pool-layout">
+
+    <div class="header">
+        <h1>Channel Pool {{ if eq .Mode "pooled" }}<span class="mode-badge pooled">Pooled</span>{{ else }}<span class="mode-badge">Isolated</span>{{ end }}</h1>
         <div class="nav-links">
-            <a href="/">← Dashboard</a>
+            <a href="/">Dashboard</a>
             <a href="/admin">Admin</a>
             <a href="/nodes">Nodes</a>
             <a href="/videos">Videos</a>
+            <span style="color:var(--text-muted)">|</span>
             <a href="javascript:void(0)" onclick="location.reload()">Refresh</a>
-            <a href="javascript:void(0)" onclick="toggleTheme()" id="theme-btn" style="font-size:14px">🌙</a>
+            <span class="nav-btn" onclick="toggleTheme()" id="theme-btn" style="font-size:15px">🌙</span>
         </div>
     </div>
 
-    <div class="add-form">		<select id="pool-site" onchange="checkPoolChannel()">
-			<option value="chaturbate">Chaturbate</option>
-			<option value="stripchat">Stripchat</option>
-		</select>
-		<input type="text" id="pool-username" placeholder="Username" autocomplete="off" spellcheck="false" oninput="checkPoolChannel()" />
+    <div class="stats-row">
+        <div class="stat-card">
+            <div class="label">Total</div>
+            <div class="value" id="stat-total">{{ len .Assignments }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Live</div>
+            <div class="value" style="color:#34d399" id="stat-live">
+                {{ $live := 0 }}{{ range .Assignments }}{{ if .IsLive }}{{ $live = add $live 1 }}{{ end }}{{ end }}{{ $live }}
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Claimed</div>
+            <div class="value" style="color:#60a5fa" id="stat-claimed">
+                {{ $claimed := 0 }}{{ range .Assignments }}{{ if eq .Status "claimed" }}{{ $claimed = add $claimed 1 }}{{ end }}{{ end }}{{ $claimed }}
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Unassigned</div>
+            <div class="value" style="color:#fbbf24" id="stat-unassigned">
+                {{ $unassigned := 0 }}{{ range .Assignments }}{{ if eq .Status "unassigned" }}{{ $unassigned = add $unassigned 1 }}{{ end }}{{ end }}{{ $unassigned }}
+            </div>
+        </div>
+    </div>
+
+    <div class="add-form">
+        <select id="pool-site">
+            <option value="chaturbate">Chaturbate</option>
+            <option value="stripchat">Stripchat</option>
+        </select>
+        <div class="username-wrap">
+            <input type="text" id="pool-username" placeholder="Username"
+                   oninput="onUsernameInput()" autocomplete="off" spellcheck="false" />
+            <span id="pool-check-indicator"></span>
+        </div>
         <select id="pool-resolution">
-            <option value="2160" selected>4K — 2160p</option>
-            <option value="1440">2K — 1440p</option>
-            <option value="1080">FHD — 1080p</option>
-            <option value="720">HD — 720p</option>
+            <option value="2160" selected>2160p</option>
+            <option value="1440">1440p</option>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
         </select>
         <select id="pool-framerate">
-            <option value="60" selected>60 FPS</option>
-            <option value="30">30 FPS</option>
-        </select>		<button id="pool-add-btn" onclick="addToPool()">Add to Pool</button>
-	</div>
-	<div id="pool-check-status" class="check-status"></div>
+            <option value="60" selected>60fps</option>
+            <option value="30">30fps</option>
+        </select>
+        <button class="btn-primary" onclick="addToPool()" id="pool-add-btn">+ Add</button>
+        <span class="dup-hint" id="dup-hint">Already exists</span>
+    </div>
 
-	{{ if .Entries }}
-	<div class="section">
-		<h2 class="section-title">Channels <span class="count">{{ len .Entries }}</span></h2>
+    <div id="pool-channels-section">
+        {{ if .Assignments }}
+        <div class="section-header">
+            <h2>Channels <span class="count-badge" id="channels-count-badge">{{ len .Assignments }}</span></h2>
+        </div>
         <div class="table-wrap">
             <table>
-                <thead>					<tr>
-						<th>Channel</th>
-						<th>Site</th>
-						<th>Source</th>
-						<th>Node</th>
+                <thead>
+                    <tr>
+                        <th>Channel</th>
+                        <th>Site</th>
+                        <th>Node</th>
                         <th>Status</th>
                         <th>Live</th>
                         <th>Resolution</th>
-                        <th>Framerate</th>
+                        <th>FPS</th>
                         <th>Assigned</th>
-                        <th>Actions</th>
+                        <th></th>
                     </tr>
                 </thead>
-                <tbody>					{{ range .Entries }}
-					<tr>
-						<td><strong>{{ .Username }}</strong></td>
-						<td>{{ .Site }}</td>
-						<td>
-							{{ if eq .Source "pool" }}
-								<span class="status-badge pool">Pool</span>
-							{{ else }}
-								<span class="status-badge local">Local</span>
-							{{ end }}
-						</td>
-						<td class="mono">
-                            {{ if .AssignedNode }}
-                            {{ .AssignedNode }}
-                            {{ else }}
-                            <span style="color:var(--text-muted)">—</span>
-                            {{ end }}
+                <tbody id="pool-tbody">
+                    {{ range .Assignments }}
+                    <tr>
+                        <td><span class="uname">{{ .Username }}</span></td>
+                        <td>
+                            {{ if eq .Site "chaturbate" }}<span class="site-pill chaturbate">Chaturbate</span>
+                            {{ else if eq .Site "stripchat" }}<span class="site-pill stripchat">Stripchat</span>
+                            {{ else }}{{ .Site }}{{ end }}
                         </td>
-                        <td>							{{ if eq .Status "claimed" }}
-								<span class="status-badge claimed">Claimed</span>
-							{{ else if eq .Status "unassigned" }}
-								<span class="status-badge unassigned">Unassigned</span>
-							{{ else if eq .Status "recording" }}
-								<span class="status-badge live">Recording</span>
-							{{ else if eq .Status "paused" }}
-								<span class="status-badge paused">Paused</span>
-							{{ else if eq .Status "connecting" }}
-								<span class="status-badge connecting">Connecting</span>
-							{{ else }}
-								<span class="status-badge offline">{{ .Status }}</span>
-							{{ end }}
+                        <td>{{ if .AssignedNode }}<span class="node-id">{{ .AssignedNode }}</span>{{ else }}<span style="color:var(--text-muted)">—</span>{{ end }}</td>
+                        <td>
+                             {{ if eq .Status "claimed" }}<span class="badge badge-claimed"><span class="badge-dot"></span>Claimed</span>
+                             {{ else if eq .Status "recording" }}<span class="badge badge-live"><span class="badge-dot"></span>Recording</span>
+                             {{ else if eq .Status "paused" }}<span class="badge badge-paused"><span class="badge-dot"></span>Paused</span>
+                             {{ else }}<span class="badge badge-unassigned"><span class="badge-dot"></span>Unassigned</span>{{ end }}
                         </td>
                         <td>
-                            {{ if .IsLive }}
-                                <span class="status-badge live">Live</span>
-                            {{ else }}
-                                <span class="status-badge offline">Offline</span>
-                            {{ end }}
-                        </td>						<td class="mono">
-							{{ if .Resolution }}{{ .Resolution }}p{{ else }}<span style="color:var(--text-muted)">—</span>{{ end }}
-						</td>
-						<td class="mono">
-							{{ if .Framerate }}{{ .Framerate }}fps{{ else }}<span style="color:var(--text-muted)">—</span>{{ end }}
-						</td>
-						<td class="mono">
-							{{ if .AssignedAt }}{{ .AssignedAt }}{{ else }}<span style="color:var(--text-muted)">—</span>{{ end }}
-						</td>
+                            {{ if .IsLive }}<span class="badge badge-live"><span class="badge-dot"></span>Live</span>
+                            {{ else }}<span class="badge badge-offline"><span class="badge-dot"></span>Offline</span>{{ end }}
+                        </td>
                         <td>
-                            <button class="btn-action btn-action-del" onclick="removeFromPool('{{ .Username }}', '{{ .Site }}')" title="Remove">✕</button>
+                            {{ if ge .Resolution 1440 }}<span class="res-chip high">{{ .Resolution }}p</span>
+                            {{ else if ge .Resolution 1080 }}<span class="res-chip mid">{{ .Resolution }}p</span>
+                            {{ else }}<span class="res-chip low">{{ .Resolution }}p</span>{{ end }}
+                        </td>
+                        <td>{{ .Framerate }}fps</td>
+                        <td><span class="ts">{{ .AssignedAt }}</span></td>
+                        <td>
+                            <button class="btn-del" onclick="removeFromPool('{{ .Username }}', '{{ .Site }}')">Remove</button>
                         </td>
                     </tr>
                     {{ end }}
                 </tbody>
             </table>
         </div>
+        {{ else }}
+        <div class="empty-state" id="empty-state-wrap">
+            <p>Loading channels...</p>
+        </div>
+        {{ end }}
     </div>
-    {{ else }}
-    <div class="empty-state" style="padding:48px">No channels in the pool. Add one above.</div>
-    {{ end }}
+
 </div>
 
 <script>
-var poolCheckTimer = null;
-var poolCheckSeq = 0; // guards against stale out-of-order check responses
+var _checkTimer = null;
+var _isDuplicate = false;
 
-function checkPoolChannel() {
+function loadPoolData() {
+    fetch('/api/pool', { cache: 'no-store' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        if (!data || !data.assignments) return;
+        var assignments = data.assignments;
+        
+        // Update Stats
+        var total = assignments.length;
+        var liveCount = 0;
+        var claimedCount = 0;
+        var unassignedCount = 0;
+
+        assignments.forEach(function(a) {
+            if (a.is_live) liveCount++;
+            if (a.status === 'claimed' || a.status === 'recording') claimedCount++;
+            if (a.status === 'unassigned') unassignedCount++;
+        });
+
+        var elTotal = document.getElementById('stat-total');
+        if (elTotal) elTotal.textContent = total;
+        var elLive = document.getElementById('stat-live');
+        if (elLive) elLive.textContent = liveCount;
+        var elClaimed = document.getElementById('stat-claimed');
+        if (elClaimed) elClaimed.textContent = claimedCount;
+        var elUnassigned = document.getElementById('stat-unassigned');
+        if (elUnassigned) elUnassigned.textContent = unassignedCount;
+
+        var sec = document.getElementById('pool-channels-section');
+        if (!sec) return;
+
+        if (total === 0) {
+            sec.innerHTML = '<div class="empty-state"><p>No channels in the pool.</p><p style="font-size:11px">Add one using the form above.</p></div>';
+            return;
+        }
+
+        var html = '<div class="section-header"><h2>Channels <span class="count-badge">' + total + '</span></h2></div>';
+        html += '<div class="table-wrap"><table><thead><tr>' +
+                '<th>Channel</th><th>Site</th><th>Node</th><th>Status</th><th>Live</th><th>Resolution</th><th>FPS</th><th>Assigned</th><th></th>' +
+                '</tr></thead><tbody id="pool-tbody">';
+
+        assignments.forEach(function(a) {
+            var sitePill = a.site === 'chaturbate' ? '<span class="site-pill chaturbate">Chaturbate</span>' :
+                          (a.site === 'stripchat' ? '<span class="site-pill stripchat">Stripchat</span>' : a.site);
+            var nodeId = a.assigned_node ? '<span class="node-id">' + escapeHtml(a.assigned_node) + '</span>' : '<span style="color:var(--text-muted)">—</span>';
+            
+             var statusBadge = a.status === 'claimed' ? '<span class="badge badge-claimed"><span class="badge-dot"></span>Claimed</span>' :
+                               a.status === 'recording' ? '<span class="badge badge-live"><span class="badge-dot"></span>Recording</span>' :
+                               a.status === 'paused' ? '<span class="badge badge-paused"><span class="badge-dot"></span>Paused</span>' :
+                               '<span class="badge badge-unassigned"><span class="badge-dot"></span>Unassigned</span>';
+            
+            var liveBadge = a.is_live ? '<span class="badge badge-live"><span class="badge-dot"></span>Live</span>' :
+                           '<span class="badge badge-offline"><span class="badge-dot"></span>Offline</span>';
+
+            var resChipClass = a.resolution >= 1440 ? 'high' : (a.resolution >= 1080 ? 'mid' : 'low');
+            var resChip = '<span class="res-chip ' + resChipClass + '">' + (a.resolution || 2160) + 'p</span>';
+            var fps = (a.framerate || 60) + 'fps';
+            var assignedAt = a.assigned_at ? '<span class="ts">' + escapeHtml(a.assigned_at) + '</span>' : '';
+
+            html += '<tr>' +
+                '<td><span class="uname">' + escapeHtml(a.username) + '</span></td>' +
+                '<td>' + sitePill + '</td>' +
+                '<td>' + nodeId + '</td>' +
+                '<td>' + statusBadge + '</td>' +
+                '<td>' + liveBadge + '</td>' +
+                '<td>' + resChip + '</td>' +
+                '<td>' + fps + '</td>' +
+                '<td>' + assignedAt + '</td>' +
+                '<td><button class="btn-del" onclick="removeFromPool(\'' + escapeJs(a.username) + '\', \'' + escapeJs(a.site) + '\')">Remove</button></td>' +
+                '</tr>';
+        });
+
+        html += '</tbody></table></div>';
+        sec.innerHTML = html;
+    })
+    .catch(function(e) { console.error('Failed loading pool:', e); });
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function escapeJs(str) {
+    if (!str) return '';
+    return String(str).replace(/'/g, "\\'");
+}
+
+function onUsernameInput() {
+    if (_checkTimer) clearTimeout(_checkTimer);
+    var indicator = document.getElementById('pool-check-indicator');
+    var addBtn = document.getElementById('pool-add-btn');
+    var dupHint = document.getElementById('dup-hint');
     var username = document.getElementById('pool-username').value.trim();
-    var status = document.getElementById('pool-check-status');
-    var btn = document.getElementById('pool-add-btn');
-    clearTimeout(poolCheckTimer);
-    poolCheckSeq++; // invalidate any in-flight response
-
-    if (!username) {
-        status.className = 'check-status';
-        status.textContent = '';
-        btn.disabled = false;
-        btn.textContent = 'Add to Pool';
-        return;
-    }
-
-    status.className = 'check-status checking';
-    status.textContent = 'Checking \u201c' + username + '\u201d\u2026';
-    btn.disabled = true;
-
-    poolCheckTimer = setTimeout(function() {
-        var seq = poolCheckSeq;
+    _isDuplicate = false;
+    indicator.textContent = '';
+    addBtn.disabled = false;
+    dupHint.classList.remove('show');
+    if (!username) return;
+    indicator.textContent = '...';
+    _checkTimer = setTimeout(function () {
         var site = document.getElementById('pool-site').value;
-        fetch('/api/pool/check?username=' + encodeURIComponent(username) + '&site=' + encodeURIComponent(site))
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                if (seq !== poolCheckSeq) return; // stale response, ignore
-                if (data.exists) {
-                    status.className = 'check-status exists';
-                    status.textContent = '\u26a0 ' + data.message + ' \u2014 adding will be skipped';
-                    btn.disabled = true;
-                } else {
-                    status.className = 'check-status ok';
-                    status.textContent = '\u2713 Available \u2014 channel will be added';
-                    btn.disabled = false;
-                }
-            })
-            .catch(function() {
-                if (seq !== poolCheckSeq) return;
-                status.className = 'check-status';
-                status.textContent = '';
-                btn.disabled = false;
-            });
-    }, 350);
+        fetch('/api/pool/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ site: site, username: username })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.exists) {
+                _isDuplicate = true;
+                indicator.textContent = '!';
+                indicator.style.color = 'var(--accent)';
+                addBtn.disabled = true;
+                dupHint.classList.add('show');
+            } else {
+                indicator.textContent = '+';
+                indicator.style.color = 'var(--accent)';
+                addBtn.disabled = false;
+                dupHint.classList.remove('show');
+            }
+        })
+        .catch(function () { indicator.textContent = ''; });
+    }, 400);
 }
 
 function addToPool() {
+    if (_isDuplicate) return;
     var site = document.getElementById('pool-site').value;
     var username = document.getElementById('pool-username').value.trim();
     if (!username) return;
-    var resolution = parseInt(document.getElementById('pool-resolution').value);
-    var framerate = parseInt(document.getElementById('pool-framerate').value);
+    var resolution = parseInt(document.getElementById('pool-resolution').value, 10);
+    var framerate = parseInt(document.getElementById('pool-framerate').value, 10);
     var btn = document.getElementById('pool-add-btn');
-    var status = document.getElementById('pool-check-status');
-
     btn.disabled = true;
-    btn.textContent = 'Adding\u2026';
+    btn.textContent = '...';
     fetch('/api/pool/add', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({site: site, username: username, resolution: resolution, framerate: framerate})
-    }).then(function(r) {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ site: site, username: username, resolution: resolution, framerate: framerate })
+    })
+    .then(function (r) {
         if (r.ok) {
-            location.reload();
-            return;
-        }
-        return r.json().catch(function() { return null; }).then(function(data) {
+            document.getElementById('pool-username').value = '';
             btn.disabled = false;
-            btn.textContent = 'Add to Pool';
-            var msg = (data && data.error) ? data.error : ('Failed: HTTP ' + r.status);
-            status.className = 'check-status exists';
-            status.textContent = '\u26a0 ' + msg;
-        });
-    }).catch(function(e) {
-        btn.disabled = false;
-        btn.textContent = 'Add to Pool';
-        alert('Error: ' + e);
-    });
+            btn.textContent = '+ Add';
+            loadPoolData();
+        } else {
+            return r.text().then(function (t) { alert(t); btn.disabled = false; btn.textContent = '+ Add'; });
+        }
+    })
+    .catch(function (e) { alert(e); btn.disabled = false; btn.textContent = '+ Add'; });
 }
 
 function removeFromPool(username, site) {
-    if (!confirm('Remove "' + username + '" from the pool?')) return;
+    if (!confirm('Remove "' + username + '"?')) return;
     fetch('/api/pool/remove', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({username: username, site: site})
-    }).then(function(r) {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username, site: site })
+    })
+    .then(function (r) {
         if (r.ok) {
-            location.reload();
+            loadPoolData();
         } else {
-            return r.text().then(function(t) { alert('Failed: ' + t); });
+            return r.text().then(function (t) { alert(t); });
         }
-    }).catch(function(e) { alert('Error: ' + e); });
+    })
+    .catch(function (e) { alert(e); });
 }
-</script>
-<script>
-(function() {
-    var btn = document.getElementById('theme-btn');
-    if (btn) {
-        btn.textContent = document.documentElement.classList.contains('dark') ? '☀️' : '🌙';
-    }
-})();
+
 function toggleTheme() {
     var html = document.documentElement;
     html.classList.toggle('dark');
     var isDark = html.classList.contains('dark');
     localStorage.setItem('darkMode', isDark);
-    var btn = document.getElementById('theme-btn');
-    if (btn) btn.textContent = isDark ? '☀️' : '🌙';
+    document.getElementById('theme-btn').textContent = isDark ? '☀️' : '🌙';
 }
+
+(function () {
+    var btn = document.getElementById('theme-btn');
+    if (btn) btn.textContent = document.documentElement.classList.contains('dark') ? '☀️' : '🌙';
+    loadPoolData();
+    setInterval(loadPoolData, 10000);
+})();
 </script>
 </body>
 </html>

@@ -123,6 +123,37 @@
             border-radius: 4px;
             pointer-events: none;
         }
+        .seekbar-preview {
+            position: absolute;
+            bottom: 20px;
+            transform: translateX(-50%);
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            pointer-events: none;
+            z-index: 10;
+        }
+        .seekbar-preview-img {
+            width: 160px;
+            height: 90px;
+            background-size: cover;
+            background-position: center;
+            border-radius: 6px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+            border: 2px solid rgba(255,255,255,0.15);
+            background-color: #000;
+        }
+        .seekbar-preview-time {
+            margin-top: 4px;
+            background: rgba(0,0,0,0.8);
+            backdrop-filter: blur(8px);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
         .progress-time-tooltip {
             position: absolute;
             bottom: 14px;
@@ -661,6 +692,10 @@
         <!-- Custom controls -->
         <div class="custom-controls">
             <div class="progress-container" id="progress-container">
+                <div class="seekbar-preview" id="seekbar-preview">
+                    <div class="seekbar-preview-img" id="seekbar-preview-img"></div>
+                    <div class="seekbar-preview-time" id="seekbar-preview-time">0:00</div>
+                </div>
                 <div class="progress-buffer" id="progress-buffer" style="width:0%"></div>
                 <div class="progress-hover" id="progress-hover"></div>
                 <div class="progress-bar" id="progress-bar" style="width:0%"></div>
@@ -774,6 +809,10 @@
         </div>
         <div class="custom-controls">
             <div class="progress-container" id="progress-container">
+                <div class="seekbar-preview" id="seekbar-preview">
+                    <div class="seekbar-preview-img" id="seekbar-preview-img"></div>
+                    <div class="seekbar-preview-time" id="seekbar-preview-time">0:00</div>
+                </div>
                 <div class="progress-hover" id="progress-hover"></div>
                 <div class="progress-bar" id="progress-bar" style="width:0%"></div>
                 <div class="progress-time-tooltip" id="progress-tooltip">0:00</div>
@@ -1103,7 +1142,7 @@ function buildVideoPlayerHTML(src) {
         '<video id="video-player" preload="metadata" playsinline crossorigin="anonymous" onloadeddata="playerLoaded()" onerror="playerError()" onplay="onPlay()" onpause="onPause()"><source src="' + src + '" type="video/mp4" /></video>' +
         '<div class="center-play" onclick="togglePlay()"><div class="center-play-btn"><svg fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21"/></svg></div></div>' +
         '<div id="error-message" class="hidden" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000;z-index:20;color:#71717a"><svg class="w-12 h-12 mb-3" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg><p class="text-sm mb-4">Could not load video directly.</p><button onclick="retryVideo()" class="action-btn action-btn-ghost text-xs">Retry</button></div>' +
-        '<div class="custom-controls"><div class="progress-container" id="progress-container"><div class="progress-hover" id="progress-hover"></div><div class="progress-bar" id="progress-bar" style="width:0%"></div><div class="progress-time-tooltip" id="progress-tooltip">0:00</div></div>' +
+        '<div class="custom-controls"><div class="progress-container" id="progress-container"><div class="seekbar-preview" id="seekbar-preview"><div class="seekbar-preview-img" id="seekbar-preview-img"></div><div class="seekbar-preview-time" id="seekbar-preview-time">0:00</div></div><div class="progress-hover" id="progress-hover"></div><div class="progress-bar" id="progress-bar" style="width:0%"></div><div class="progress-time-tooltip" id="progress-tooltip">0:00</div></div>' +
         '<div class="controls-row"><div class="ctrl-left"><button class="ctrl-btn" onclick="togglePlay()" title="Play (Space)"><svg id="icon-play" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21"/></svg><svg id="icon-pause" fill="currentColor" viewBox="0 0 24 24" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg></button>' +
         '<div class="volume-wrap"><button class="ctrl-btn" onclick="toggleMute()" title="Mute (M)"><svg id="icon-vol" fill="currentColor" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 010 7.07" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M19.07 4.93a10 10 0 010 14.14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><svg id="icon-muted" fill="currentColor" viewBox="0 0 24 24" style="display:none"><path d="M11 5L6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>' +
         '<input type="range" class="volume-slider" id="volume-slider" min="0" max="1" step="0.05" value="1" oninput="setVolume(this.value)" /></div>' +
@@ -1245,10 +1284,39 @@ function formatTime(seconds) {
     return m + ':' + (s < 10 ? '0' : '') + s;
 }
 
+// TRUE_DUR is the server-verified content duration in seconds (0 = unknown).
+// LL-HLS recordings that failed normalize carry absolute server timestamps
+// (e.g. start at 5044s), so the browser's v.duration reports a 2-4h total for
+// what is really a 9-10 minute video.  When v.duration is far larger than the
+// known true duration, we treat the difference as a timeline offset and clamp
+// the displayed total + current time + seek math to the real content length.
+var TRUE_DUR = {{ .TrueDuration }} || 0;
+
+function trueDurOffset() {
+    var v = getVideo(); if (!v) return 0;
+    if (TRUE_DUR > 0 && isFinite(v.duration) && v.duration > TRUE_DUR * 1.5) {
+        return v.duration - TRUE_DUR; // absolute-timestamp offset
+    }
+    return 0;
+}
+function shownTotalDur() {
+    var v = getVideo(); if (!v) return 0;
+    return TRUE_DUR > 0 ? TRUE_DUR : v.duration;
+}
+function shownCurrentDur() {
+    var v = getVideo(); if (!v) return 0;
+    return Math.max(0, v.currentTime - trueDurOffset());
+}
+
+function vttToSeconds(vtt) {
+    var p = vtt.split(':');
+    return parseInt(p[0]) * 3600 + parseInt(p[1]) * 60 + parseFloat(p[2]);
+}
+
 function updateTotalTime() {
     var v = getVideo(); if (!v) return;
     var total = document.getElementById('time-total');
-    if (total) total.textContent = formatTime(v.duration);
+    if (total) total.textContent = formatTime(shownTotalDur());
 }
 
 function initCustomControls() {
@@ -1260,32 +1328,38 @@ function initCustomControls() {
 
     // Time update
     v.addEventListener('timeupdate', function() {
-        var pct = (v.currentTime / v.duration) * 100;
+        var total = shownTotalDur();
+        var pct = total > 0 ? (shownCurrentDur() / total) * 100 : 0;
         var bar = document.getElementById('progress-bar');
         var current = document.getElementById('time-current');
         if (bar) bar.style.width = pct + '%';
-        if (current) current.textContent = formatTime(v.currentTime);
+        if (current) current.textContent = formatTime(shownCurrentDur());
     });
 
     v.addEventListener('loadedmetadata', updateTotalTime);
 
-    // Progress bar seek
+    // Progress bar seek + hover time tooltip
     var container = document.getElementById('progress-container');
     if (container) {
         container.addEventListener('click', function(e) {
             var rect = container.getBoundingClientRect();
             var pct = (e.clientX - rect.left) / rect.width;
-            v.currentTime = pct * v.duration;
+            if (pct < 0) pct = 0;
+            if (pct > 1) pct = 1;
+            var total = shownTotalDur();
+            v.currentTime = trueDurOffset() + pct * total;
         });
         container.addEventListener('mousemove', function(e) {
             var rect = container.getBoundingClientRect();
             var pct = (e.clientX - rect.left) / rect.width;
+            if (pct < 0) pct = 0;
+            if (pct > 1) pct = 1;
             var hover = document.getElementById('progress-hover');
             var tooltip = document.getElementById('progress-tooltip');
             if (hover) hover.style.width = (pct * 100) + '%';
             if (tooltip) {
                 tooltip.style.left = (pct * 100) + '%';
-                tooltip.textContent = formatTime(pct * v.duration);
+                tooltip.textContent = formatTime(pct * shownTotalDur());
             }
         });
     }
@@ -1315,15 +1389,17 @@ function initCustomControls() {
 document.addEventListener('DOMContentLoaded', function() {
     initCustomControls();
 
-    // Persist playback position
+    // Persist playback position (absolute-timestamp aware: store the shown
+    // content-relative time, restore by adding back the timeline offset)
     var v = getVideo(); if (!v) return;
     var key = 'pos_{{ .Filename }}';
     var saved = parseFloat(localStorage.getItem(key) || '0');
     if (saved > 5) {
-        v.addEventListener('loadedmetadata', function() { v.currentTime = saved; }, { once: true });
+        v.addEventListener('loadedmetadata', function() { v.currentTime = trueDurOffset() + saved; }, { once: true });
     }
     v.addEventListener('timeupdate', function() {
-        if (v.currentTime > 5) localStorage.setItem(key, v.currentTime);
+        var shown = shownCurrentDur();
+        if (shown > 5) localStorage.setItem(key, shown);
     });
     v.addEventListener('ended', function() { localStorage.removeItem(key); });
 });
@@ -1340,15 +1416,16 @@ function copyVideoLink() {
 
 // ── New player features ──
 
-// Skip forward/backward
+// Skip forward/backward (offset-aware: for absolute-timestamp files the
+// timeline starts at trueDurOffset(), so the seek bounds must be shifted too)
 function skipForward() {
     var v = getVideo(); if (!v) return;
-    v.currentTime = Math.min(v.duration, v.currentTime + 10);
+    v.currentTime = Math.min(trueDurOffset() + shownTotalDur(), v.currentTime + 10);
     showSkipIndicator('right');
 }
 function skipBack() {
     var v = getVideo(); if (!v) return;
-    v.currentTime = Math.max(0, v.currentTime - 10);
+    v.currentTime = Math.max(trueDurOffset(), v.currentTime - 10);
     showSkipIndicator('left');
 }
 function showSkipIndicator(side) {
@@ -1435,13 +1512,14 @@ function onPlay() {
     if (poster) poster.classList.add('hidden');
 }
 
-// Buffer progress
+// Buffer progress (offset-aware)
 document.addEventListener('DOMContentLoaded', function() {
     var v = getVideo(); if (!v) return;
     v.addEventListener('progress', function() {
         if (v.buffered.length > 0) {
             var buffered = v.buffered.end(v.buffered.length - 1);
-            var pct = (buffered / v.duration) * 100;
+            var total = shownTotalDur();
+            var pct = total > 0 ? (Math.max(0, buffered - trueDurOffset()) / total) * 100 : 0;
             var buf = document.getElementById('progress-buffer');
             if (buf) buf.style.width = pct + '%';
         }

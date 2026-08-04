@@ -382,35 +382,6 @@
         .btn-delete { background: rgba(239,68,68,0.15); color: #ef4444; }
         .btn-delete:hover { background: rgba(239,68,68,0.25); }
 
-        .rescan-row {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            margin-top: 10px;
-        }
-        .rescan-row .filter-input { margin-top: 0; flex: 1; }
-        .btn-rescan {
-            font-size: 11px;
-            font-weight: 700;
-            padding: 8px 14px;
-            border-radius: 8px;
-            border: none;
-            cursor: pointer;
-            background: var(--accent);
-            color: #fff;
-            white-space: nowrap;
-            transition: opacity 0.15s, transform 0.1s;
-        }
-        .btn-rescan:hover { opacity: 0.85; }
-        .btn-rescan:active { transform: scale(0.97); }
-        .btn-rescan:disabled { opacity: 0.5; cursor: not-allowed; }
-        .rescan-status {
-            font-size: 11px;
-            margin-top: 8px;
-            min-height: 15px;
-            font-weight: 600;
-        }
-
         .edit-link {
             font-size: 11px;
             font-weight: 600;
@@ -425,6 +396,14 @@
             text-decoration: none;
         }
 
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        @keyframes refresh-glow {
+            0%, 100% { box-shadow: 0 0 4px rgba(59,130,246,0.3), 0 0 8px rgba(59,130,246,0.15); border-color: #3b82f6; }
+            50% { box-shadow: 0 0 8px rgba(59,130,246,0.6), 0 0 16px rgba(59,130,246,0.3); border-color: #60a5fa; }
+        }
         @media (max-width: 768px) {
             .admin-layout { padding: 12px 16px; }
             .metrics { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
@@ -489,11 +468,6 @@
             <div class="sub">{{ subFailed .Uploads.History }} failed</div>
         </div>
         <div class="metric-card">
-            <div class="label">Orphan Files</div>
-            <div class="value">{{ len .Orphans }}</div>
-            <div class="sub">{{ orphSize .Orphans }} total</div>
-        </div>
-        <div class="metric-card">
             <div class="label">Disk</div>
             <div class="value">{{ .Disk.Used }}</div>
             <div class="sub">{{ .Disk.Free }} free of {{ .Disk.Total }}</div>
@@ -527,6 +501,7 @@
                         <th>Channel</th>
                         <th>Site</th>
                         <th>Status</th>
+                        <th>Last Error</th>
                         <th>Duration</th>
                         <th>Filesize</th>
                         <th>Upload</th>
@@ -551,6 +526,13 @@
                                 <span class="status-badge pending">Connecting</span>
                             {{ else }}
                                 <span class="status-badge" style="background:rgba(113,113,122,0.12);color:#71717a">Offline</span>
+                            {{ end }}
+                        </td>
+                        <td style="max-width:200px">
+                            {{ if $ch.LastError }}
+                            <span class="mono" style="font-size:10px;color:#ef4444;word-break:break-word" title="{{ $ch.LastError }}">{{ $ch.LastError }}</span>
+                            {{ else }}
+                            <span style="color:var(--text-muted);font-size:10px">—</span>
                             {{ end }}
                         </td>
                         <td class="mono">{{ $ch.Duration }}</td>
@@ -595,7 +577,7 @@
             <span class="arrow">▶</span>
             Active Uploads <span class="count">{{ len .Uploads.Active }}</span>
             {{ if gt (len .Uploads.Active) 0 }}
-            <span class="badge uploading">{{ len .Uploads.Active }} uploading</span>
+            <span class="badge uploading" id="uploads-summary" style="{{ if not .Uploads.Active }}display:none{{ end }}">{{ len .Uploads.Active }} uploading</span>
             {{ end }}
         </summary>
         <div class="section-body">
@@ -611,7 +593,7 @@
                         <th>Speed</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="uploads-table-body">
                     {{ if .Uploads.Active }}
                     {{ range .Uploads.Active }}
                     <tr>
@@ -642,6 +624,47 @@
                     {{ end }}
                 </tbody>
             </table>
+        </div>
+    </details>
+
+    <!-- ════════ LIVE UPLOAD MATRIX ════════ -->
+    <style>
+        .upload-matrix { margin-top: 8px; max-height: 62vh; overflow-y: auto; }
+        .matrix-section { border: 1px solid var(--border-color, #27272a); border-radius: 8px; margin-bottom: 10px; background: var(--bg-card, #0a0a0e); }
+        .matrix-section-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border-color, #27272a); position: sticky; top: 0; background: var(--bg-card, #0a0a0e); z-index: 1; }
+        .matrix-section-title { font-weight: 700; font-size: 13px; color: var(--text-primary, #e4e4e7); }
+        .matrix-section-count { font-size: 10px; color: var(--text-muted, #52525b); }
+        .matrix-section-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; padding: 10px; }
+        .host-card { border: 1px solid var(--border-color, #27272a); border-radius: 8px; padding: 10px; background: var(--bg-card, #0a0a0e); }
+        .host-card.ok { border-color: rgba(16,185,129,0.5); }
+        .host-card.fail { border-color: rgba(239,68,68,0.5); }
+        .host-card.pending { opacity: 0.55; }
+        .host-card.active { border-color: rgba(59,130,246,0.5); }
+        .host-card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+        .host-name { font-weight: 600; font-size: 13px; color: var(--text-primary, #e4e4e7); }
+        .host-status { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted, #52525b); }
+        .host-card.ok .host-status { color: #10b981; }
+        .host-card.fail .host-status { color: #ef4444; }
+        .host-card.active .host-status { color: #3b82f6; }
+        .host-card-file { font-size: 10px; color: var(--text-muted, #52525b); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .host-card-meta { display: flex; justify-content: space-between; font-size: 11px; margin-top: 4px; color: var(--text-muted, #52525b); }
+        .host-card-bytes { font-size: 10px; color: var(--text-muted, #52525b); margin-top: 2px; }
+        .host-card .progress-bar { height: 6px; }
+        .host-card .progress-bar .fill { background: #3b82f6; transition: width 0.4s; }
+        .host-card .progress-bar .fill.ok { background: #10b981; }
+        .host-card .progress-bar .fill.fail { background: #ef4444; }
+        .host-card .progress-bar .fill.pending { background: #52525b; }
+    </style>
+    <details class="section" open>
+        <summary>
+            <span class="arrow">▶</span>
+            Live Upload Matrix
+            <span class="badge uploading" id="matrix-summary" style="display:none">0 hosts active</span>
+        </summary>
+        <div class="section-body">
+            <div id="upload-matrix-body" class="upload-matrix">
+                <div class="empty-state">No active uploads</div>
+            </div>
         </div>
     </details>
 
@@ -731,6 +754,7 @@
                         <th>Status</th>
                         <th>Live</th>
                         <th>Quality</th>
+                        <th>Max Dur</th>
                         <th>Assigned</th>
                     </tr>
                 </thead>
@@ -764,6 +788,7 @@
                             {{ end }}
                         </td>
                         <td class="mono">{{ .Resolution }}p / {{ .Framerate }}fps</td>
+                        <td class="mono">{{ if gt .MaxDuration 0 }}{{ .MaxDuration }}m{{ else }}<span style="color:var(--text-muted)">∞</span>{{ end }}</td>
                         <td class="mono" style="font-size:10px">{{ .AssignedAt }}</td>
                     </tr>
                     {{ end }}
@@ -774,6 +799,82 @@
             </table>
         </div>
     </details>
+
+    <!-- ════════ PROXY STATUS ════════ -->
+    {{ if .ProxyStatus }}
+    <details class="section" id="proxy-section-details">
+        <summary>
+            <span class="arrow">▶</span>
+            Proxy Pool <span class="count" id="proxy-pool-count" onclick="discoverProxies()" style="cursor:pointer;transition:background 0.15s" onmouseover="this.style.background='rgba(212,160,83,0.15)'" onmouseout="this.style.background=''" title="Click to re-discover proxies">{{ .ProxyStatus.PoolSize }}</span>
+            <span id="proxy-summary-badges">
+            {{ if .ProxyStatus.CookiesOK }}
+            <span class="badge online" style="background:rgba(16,185,129,0.12);color:#10b981;font-size:10px">Cookies OK</span>
+            {{ else }}
+            <span class="badge" style="background:rgba(239,68,68,0.12);color:#ef4444;font-size:10px">No Cookies</span>
+            {{ end }}
+            {{ if .ProxyStatus.Refreshing }}
+            <span class="badge pending" style="font-size:10px">Refreshing</span>
+            {{ end }}
+            {{ if .ProxyStatus.Prewarming }}
+            <span class="badge uploading" style="font-size:10px">Pre-warming</span>
+            {{ end }}
+            {{ if gt .ProxyStatus.DeadCount 0 }}
+            <span class="badge" style="background:rgba(239,68,68,0.12);color:#ef4444;font-size:10px">{{ .ProxyStatus.DeadCount }} dead</span>
+            {{ end }}
+            </span>
+            <a href="javascript:void(0)" onclick="discoverProxies()" id="discover-proxies-btn"
+               style="margin-left:auto;font-size:10px;font-weight:600;padding:3px 10px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border-subtle);color:var(--text-secondary);cursor:pointer;transition:all 0.15s;text-decoration:none;white-space:nowrap"
+               onmouseover="this.style.background='var(--bg-card)';this.style.color='var(--text-primary)'"
+               onmouseout="this.style.background='var(--bg-input)';this.style.color='var(--text-secondary)'">⟳ Discover</a>
+        </summary>
+        <div class="section-body">
+            {{ if gt .ProxyStatus.PoolSize 0 }}
+            <div id="proxy-cards-container" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+                {{ range .ProxyStatus.Proxies }}
+                <div style="
+                    background:var(--bg-card);
+                    border:1px solid {{ if .Current }}var(--accent){{ else }}var(--border-color){{ end }};
+                    border-radius:10px;
+                    padding:12px 14px;
+                    min-width:200px;
+                    flex:1;
+                    max-width:280px;
+                    {{ if .Current }}box-shadow:0 0 0 1px var(--accent-glow){{ end }}
+                ">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                        <span class="proxy-url" style="font-family:ui-monospace,monospace;font-size:11px;font-weight:600;color:var(--text-primary)" title="{{ .Proxy }}">{{ .Proxy }}</span>
+                        <span class="proxy-role" data-current="{{ .Current }}">
+                        {{ if .Current }}
+                        <span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;padding:2px 8px;border-radius:4px;background:rgba(212,160,83,0.12);color:var(--accent)">Active</span>
+                        {{ else }}
+                        <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;padding:2px 8px;border-radius:4px;background:var(--bg-input);color:var(--text-muted)">Standby</span>
+                        {{ end }}
+                        </span>
+                    </div>
+                    <div class="proxy-status-tags" style="display:flex;flex-wrap:wrap;gap:4px">
+                        {{ if .Cookies }}
+                        <span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(16,185,129,0.12);color:#10b981" title="Cached cookies, age: {{ .CookiesAge }}">🍪 {{ .CookiesAge }}</span>
+                        {{ else }}
+                        <span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(239,68,68,0.12);color:#ef4444">🍪 None</span>
+                        {{ end }}
+                        {{ if .Dead }}
+                        <span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(239,68,68,0.12);color:#ef4444" title="Cooldown until {{ .DeadUntil }}">✕ Dead</span>
+                        {{ else }}
+                        <span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(16,185,129,0.12);color:#10b981">✓ Alive</span>
+                        {{ end }}
+                        {{ if .PreWarmed }}
+                        <span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(59,130,246,0.12);color:#3b82f6">⟳ Pre-warmed</span>
+                        {{ end }}
+                    </div>
+                </div>
+                {{ end }}
+            </div>
+            {{ else }}
+            <div class="empty-state" id="proxy-cards-container">No proxies configured or discovered</div>
+            {{ end }}
+        </div>
+    </details>
+    {{ end }}
 
     <!-- ════════ PIPELINE QUEUE ════════ -->
     <details class="section">
@@ -911,7 +1012,7 @@
                 </div>
                 <div class="detail-item">
                     <div class="label">FFmpeg Path</div>
-                    <div class="val">{{ if .Config.FFmpegPath }}{{ .Config.FFmpegPath }}{{ else }}default{{ end }}</div>
+                    <div class="val">{{ if .FFmpegBin }}{{ .FFmpegBin }}{{ else }}default{{ end }}</div>
                 </div>
                 <div class="detail-item">
                     <div class="label">Port</div>
@@ -937,51 +1038,6 @@
         </div>
     </details>
 
-    <!-- ════════ ORPHAN FILES ════════ -->
-    <details class="section">
-        <summary><span class="arrow">▶</span> Orphan Files <span class="count">{{ len .Orphans }}</span></summary>
-        <div class="section-body">
-            <div class="rescan-row">
-                <input type="text" class="filter-input" id="orphan-search" placeholder="Search orphan files..." oninput="filterOrphans()">
-                <button class="btn-rescan" id="rescan-btn" onclick="rescanOutputDir()" title="Scan the output dir and upload every orphan immediately — rescues files stuck by a stale 'already uploading' marker">↻ Rescan &amp; Upload</button>
-            </div>
-            <div class="rescan-status" id="rescan-status"></div>
-            <table class="admin-table">
-                <thead>
-                    <tr>
-                        <th>Filename</th>
-                        <th>Path</th>
-                        <th>Size</th>
-                        <th>Age</th>
-                        <th>Modified</th>
-                        <th>Action</th>
-                    </tr>
-                </thead>
-                <tbody id="orphans-tbody">
-                    {{ if .Orphans }}
-                    {{ range .Orphans }}
-                    <tr>
-                        <td class="mono truncate" title="{{ .Filename }}">{{ .Filename }}</td>
-                        <td class="mono truncate" title="{{ .Path }}" style="max-width:200px">{{ .Path }}</td>
-                        <td class="mono">{{ printf "%.1f" (divBytes .Size) }} MB</td>
-                        <td class="mono">{{ .Age }}</td>
-                        <td class="mono">{{ .ModTime }}</td>
-                        <td>
-                            <div class="orphan-actions">
-                                <button class="btn-retry" onclick="retryOrphan('{{ .Path }}', this)">Retry</button>
-                                <button class="btn-delete" onclick="deleteOrphan('{{ .Path }}', this)">Delete</button>
-                            </div>
-                        </td>
-                    </tr>
-                    {{ end }}
-                    {{ else }}
-                    <tr><td colspan="6" class="empty-state">No orphan files found</td></tr>
-                    {{ end }}
-                </tbody>
-            </table>
-        </div>
-    </details>
-
     <!-- ════════ DISK ════════ -->
     <details class="section">
         <summary><span class="arrow">▶</span> Disk Usage</summary>
@@ -991,7 +1047,7 @@
                 <span style="font-size:11px;color:var(--text-muted)">{{ .Disk.Free }} free</span>
             </div>
             <div class="disk-bar">
-                <div class="fill {{ if gt .Disk.Percent 80 }}" style="width:{{ .Disk.Percent }}%;background:linear-gradient(90deg,#ef4444,#dc2626)"{{ else if gt .Disk.Percent 60 }}" style="width:{{ .Disk.Percent }}%;background:linear-gradient(90deg,#f59e0b,#d97706)"{{ else }}" style="width:{{ .Disk.Percent }}%;background:linear-gradient(90deg,#10b981,#059669)"{{ end }}></div>
+                <div class="fill" style="width:{{ .Disk.Percent }}%;{{ if gt .Disk.Percent 80 }}background:linear-gradient(90deg,#ef4444,#dc2626){{ else if gt .Disk.Percent 60 }}background:linear-gradient(90deg,#f59e0b,#d97706){{ else }}background:linear-gradient(90deg,#10b981,#059669){{ end }}"></div>
             </div>
             <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-top:4px;">
                 <span>{{ .Disk.Percent }}% used</span>
@@ -1005,9 +1061,10 @@
 <script>
 (function() {
     var ar = document.getElementById('auto-refresh');
-    if (ar) {
-        ar.checked = localStorage.getItem('admin-auto-refresh') === 'true';
-        if (ar.checked) scheduleRefresh();
+    ar.checked = localStorage.getItem('admin-auto-refresh') !== 'false';
+    if (ar.checked) {
+        startLivePoll();
+        scheduleRefresh();
     }
 
     // Theme toggle button
@@ -1030,21 +1087,234 @@
 })();
 
 var refreshTimer = null;
+var livePollTimer = null;
+
 function toggleAutoRefresh() {
     var cb = document.getElementById('auto-refresh');
     localStorage.setItem('admin-auto-refresh', cb.checked);
     if (cb.checked) {
+        startLivePoll();
         scheduleRefresh();
-    } else if (refreshTimer) {
-        clearTimeout(refreshTimer);
-        refreshTimer = null;
+    } else {
+        stopLivePoll();
+        if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
     }
 }
+
+function startLivePoll() {
+    stopLivePoll();
+    // Poll uploads every 2s, proxies every 5s for live updates
+    livePollTimer = setInterval(function() {
+        pollUploads();
+        pollProxies();
+    }, 2000);
+}
+
+function stopLivePoll() {
+    if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
+}
+
+// ── Upload Polling ──
+
+function pollUploads() {
+    fetch('/api/uploads')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data) return;
+            updateUploadsSection(data);
+            updateMetricsUploads(data);
+            updateUploadMatrix(data);
+        })
+        .catch(function() {/* silent */});
+}
+
+// ── Proxy Polling ──
+
+var _lastProxyPoll = 0;
+var _proxyPollInterval = 5000; // poll proxy status every 5s (less churn than uploads)
+
+function pollProxies() {
+    var now = Date.now();
+    if (now - _lastProxyPoll < _proxyPollInterval) return;
+    _lastProxyPoll = now;
+    fetch('/api/proxies')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data) return;
+            updateProxySection(data);
+        })
+        .catch(function() {/* silent */});
+}
+
+function updateMetricsUploads(data) {
+    var active = (data.active || []).length;
+    var pending = (data.pending || []).length;
+    var hist = (data.history || []).length;
+
+    // Update metrics cards without full page reload
+    var cards = document.querySelectorAll('.metric-card');
+    if (cards.length >= 5) {
+        var activeCard = cards[4];
+        var val = activeCard.querySelector('.value');
+        var sub = activeCard.querySelector('.sub');
+        if (val) val.textContent = active;
+        if (sub) sub.textContent = pending + ' pending';
+    }
+    if (cards.length >= 6) {
+        var histCard = cards[5];
+        var val = histCard.querySelector('.value');
+        if (val) val.textContent = hist;
+    }
+
+
+}
+
+function updateUploadsSection(data) {
+    var active = (data.active || []);
+    var container = document.getElementById('uploads-table-body');
+    var summary = document.getElementById('uploads-summary');
+    if (!container) return;
+
+    if (active.length === 0) {
+        container.innerHTML = '<tr><td colspan="7" class="empty-state">No active uploads</td></tr>';
+        if (summary) {
+            summary.innerHTML = '<span class="badge">0 uploading</span>';
+            summary.style.display = 'none';
+        }
+        return;
+    }
+
+    var html = '';
+    for (var i = 0; i < active.length; i++) {
+        var c = active[i];
+        var pct = Math.min(Math.max(c.progress || 0, 0), 100);
+        var hostRows = '';
+        if (c.hosts && c.hosts.length > 0) {
+            hostRows = '<div class="host-list"><span class="host-tag">' + (c.host_count || 0) + '/' + (c.host_total || '?') + ' done</span>';
+            for (var j = 0; j < c.hosts.length; j++) {
+                var h = c.hosts[j];
+                var cls = h.status === 'done' ? 'ok' : h.status === 'failed' ? 'fail' : '';
+                hostRows += '<span class="host-tag ' + cls + '" title="' + escAttr(h.host || '') + ': ' + Math.round(h.progress || 0) + '%' + (h.speed ? ' @ ' + h.speed : '') + '">' + escHtml(h.host || '') + '</span>';
+            }
+            hostRows += '</div>';
+        }
+        html += '<tr>'
+            + '<td><strong>' + escHtml(c.channel || '') + '</strong></td>'
+            + '<td class="mono truncate" title="' + escAttr(c.filename || '') + '">' + escHtml(c.filename || '') + '</td>'
+            + '<td><span class="status-badge active">' + escHtml(c.status || '') + '</span></td>'
+            + '<td style="min-width:140px">' + Math.round(pct) + '%<div class="progress-bar"><div class="fill ok" style="width:' + pct + '%"></div></div></td>'
+            + '<td>' + (hostRows || '<span style="color:var(--text-muted);font-size:10px">—</span>') + '</td>'
+            + '<td class="mono">' + (c.bytes_total > 0 ? (c.bytes_current || 0) + '/' + (c.bytes_total || 0) : '—') + '</td>'
+            + '<td class="mono">' + (c.speed || '—') + '</td>'
+            + '</tr>';
+    }
+    container.innerHTML = html;
+
+    if (summary) {
+        summary.innerHTML = '<span class="badge uploading">' + active.length + ' uploading</span>';
+        summary.style.display = '';
+    }
+}
+
+function updateUploadMatrix(data) {
+    var active = data.active || [];
+    var body = document.getElementById('upload-matrix-body');
+    if (!body) return;
+
+    // Group every host's in-flight uploads into one section per host.
+    var groups = {};
+    var order = [];
+    for (var i = 0; i < active.length; i++) {
+        var c = active[i];
+        var hosts = c.hosts || [];
+        for (var j = 0; j < hosts.length; j++) {
+            var h = hosts[j];
+            var name = (h.host || '?');
+            if (!groups[name]) { groups[name] = []; order.push(name); }
+            groups[name].push({
+                status: h.status || 'pending',
+                progress: h.progress || 0,
+                speed: h.speed || '',
+                bytes_current: h.bytes_current || 0,
+                bytes_total: h.bytes_total || 0,
+                channel: c.channel || '',
+                filename: c.filename || ''
+            });
+        }
+    }
+
+    var totalCards = 0;
+    for (var g = 0; g < order.length; g++) totalCards += groups[order[g]].length;
+
+    if (order.length === 0) {
+        body.innerHTML = '<div class="empty-state">No active uploads</div>';
+        var s0 = document.getElementById('matrix-summary');
+        if (s0) s0.style.display = 'none';
+        return;
+    }
+
+    order.sort(); // stable alphabetical host sections
+
+    var html = '';
+    for (var gi = 0; gi < order.length; gi++) {
+        var host = order[gi];
+        var items = groups[host];
+        var hostUploading = 0;
+        for (var z = 0; z < items.length; z++) {
+            if (items[z].status === 'uploading') hostUploading++;
+        }
+        html += '<div class="matrix-section">'
+            + '<div class="matrix-section-head"><span class="matrix-section-title">' + escHtml(host) + '</span>'
+            + '<span class="matrix-section-count">' + items.length + ' upload' + (items.length === 1 ? '' : 's')
+            + (hostUploading ? ' · ' + hostUploading + ' active' : '') + '</span></div>'
+            + '<div class="matrix-section-grid">';
+        for (var k = 0; k < items.length; k++) {
+            var t = items[k];
+            var pct = Math.min(Math.max(t.progress, 0), 100);
+            var cls = t.status === 'done' ? 'ok' : t.status === 'failed' ? 'fail' : t.status === 'pending' ? 'pending' : 'active';
+            var barCls = t.status === 'done' ? 'ok' : t.status === 'failed' ? 'fail' : t.status === 'pending' ? 'pending' : '';
+            html += '<div class="host-card ' + cls + '">'
+                + '<div class="host-card-top"><span class="host-name">' + escHtml(t.channel) + '</span>'
+                + '<span class="host-status">' + escHtml(t.status) + '</span></div>'
+                + '<div class="host-card-file mono" title="' + escAttr(t.filename) + '">' + escHtml(t.filename) + '</div>'
+                + '<div class="progress-bar"><div class="fill ' + barCls + '" style="width:' + pct + '%"></div></div>'
+                + '<div class="host-card-meta"><span>' + Math.round(pct) + '%</span>' + (t.speed ? '<span>' + escHtml(t.speed) + '</span>' : '') + '</div>'
+                + '<div class="host-card-bytes mono">' + (t.bytes_total > 0 ? fmtBytes(t.bytes_current) + ' / ' + fmtBytes(t.bytes_total) : '—') + '</div>'
+                + '</div>';
+        }
+        html += '</div></div>';
+    }
+    body.innerHTML = html;
+
+    var s = document.getElementById('matrix-summary');
+    if (s) {
+        s.style.display = '';
+        s.textContent = order.length + ' host' + (order.length === 1 ? '' : 's') + ' · ' + totalCards + ' upload' + (totalCards === 1 ? '' : 's');
+    }
+}
+
+function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+    return n + ' B';
+}
+
+function escHtml(s) {
+    if (!s) return '';
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) {
+    if (!s) return '';
+    return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function scheduleRefresh() {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = setTimeout(function() {
         location.reload();
-    }, 30000);
+    }, 12000);
 }
 
 function toggleTheme() {
@@ -1071,6 +1341,179 @@ function stopAllChannels() {
     });
 }
 
+function updateProxySection(data) {
+    // Update pool count
+    var countEl = document.getElementById('proxy-pool-count');
+    if (countEl) countEl.textContent = data.pool_size || 0;
+
+    // Update summary badges
+    var badgesEl = document.getElementById('proxy-summary-badges');
+    if (badgesEl) {
+        var badges = '';
+        if (data.cookies_ok) {
+            badges += '<span class="badge online" style="background:rgba(16,185,129,0.12);color:#10b981;font-size:10px">Cookies OK</span>';
+        } else {
+            badges += '<span class="badge" style="background:rgba(239,68,68,0.12);color:#ef4444;font-size:10px">No Cookies</span>';
+        }
+        if (data.refreshing && data.refresh_proxy) {
+            badges += '<span class="badge pending" style="font-size:10px;animation:pulse 1.2s ease-in-out infinite">\u27F3 ' + escHtml(data.refresh_proxy) + '</span>';
+        } else if (data.refreshing) {
+            badges += '<span class="badge pending" style="font-size:10px;animation:pulse 1.2s ease-in-out infinite">Refreshing</span>';
+        }
+        if (data.prewarming) {
+            badges += '<span class="badge uploading" style="font-size:10px">Pre-warming</span>';
+        }
+        if (data.dead_count > 0) {
+            badges += '<span class="badge" style="background:rgba(239,68,68,0.12);color:#ef4444;font-size:10px">' + data.dead_count + ' dead</span>';
+        }
+        badgesEl.innerHTML = badges;
+    }
+
+    // Update proxy cards container
+    var cardsEl = document.getElementById('proxy-cards-container');
+    if (!cardsEl) return;
+
+    var proxies = data.proxies || [];
+    if (proxies.length === 0) {
+        cardsEl.innerHTML = '<div class="empty-state">No proxies configured or discovered</div>';
+        cardsEl.className = 'empty-state';
+        cardsEl.style.cssText = '';
+        return;
+    }
+
+    // Restore flex container style
+    cardsEl.style.cssText = 'display:flex;gap:10px;flex-wrap:wrap;margin-top:10px';
+    cardsEl.className = '';
+
+    var isRefreshing = data.refreshing && data.refresh_proxy ? true : false;
+    var refreshProxyUrl = data.refresh_proxy || '';
+    var html = '';
+    for (var i = 0; i < proxies.length; i++) {
+        var p = proxies[i];
+        var thisIsRefreshing = isRefreshing && p.proxy === refreshProxyUrl;
+        var borderColor = thisIsRefreshing ? '#3b82f6' : (p.current ? 'var(--accent)' : 'var(--border-color)');
+        var shadow = thisIsRefreshing ? 'animation:refresh-glow 1.5s ease-in-out infinite' : (p.current ? 'box-shadow:0 0 0 1px var(--accent-glow)' : '');
+        var roleHtml = p.current
+            ? '<span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;padding:2px 8px;border-radius:4px;background:rgba(212,160,83,0.12);color:var(--accent)">Active</span>'
+            : '<span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;padding:2px 8px;border-radius:4px;background:var(--bg-input);color:var(--text-muted)">Standby</span>';
+
+        // Status tags
+        var tags = '';
+        if (p.cookies) {
+            tags += '<span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(16,185,129,0.12);color:#10b981" title="Cached cookies, age: ' + escAttr(p.cookies_age) + '">\uD83C\uDF6A ' + escHtml(p.cookies_age || '') + '</span>';
+        } else {
+            tags += '<span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(239,68,68,0.12);color:#ef4444">\uD83C\uDF6A None</span>';
+        }
+        if (p.dead) {
+            tags += '<span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(239,68,68,0.12);color:#ef4444" title="Cooldown until ' + escAttr(p.dead_until || '') + '">\u2715 Dead</span>';
+        } else {
+            tags += '<span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(16,185,129,0.12);color:#10b981">\u2713 Alive</span>';
+        }
+        if (thisIsRefreshing) {
+            tags += '<span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(59,130,246,0.15);color:#3b82f6;animation:pulse 1.2s ease-in-out infinite">\u27F3 Scrapling...</span>';
+        } else if (p.prewarmed) {
+            tags += '<span style="font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(59,130,246,0.12);color:#3b82f6">\u27F3 Pre-warmed</span>';
+        }
+
+        html += '<div style="cursor:pointer;background:var(--bg-card);border:1px solid ' + borderColor + ';border-radius:10px;padding:12px 14px;min-width:200px;flex:1;max-width:280px;transition:opacity 0.2s,border-color 0.2s;' + shadow + '" onclick="refreshProxy(' + p.index + ', this)" title="Click to refresh cookies through this proxy">'
+            + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<span class="proxy-url" style="font-family:ui-monospace,monospace;font-size:11px;font-weight:600;color:var(--text-primary)" title="' + escAttr(p.proxy) + '">' + escHtml(p.proxy) + '</span>'
+            + roleHtml
+            + '</div>'
+            + '<div class="proxy-status-tags" style="display:flex;flex-wrap:wrap;gap:4px">'
+            + tags
+            + '</div>'
+            + '</div>';
+    }
+    cardsEl.innerHTML = html;
+}
+
+function discoverProxies() {
+    var btn = document.getElementById('discover-proxies-btn');
+    if (!btn) return;
+    var originalText = btn.textContent;
+    btn.textContent = '⟳ Discovering...';
+    btn.style.opacity = '0.6';
+    btn.style.pointerEvents = 'none';
+    btn.style.background = 'rgba(212,160,83,0.12)';
+    btn.style.color = 'var(--accent)';
+
+    fetch('/api/proxies/discover', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            btn.textContent = '✓ ' + (d.count || 0) + ' proxies';
+            btn.style.background = 'rgba(16,185,129,0.12)';
+            btn.style.color = '#10b981';
+            // Refresh the proxy section to show new pool
+            _lastProxyPoll = 0; // force immediate refresh
+            pollProxies();
+        })
+        .catch(function() {
+            btn.textContent = '✕ Failed';
+            btn.style.background = 'rgba(239,68,68,0.12)';
+            btn.style.color = '#ef4444';
+        })
+        .finally(function() {
+            setTimeout(function() {
+                btn.textContent = originalText;
+                btn.style.opacity = '';
+                btn.style.pointerEvents = '';
+                btn.style.background = 'var(--bg-input)';
+                btn.style.color = 'var(--text-secondary)';
+            }, 4000);
+        });
+}
+
+function refreshProxy(index, el) {
+    // Visual feedback: disable and show spinner
+    el.style.opacity = '0.5';
+    el.style.pointerEvents = 'none';
+    var originalBorder = el.style.borderColor;
+    el.style.borderColor = 'var(--accent)';
+
+    // Add a temporary "Refreshing..." tag
+    var tagsEl = el.querySelector('.proxy-status-tags');
+    var spinner = document.createElement('span');
+    spinner.style.cssText = 'font-size:9px;font-weight:600;padding:2px 6px;border-radius:3px;background:rgba(212,160,83,0.15);color:var(--accent);animation:pulse 1.2s ease-in-out infinite';
+    spinner.textContent = '⟳ Refreshing...';
+    if (tagsEl) tagsEl.appendChild(spinner);
+
+    fetch('/api/proxies/refresh', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: index})
+    })
+    .then(function(r) {
+        if (r.status === 202) {
+            spinner.textContent = '✓ Started';
+            spinner.style.background = 'rgba(16,185,129,0.12)';
+            spinner.style.color = '#10b981';
+        } else {
+            return r.json().then(function(d) {
+                spinner.textContent = '✕ ' + (d.error || 'Failed');
+                spinner.style.background = 'rgba(239,68,68,0.12)';
+                spinner.style.color = '#ef4444';
+            });
+        }
+    })
+    .catch(function() {
+        spinner.textContent = '✕ Error';
+        spinner.style.background = 'rgba(239,68,68,0.12)';
+        spinner.style.color = '#ef4444';
+    })
+    .finally(function() {
+        // Re-enable after a moment
+        setTimeout(function() {
+            el.style.opacity = '';
+            el.style.pointerEvents = '';
+            el.style.borderColor = originalBorder || '';
+            if (spinner && spinner.parentNode) {
+                spinner.parentNode.removeChild(spinner);
+            }
+        }, 3000);
+    });
+}
+
 function channelAction(action, username) {
     if (action === 'stop' && !confirm('Delete channel "' + username + '"?')) return;
     var url = '/' + action + '_channel/' + encodeURIComponent(username);
@@ -1081,88 +1524,6 @@ function channelAction(action, username) {
     });
 }
 
-function filterOrphans() {
-    var q = document.getElementById('orphan-search').value.toLowerCase();
-    var rows = document.querySelectorAll('#orphans-tbody tr');
-    rows.forEach(function(tr) {
-        var text = (tr.textContent || '').toLowerCase();
-        tr.style.display = text.indexOf(q) !== -1 ? '' : 'none';
-    });
-}
-
-function retryOrphan(path, btn) {
-    btn.disabled = true;
-    btn.textContent = '...';
-    fetch('/api/orphans/retry', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({paths: [path]})
-    }).then(function(r) { return r.json(); }).then(function(data) {
-        if (data.length > 0 && data[0].status === 'success') {
-            btn.textContent = 'Queued';
-            btn.style.opacity = '0.5';
-            setTimeout(function() { location.reload(); }, 3000);
-        } else {
-            btn.textContent = 'Failed';
-            btn.style.background = 'rgba(239,68,68,0.15)';
-            btn.style.color = '#ef4444';
-        }
-    }).catch(function() {
-        btn.textContent = 'Error';
-        btn.style.background = 'rgba(239,68,68,0.15)';
-        btn.style.color = '#ef4444';
-    });
-}
-
-function rescanOutputDir() {
-    var btn = document.getElementById('rescan-btn');
-    var status = document.getElementById('rescan-status');
-    if (!btn || btn.disabled) return;
-    btn.disabled = true;
-    btn.textContent = '↻ Rescanning...';
-    if (status) {
-        status.textContent = 'Scanning output dir for orphans...';
-        status.style.color = 'var(--text-secondary)';
-    }
-    fetch('/api/orphans/rescan', { method: 'POST' })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            var msg = 'Found ' + data.found + ' file' + (data.found === 1 ? '' : 's');
-            if (data.uploaded > 0) msg += ' — ' + data.uploaded + ' uploaded';
-            if (data.failed > 0) msg += ' — ' + data.failed + ' failed';
-            btn.textContent = '↻ Rescan & Upload';
-            btn.disabled = false;
-            if (status) {
-                status.textContent = (data.failed > 0 ? '⚠ ' : '✅ ') + msg;
-                status.style.color = data.failed > 0 ? '#ef4444' : '#10b981';
-            }
-            setTimeout(function() { location.reload(); }, 4000);
-        })
-        .catch(function() {
-            btn.textContent = '↻ Retry';
-            btn.disabled = false;
-            if (status) {
-                status.textContent = '❌ Rescan failed — check server logs';
-                status.style.color = '#ef4444';
-            }
-        });
-}
-
-function deleteOrphan(path, btn) {
-    if (!confirm('Delete ' + path + '?')) return;
-    btn.disabled = true;
-    btn.textContent = '...';
-    fetch('/api/orphans', {
-        method: 'DELETE',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({paths: [path]})
-    }).then(function(r) { return r.json(); }).then(function() {
-        var tr = btn.closest('tr');
-        if (tr) tr.remove();
-    }).catch(function() {
-        btn.textContent = 'Error';
-    });
-}
 </script>
 </body>
 </html>

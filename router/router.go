@@ -150,6 +150,8 @@ func LoadHTMLFromEmbedFS(r *gin.Engine, embeddedFS embed.FS, files ...string) er
 			return fmt.Sprintf("%.1f MB", float64(s)/1024/1024)
 		},
 		"divBytes": func(b int64) float64 { return float64(b) / 1024 / 1024 },
+		"add": func(a, b int) int { return a + b },
+		"isWebp": func(url string) bool { return strings.HasSuffix(url, ".webp") },
 	})
 	for _, file := range files {
 		content, err := embeddedFS.ReadFile(file)

@@ -6,8 +6,6 @@
     <link rel="stylesheet" href="/static/styles/app.css?v=4" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="dns-prefetch" href="https://img2.pixhost.to" />
-    <link rel="dns-prefetch" href="https://t2.pixhost.to" />
     <link rel="preload" as="style" onload="this.onload=null;this.rel='stylesheet'"
           href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Outfit:wght@400;500;600;700;800;900&display=swap" />
     <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Outfit:wght@400;500;600;700;800;900&display=swap" /></noscript>
@@ -370,14 +368,13 @@
             <div class="video-card group cursor-pointer"
                  data-filename="{{ .Filename }}"
                  data-username="{{ .Username }}"
-                 data-preview="{{ .PreviewURL }}"
-                 data-sprite="{{ .SpriteURL }}"
-                 data-tags="{{ range .Tags }}{{ . }} {{ end }}"
-                 data-video-href="{{ if .FullPath }}/video?path={{ .FullPath | urlquery }}{{ else }}/video?path={{ .Filename | urlquery }}{{ end }}"
-                 onclick="location.href=this.dataset.videoHref">
+                  data-preview="{{ .PreviewURL }}"
+                  data-tags="{{ range .Tags }}{{ . }} {{ end }}"
+                  data-video-href="{{ if .FullPath }}/video?path={{ .FullPath | urlquery }}{{ else }}/video?path={{ .Filename | urlquery }}{{ end }}"
+                  onclick="location.href=this.dataset.videoHref">
                 <div class="card-thumb">
                     {{ if .ThumbnailURL }}<img src="{{ .ThumbnailURL }}" alt="" loading="lazy" decoding="async" />{{ end }}
-                    {{ if .PreviewURL }}<div class="sprite-overlay"><video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video></div>{{ else if .SpriteURL }}<div class="sprite-overlay"><div class="sprite-anim"></div></div>{{ end }}
+                    {{ if .PreviewURL }}<div class="sprite-overlay">{{ if isWebp .PreviewURL }}<img src="{{ .PreviewURL }}" class="preview-gif" alt="" loading="lazy" decoding="async" />{{ else }}<video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video>{{ end }}</div>{{ end }}
                     <div class="play-btn-wrap"><div class="play-btn"><svg fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21"/></svg></div></div>
                     <div class="card-badges">
                         <div class="flex flex-wrap gap-1">
@@ -458,11 +455,10 @@
             <div class="video-card group cursor-pointer"
                  data-filename="{{ .Filename }}"
                  data-username="{{ .Username }}"
-                 data-preview="{{ .PreviewURL }}"
-                 data-sprite="{{ .SpriteURL }}"
-                 data-tags="{{ range .Tags }}{{ . }} {{ end }}"
-                 data-video-href="{{ if .FullPath }}/video?path={{ .FullPath | urlquery }}{{ else }}/video?path={{ .Filename | urlquery }}{{ end }}"
-                 onclick="location.href=this.dataset.videoHref">
+                  data-preview="{{ .PreviewURL }}"
+                  data-tags="{{ range .Tags }}{{ . }} {{ end }}"
+                  data-video-href="{{ if .FullPath }}/video?path={{ .FullPath | urlquery }}{{ else }}/video?path={{ .Filename | urlquery }}{{ end }}"
+                  onclick="location.href=this.dataset.videoHref">
 
                 <!-- Thumbnail -->
                 <div class="card-thumb">
@@ -471,11 +467,7 @@
                     {{ end }}
 
                     {{ if .PreviewURL }}
-                    <div class="sprite-overlay"><video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video></div>
-                    {{ else if .SpriteURL }}
-                    <div class="sprite-overlay">
-                        <div class="sprite-anim"></div>
-                    </div>
+                    <div class="sprite-overlay">{{ if isWebp .PreviewURL }}<img src="{{ .PreviewURL }}" class="preview-gif" alt="" loading="lazy" decoding="async" />{{ else }}<video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video>{{ end }}</div>
                     {{ end }}
 
                     <!-- Play button (always visible on hover) -->
@@ -591,47 +583,10 @@ function filterSearch(q) {
     }, 180);
 }
 
-// ── Sprite filmstrip animation ──────────────────────────────────────────────
-// The sprite sheet is a 4-col × 4-row contact sheet of 16 evenly-spaced
-// frames (each frame 640×360 px → total image 2560×1440 px).
-// 640×360 ensures sharp previews on HiDPI/Retina (2× DPR) displays.
-(function() {
-    var COLS = 4, ROWS = 4, FRAMES = 16, MS = 380;
-    function initCard(card) {
-        var url = card.dataset.sprite;
-        if (!url) return;
-        var el = card.querySelector('.sprite-anim');
-        if (!el) return;
-        var frame = 0, timer = null, loaded = false;
-        function show(f) {
-            var c = f % COLS, r = Math.floor(f / COLS);
-            var x = (COLS > 1) ? (c / (COLS - 1)) * 100 : 0;
-            var y = (ROWS > 1) ? (r / (ROWS - 1)) * 100 : 0;
-            el.style.backgroundPosition = x + '% ' + y + '%';
-        }
-        function load() {
-            if (loaded) return;
-            loaded = true;
-            el.style.backgroundImage = "url('" + url + "')";
-            el.style.backgroundSize  = (COLS * 100) + '% ' + (ROWS * 100) + '%';
-        }
-        card.addEventListener('mouseenter', function() {
-            load();
-            frame = 0; show(frame);
-            timer = setInterval(function() { frame = (frame + 1) % FRAMES; show(frame); }, MS);
-        });
-        card.addEventListener('mouseleave', function() { clearInterval(timer); timer = null; });
-    }
-    // Use IntersectionObserver to init only cards near the viewport
-    if ('IntersectionObserver' in window) {
-        var io = new IntersectionObserver(function(entries) {
-            entries.forEach(function(e) { if (e.isIntersecting) { initCard(e.target); io.unobserve(e.target); } });
-        }, { rootMargin: '200px' });
-        document.querySelectorAll('.video-card').forEach(function(c) { io.observe(c); });
-    } else {
-        document.querySelectorAll('.video-card').forEach(initCard);
-    }
-})();
+// ── Hover preview ─────────────────────────────────────────────────────────
+// Hover preview is rendered by the host-supplied PreviewURL <video> element,
+// shown via the .sprite-overlay opacity transition in CSS. No sprite-sheet
+// animation is required.
 </script>
 </body>
 </html>

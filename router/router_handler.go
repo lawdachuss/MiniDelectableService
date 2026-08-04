@@ -26,6 +26,7 @@ import (
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
+	"github.com/teacat/chaturbate-dvr/site"
 )
 
 // IndexData represents the data structure for the index page.
@@ -1417,8 +1418,8 @@ type PoolEntry struct {
 
 // PoolData represents the data structure for the pool editor page.
 type PoolData struct {
-	Entries []PoolEntry
-	Mode    string
+	Assignments []PoolEntry
+	Mode        string
 }
 
 // poolEntries returns the unified pool rows for the editor page.  In pooled
@@ -1485,8 +1486,8 @@ func PoolPage(c *gin.Context) {
 
 	entries, mode := poolEntries()
 	c.HTML(200, "pool.html", &PoolData{
-		Entries: entries,
-		Mode:    mode,
+		Assignments: entries,
+		Mode:        mode,
 	})
 }
 
@@ -1513,13 +1514,14 @@ func GetNodesJSON(c *gin.Context) {
 // configured channels in isolated mode).
 func GetPoolJSON(c *gin.Context) {
 	entries, mode := poolEntries()
-	c.JSON(http.StatusOK, gin.H{"mode": mode, "entries": entries})
+	c.JSON(http.StatusOK, gin.H{"mode": mode, "assignments": entries})
 }
 
 // PoolCheckResponse is the JSON response for the realtime pool channel checker.
 type PoolCheckResponse struct {
-	Exists  bool   `json:"exists"`
-	Source  string `json:"source,omitempty"`
+	Exists bool   `json:"exists"`
+	Source string `json:"source,omitempty"`
+	IsLive bool   `json:"isLive"`
 	Message string `json:"message"`
 }
 
@@ -1560,20 +1562,37 @@ func poolChannelExists(username, site string) (bool, string, string) {
 
 // CheckPoolChannel checks in realtime whether a channel already exists
 // (configured locally, in the pool, or in the database) so the pool editor can
-// skip duplicates before submitting.
+// skip duplicates before submitting.  It also reports whether the channel is
+// currently live so the user can see before adding it.
 func CheckPoolChannel(c *gin.Context) {
 	username := strings.TrimSpace(c.Query("username"))
 	if username == "" {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "username is required"})
 		return
 	}
-	site := strings.TrimSpace(c.Query("site"))
-	if site == "" {
-		site = "chaturbate"
+	siteName := strings.TrimSpace(c.Query("site"))
+	if siteName == "" {
+		siteName = "chaturbate"
 	}
 
-	exists, source, message := poolChannelExists(username, site)
-	c.JSON(http.StatusOK, PoolCheckResponse{Exists: exists, Source: source, Message: message})
+	exists, source, message := poolChannelExists(username, siteName)
+
+	isLive := false
+	if server.Config != nil {
+		var siteImpl site.Site
+		switch siteName {
+		case "stripchat":
+			siteImpl = site.NewStripchatSite()
+		default:
+			siteImpl = site.NewChaturbateSite()
+		}
+		status, err := siteImpl.GetRoomStatus(context.Background(), internal.NewReq(), username)
+		if err == nil {
+			isLive = status == site.StatusPublic || status == site.StatusPrivate
+		}
+	}
+
+	c.JSON(http.StatusOK, PoolCheckResponse{Exists: exists, Source: source, IsLive: isLive, Message: message})
 }
 
 // PoolAddRequest is the request body for adding a channel to the pool.

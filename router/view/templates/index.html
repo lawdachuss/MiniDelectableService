@@ -6,7 +6,6 @@
     <link rel="stylesheet" href="/static/styles/app.css?v=5" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="dns-prefetch" href="https://img2.pixhost.to" />
     <link rel="preload" as="style" onload="this.onload=null;this.rel='stylesheet'"
           href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Outfit:wght@400;500;600;700;800;900&display=swap" />
     <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Outfit:wght@400;500;600;700;800;900&display=swap" /></noscript>
@@ -91,15 +90,6 @@
             transition: all 0.2s ease;
         }
         .btn-secondary:hover { background: rgba(255,255,255,0.08); color: #e4e4e7; border-color: rgba(255,255,255,0.15); }
-        /* Realtime duplicate-channel checker in the Add Channel dialog */
-        .add-check {
-            min-height: 16px; font-size: 11px; font-weight: 500; margin-top: 8px;
-            padding: 4px 10px; border-radius: 8px; display: none;
-        }
-        .add-check.ok { display: block; background: rgba(16,185,129,0.1); color: #10b981; border: 1px solid rgba(16,185,129,0.2); }
-        .add-check.exists { display: block; background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(239,68,68,0.25); }
-        .add-check.checking { display: block; background: rgba(255,255,255,0.04); color: #9ca3af; border: 1px solid rgba(255,255,255,0.08); }
-        html:not(.dark) .add-check.checking { background: rgba(0,0,0,0.03); color: #71717a; border-color: var(--border-color); }
         .dialog-overlay { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; }
         .section-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: #3f3f46; }
 
@@ -241,10 +231,15 @@
         .log-line.log-type-upload   { border-left-color: rgba(96,165,250,0.45);  background: rgba(96,165,250,0.02); }
         .log-line.log-type-delete   { border-left-color: rgba(248,113,113,0.4);  background: rgba(248,113,113,0.02); }
         .log-line.log-type-file     { border-left-color: rgba(251,191,36,0.45);  background: rgba(251,191,36,0.02); }
-        .log-line.log-type-cf       { border-left-color: rgba(249,115,22,0.5);   background: rgba(249,115,22,0.025); }
-        .log-line.log-type-status   { border-left-color: rgba(45,212,191,0.4);   background: rgba(45,212,191,0.02); }
-        .log-line.log-type-thumbnail{ border-left-color: rgba(236,72,153,0.4);   background: rgba(236,72,153,0.02); }
+        .log-line.log-type-cf       { border-left-color: rgba(249,115,22,0.55);  background: rgba(249,115,22,0.035); }
+        .log-line.log-type-status   { border-left-color: rgba(45,212,191,0.5);   background: rgba(45,212,191,0.025); }
+        .log-line.log-type-thumbnail{ border-left-color: rgba(236,72,153,0.5);   background: rgba(236,72,153,0.025); }
         .log-line.log-type-info     { border-left-color: transparent; }
+
+        /* Level badge backgrounds */
+        .log-level-badge-error { background: rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.25); border-radius:3px; padding:0 5px; }
+        .log-level-badge-warn  { background: rgba(245,158,11,0.18); border:1px solid rgba(245,158,11,0.22); border-radius:3px; padding:0 5px; }
+        .log-level-badge-info  { background: rgba(82,82,91,0.12); border:1px solid rgba(82,82,91,0.15); border-radius:3px; padding:0 5px; }
 
         html:not(.dark) .log-terminal { background: #f9fafb; }
         html:not(.dark) .log-terminal-bar { background: #f9fafb; border-bottom: 1px solid #e4e4e7; }
@@ -556,6 +551,7 @@
                             <button class="log-filter-dot" data-filter="mux"       title="Mux"        style="color:#06b6d4">●</button>
                             <button class="log-filter-dot" data-filter="file"      title="File"       style="color:#f59e0b;opacity:0.6">●</button>
                             <button class="log-filter-dot" data-filter="upload"    title="Upload"     style="color:#3b82f6">●</button>
+                            <button class="log-filter-dot" data-filter="cf"        title="Cloudflare" style="color:#fb923c">●</button>
                             <button class="log-filter-dot" data-filter="delete"    title="Delete"     style="color:#dc2626">●</button>
                             <button class="log-filter-dot" data-filter="status"    title="Status"     style="color:#14b8a6">●</button>
                             <button class="log-filter-dot" data-filter="thumbnail" title="Thumbnail"  style="color:#ec4899">●</button>
@@ -651,8 +647,8 @@
                         <input type="password" name="mixdrop_token" value="{{ .Config.MixdropToken }}" class="input-field" />
                     </div>
                     <div>
-                        <label class="block text-[11px] font-medium text-zinc-500 mb-1.5">Vidara Key</label>
-                        <input type="password" name="vidara_key" value="{{ .Config.VidaraKey }}" class="input-field" />
+                        <label class="block text-[11px] font-medium text-zinc-500 mb-1.5">Vidara API Key</label>
+                        <input type="password" name="vidara_key" value="{{ .VidaraKeyValue }}" class="input-field" placeholder="Vidara.so API key (comma-separated for multiple)" />
                     </div>
                 </div>
                 
@@ -691,8 +687,8 @@
 </dialog>
 
 <!-- ═══════════════════ ADD CHANNEL DIALOG ═══════════════════ -->
-<dialog id="create-dialog" class="text-zinc-100 rounded-2xl w-full max-w-[540px] max-h-[90vh] overflow-y-auto p-0 border-0 shadow-2xl" style="background:#12121a;border:1px solid rgba(255,255,255,0.08)" onclose="resetAddChannelCheck()">
-    <form action="/create_channel" method="POST" onsubmit="return allowAddChannelSubmit()">
+<dialog id="create-dialog" class="text-zinc-100 rounded-2xl w-full max-w-[540px] max-h-[90vh] overflow-y-auto p-0 border-0 shadow-2xl" style="background:#12121a;border:1px solid rgba(255,255,255,0.08)">
+    <form action="/create_channel" method="POST">
         <!-- Header -->
         <div class="flex items-center justify-between px-4 sm:px-6 py-5" style="border-bottom:1px solid rgba(255,255,255,0.06)">
             <div class="flex items-center gap-3">
@@ -711,7 +707,7 @@
             <!-- Site -->
             <div>
                 <label class="block text-xs font-semibold text-zinc-400 mb-2 uppercase tracking-wider">Site</label>
-                <select name="site" id="add-channel-site" class="input-field select-field" onchange="updateDomainPrefix(); checkAddChannel()">
+                <select name="site" id="add-channel-site" class="input-field select-field" onchange="updateDomainPrefix()">
                     <option value="chaturbate">Chaturbate</option>
                     <option value="stripchat">Stripchat</option>
                 </select>
@@ -722,11 +718,10 @@
                 <label class="block text-xs font-semibold text-zinc-400 mb-2 uppercase tracking-wider">Channel Username</label>
                 <div class="flex rounded-xl overflow-hidden" style="border:1px solid rgba(255,255,255,0.08)">
                     <span id="domain-prefix" class="flex items-center px-3 text-[11px] text-zinc-600 shrink-0" style="background:rgba(255,255,255,0.03);border-right:1px solid rgba(255,255,255,0.08)">{{ .Config.Domain }}</span>
-                    <input type="text" name="username" id="add-channel-username" autofocus required
+                    <input type="text" name="username" autofocus required
                            class="flex-1 bg-transparent px-3 py-2.5 text-sm text-zinc-200 focus:outline-none placeholder-zinc-700"
-                           placeholder="username" oninput="checkAddChannel()" />
+                           placeholder="username" />
                 </div>
-                <div id="add-channel-check" class="add-check"></div>
                 <p class="text-[11px] text-zinc-600 mt-1.5">Comma-separate multiple usernames to add them all at once.</p>
             </div>
 
@@ -798,7 +793,7 @@
 
         <div class="flex justify-end gap-2 px-4 sm:px-6 pb-5">
             <button type="button" onclick="this.closest('dialog').close()" class="btn-secondary">Cancel</button>
-            <button type="submit" id="add-channel-submit" class="btn-primary flex items-center gap-2">
+            <button type="submit" class="btn-primary flex items-center gap-2">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M12 5v14m-7-7h14"/></svg>
                 Add Channel
             </button>
@@ -890,6 +885,14 @@ var LOG_MSG_RULES = [
     { re: /^upload:/i,                         type: 'upload',    color: '#7dd3fc' },
     { re: /^upload (?:complete|started|failed|retrying)/i, type: 'upload', color: '#7dd3fc' },
     { re: /^queued for upload/i,              type: 'upload',    color: '#7dd3fc' },
+    { re: /^file deleted from/i,               type: 'upload',    color: '#7dd3fc' },
+    { re: /^vidhide:/i,                        type: 'upload',    color: '#fb923c' },
+    { re: /^streamwish:/i,                     type: 'upload',    color: '#67e8f9' },
+    { re: /^seekstreaming:/i,                  type: 'upload',    color: '#f0abfc' },
+    { re: /^upnshare:/i,                       type: 'upload',    color: '#6ee7b7' },
+    { re: /^vidara:/i,                         type: 'upload',    color: '#fda4af' },
+    { re: /^doodstream:/i,                     type: 'upload',    color: '#f97316' },
+
     // Compress
     { re: /^compress:/i,                       type: 'compress',  color: '#c084fc' },
     { re: /^encoding/i,                        type: 'compress',  color: '#c084fc' },
@@ -923,6 +926,9 @@ var LOG_MSG_RULES = [
     { re: /^checking/i,                        type: 'status',    color: '#a1a1aa' },
     { re: /^polling/i,                         type: 'status',    color: '#a1a1aa' },
     { re: /^scanning/i,                        type: 'status',    color: '#2dd4bf' },
+    { re: /^(?:stream is|stream)(?: now)? (?:online|offline|live|ended)/i, type: 'status', color: '#fde047' },
+    { re: /^no (?:stream|video|playlist)/i,    type: 'status',    color: '#f87171' },
+    { re: /^found (?:stream|video|playlist)/i, type: 'status',    color: '#34d399' },
     // Cloudflare
     { re: /^cf[_ ]?clearance/i,                type: 'cf',        color: '#fb923c' },
     { re: /^cloudflare/i,                      type: 'cf',        color: '#fb923c' },
@@ -961,16 +967,20 @@ function highlightMsg(msg, baseColor) {
     // ── STEP 1: Bracket badges (must be first — other rules inject ']') ──
     // Upload host names in brackets [GoFile], [VOE.sx] etc → per-host colored badge
     var HOST_COLORS = {
-        'GoFile':     { fg: '#34d399', bg: 'rgba(52,211,153,0.1)'  },  // green
-        'VOE.sx':     { fg: '#f472b6', bg: 'rgba(244,114,182,0.1)' },  // pink
-        'VoeSX':      { fg: '#f472b6', bg: 'rgba(244,114,182,0.1)' },  // pink
-        'TurboViPlay':{ fg: '#a78bfa', bg: 'rgba(167,139,250,0.1)' },  // violet
-        'GitHub':     { fg: '#e4e4e7', bg: 'rgba(228,228,231,0.08)'},  // white
-        'Streamtape': { fg: '#fbbf24', bg: 'rgba(251,191,36,0.1)'  },  // amber
-        'Mixdrop':    { fg: '#c084fc', bg: 'rgba(192,132,252,0.1)' },  // purple
-        'Vidara':     { fg: '#38bdf8', bg: 'rgba(56,189,248,0.1)'  },  // sky blue
+        'GoFile':       { fg: '#34d399', bg: 'rgba(52,211,153,0.1)'    },  // green
+        'VOE.sx':       { fg: '#f472b6', bg: 'rgba(244,114,182,0.1)'   },  // pink
+        'VoeSX':        { fg: '#f472b6', bg: 'rgba(244,114,182,0.1)'   },  // pink
+        'TurboViPlay':  { fg: '#a78bfa', bg: 'rgba(167,139,250,0.1)'   },  // violet
+        'GitHub':       { fg: '#e4e4e7', bg: 'rgba(228,228,231,0.08)'  },  // white
+        'Streamtape':   { fg: '#fbbf24', bg: 'rgba(251,191,36,0.1)'    },  // amber
+        'Mixdrop':      { fg: '#c084fc', bg: 'rgba(192,132,252,0.1)'   },  // purple
+        'VidHide':      { fg: '#fb923c', bg: 'rgba(251,146,60,0.12)'   },  // orange
+        'StreamWish':   { fg: '#67e8f9', bg: 'rgba(103,232,249,0.1)'   },  // cyan
+        'SeekStreaming':{ fg: '#f0abfc', bg: 'rgba(240,171,252,0.1)'   },  // light purple
+        'UPnShare':     { fg: '#6ee7b7', bg: 'rgba(110,231,183,0.12)'  },  // green
+        'DoodStream':   { fg: '#f97316', bg: 'rgba(249,115,22,0.12)'   },  // orange
     };
-    safe = safe.replace(/\[(GoFile|VOE\.sx|VoeSX|TurboViPlay|GitHub|Streamtape|Mixdrop|Vidara)\]/g,
+    safe = safe.replace(/\[(GoFile|VOE\.sx|VoeSX|TurboViPlay|GitHub|Streamtape|Mixdrop|VidHide|StreamWish|SeekStreaming|UPnShare|DoodStream)\]/g,
         function(m, host) {
             var c = HOST_COLORS[host] || { fg: '#94a3b8', bg: 'rgba(148,163,184,0.1)' };
             return '<span style="color:' + c.fg + ';background:' + c.bg + ';padding:0 4px;border-radius:3px;font-size:10px;font-weight:600">[' + host + ']</span>';
@@ -991,6 +1001,21 @@ function highlightMsg(msg, baseColor) {
     // Action keywords → teal
     safe = safe.replace(/\b(start(?:ed|ing)?|stopp(?:ed|ing)?|creat(?:ed|ing)?|remov(?:ed|ing)?|delet(?:ed|ing)?|resum(?:ed|ing)?|paus(?:ed|ing)?|queu(?:ed|ing)?|upload(?:ed|ing)?|download(?:ed|ing)?|merg(?:ed|ing)?|encod(?:ed|ing)?|compress(?:ed|ing)?|finished|skipp(?:ed|ing)?)\b/gi,
         '<span style="color:#2dd4bf;font-weight:600">$1</span>');
+    // Queue-related highlights → teal
+    safe = safe.replace(/\b(queue|queuing|queued)\b/gi,
+        '<span style="color:#34d399;font-weight:600">$1</span>');
+    // Found / discovered → green
+    safe = safe.replace(/\b(found|discovered|detected|located)\b/gi,
+        '<span style="color:#34d399;font-weight:600">$1</span>');
+    // "No" matches → red
+    safe = safe.replace(/\b(no|none|empty|missing)\b/gi,
+        '<span style="color:#f87171;font-weight:600">$1</span>');
+    // Online / offline / live → status colored
+    safe = safe.replace(/\b(online|offline|live|ended)\b/gi,
+        '<span style="color:#fde047;font-weight:600">$1</span>');
+    // Host: prefix → dim label
+    safe = safe.replace(/\bhost:\s*(\S+)/gi,
+        'host:<span style="color:#a78bfa;font-weight:600">$1</span>');
     // Encoder/tech names → violet
     safe = safe.replace(/\b(NVENC|AMF|QSV|VideoToolbox|CPU|libx264|h264_nvenc|h264_amf|h264_qsv|ffmpeg|ffprobe|streamlink|yt-dlp|hls|rtmp)\b/gi,
         '<span style="color:#c084fc;font-weight:600">$1</span>');
@@ -1032,10 +1057,13 @@ function renderLogLine(raw) {
     var html = '<div class="log-line log-type-' + meta.type + '">';
     // Timestamp
     if (p.time) {
-        html += '<span class="log-time">' + p.time + '</span>';
+        html += '<span class="log-time" style="color:#a16207">' + p.time + '</span>';
     }
-    // Level as plain terminal bracket text
-    html += '<span class="log-level" style="color:' + ls.text + '">[' + p.level + ']</span>';
+    // Level as badge with background (ERROR → red bg, WARN → amber bg, INFO → subtle gray bg)
+    var badgeClass = ls.type === 'error' ? 'log-level-badge-error'
+        : ls.type === 'warn' ? 'log-level-badge-warn'
+        : 'log-level-badge-info';
+    html += '<span class="log-level ' + badgeClass + '" style="color:' + ls.text + ';font-size:10px;font-weight:600;letter-spacing:0.3px">[' + p.level + ']</span>';
     // Message
     html += '<span class="log-msg" style="color:' + msgColor + '">' + highlightMsg(p.msg, msgColor) + '</span>';
     html += '</div>';
@@ -1748,114 +1776,6 @@ function updateDomainPrefix() {
     } else {
         prefix.textContent = '{{ .Config.Domain }}';
     }
-}
-
-// ── Realtime duplicate-channel checker (uses /api/pool/check) ────────────────
-var addCheckTimer = null;
-var addCheckSeq = 0;
-var addCheckHasDup = false;
-var addCheckInFlight = false;
-
-// Reset the checker state when the dialog closes so reopening it never shows
-// a stale "already exists" message or a disabled submit button.
-function resetAddChannelCheck() {
-    clearTimeout(addCheckTimer);
-    addCheckSeq++;
-    addCheckInFlight = false;
-    addCheckHasDup = false;
-    var status = document.getElementById('add-channel-check');
-    var submit = document.getElementById('add-channel-submit');
-    if (status) { status.className = 'add-check'; status.textContent = ''; }
-    if (submit) submit.disabled = false;
-}
-
-function checkAddChannel() {
-    var input = document.getElementById('add-channel-username');
-    var status = document.getElementById('add-channel-check');
-    var submit = document.getElementById('add-channel-submit');
-    if (!input || !status || !submit) return;
-
-    var names = input.value.split(',').map(function(s) { return s.trim(); }).filter(function(s) { return s; });
-    clearTimeout(addCheckTimer);
-    addCheckSeq++;
-    addCheckInFlight = true;
-
-    if (names.length === 0) {
-        addCheckInFlight = false;
-        addCheckHasDup = false;
-        status.className = 'add-check';
-        status.textContent = '';
-        submit.disabled = false;
-        return;
-    }
-
-    status.className = 'add-check checking';
-    status.textContent = 'Checking\u2026';
-    submit.disabled = true;
-
-    addCheckTimer = setTimeout(function() {
-        var seq = addCheckSeq;
-        var site = document.getElementById('add-channel-site').value;
-        var state = { dups: [], errors: 0, done: 0, total: names.length };
-
-        function finishAddCheck() {
-            if (seq !== addCheckSeq) return;
-            if (state.done < state.total) return;
-            addCheckInFlight = false;
-            if (state.dups.length > 0) {
-                addCheckHasDup = true;
-                status.className = 'add-check exists';
-                status.textContent = '\u26a0 ' + state.dups.join(', ') +
-                    (state.dups.length > 1 ? ' already exist \u2014 add skipped' : ' already exists \u2014 add skipped');
-                submit.disabled = true;
-            } else if (state.errors > 0) {
-                // Checker unavailable \u2014 don't block the user.
-                addCheckHasDup = false;
-                status.className = 'add-check';
-                status.textContent = '';
-                submit.disabled = false;
-            } else {
-                addCheckHasDup = false;
-                status.className = 'add-check ok';
-                status.textContent = '\u2713 Available \u2014 channel will be added';
-                submit.disabled = false;
-            }
-        }
-
-        names.forEach(function(name) {
-            // Timeout so a hung request can never leave the dialog locked.
-            var ctrl = new AbortController();
-            var t = setTimeout(function() { ctrl.abort(); }, 5000);
-            fetch('/api/pool/check?username=' + encodeURIComponent(name) + '&site=' + encodeURIComponent(site), { signal: ctrl.signal })
-                .then(function(r) { return r.json(); })
-                .then(function(data) {
-                    if (seq !== addCheckSeq) return;
-                    clearTimeout(t);
-                    state.done++;
-                    if (data.exists) state.dups.push(name);
-                    finishAddCheck();
-                })
-                .catch(function() {
-                    if (seq !== addCheckSeq) return;
-                    clearTimeout(t);
-                    state.done++;
-                    state.errors++;
-                    finishAddCheck();
-                });
-        });
-    }, 350);
-}
-
-// Block native form submission if a check is pending or the last one flagged a
-// duplicate. (Pressing Enter submits even when the submit button is disabled,
-// so the onsubmit guard re-validates before letting the form through.)
-function allowAddChannelSubmit() {
-    if (addCheckInFlight) return false; // check running \u2014 status line shows why
-    if (addCheckHasDup) {
-        checkAddChannel();
-        return false;
-    }
-    return true;
 }
 </script>
 

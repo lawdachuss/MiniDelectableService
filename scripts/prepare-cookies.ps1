@@ -21,12 +21,20 @@ $dnsJob = Start-Job -Name dns -ArgumentList ((($env:SUPABASE_URL -replace '^http
   if ([string]::IsNullOrWhiteSpace($sbHost) -or $sbHost -eq '-' -or $sbHost.Length -le 2) { $sbHost = 'supabase.chuglii.in' }
   Write-Host "(DNS) Supabase host: $sbHost"
   try {
-    Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-      try {
-        Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses ('1.1.1.1', '8.8.8.8') -ErrorAction Stop | Out-Null
-        Write-Host "(DNS) Set $($_.Name) DNS -> 1.1.1.1, 8.8.8.8"
-      } catch { Write-Warning "(DNS) DNS set skipped on $($_.Name): $($_.Exception.Message)" }
-    }
+    Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+      Where-Object { $_.Status -eq 'Up' -and $_.Name } |
+      ForEach-Object {
+        $idx = $_.ifIndex
+        try {
+          $dns = Get-DnsClientServerAddress -InterfaceIndex $idx -ErrorAction SilentlyContinue
+          if (-not $dns) {
+            Write-Host "(DNS) Skipping $($_.Name) (idx $idx) — no DNS config support"
+            return
+          }
+          Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses ('1.1.1.1', '8.8.8.8') -ErrorAction Stop | Out-Null
+          Write-Host "(DNS) Set $($_.Name) DNS -> 1.1.1.1, 8.8.8.8"
+        } catch { Write-Warning "(DNS) DNS set skipped on $($_.Name): $($_.Exception.Message)" }
+      }
   } catch { Write-Warning "(DNS) DNS enumeration failed: $($_.Exception.Message)" }
   ipconfig /flushdns | Out-Null
   $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
