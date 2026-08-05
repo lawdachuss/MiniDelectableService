@@ -26,6 +26,7 @@ type IManager interface {
 	WaitForAllChannels()
 	StopWatcher()
 	StartSession(duration time.Duration)
+	StopSession()
 	StartWatcher()
 	IsFileUploadInFlight(filePath string) bool
 	SessionInfo() (time.Duration, bool)

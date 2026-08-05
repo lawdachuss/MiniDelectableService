@@ -104,8 +104,9 @@ type Manager struct {
 
 	// sessionMu prevents multiple concurrent sessionLoop goroutines when
 	// StartSession is called more than once (e.g. from create-channel handler).
-	sessionMu      sync.Mutex
-	sessionStarted bool
+	sessionMu       sync.Mutex
+	sessionStarted  bool
+	sessionStopped  bool // set by StopSession to permanently stop the loop
 
 	// Cloudflare block tracking: channels currently in a blocked state, plus
 	// whether the global multi-channel alert has already fired.
@@ -126,6 +127,16 @@ func (m *Manager) TriggerSessionStop() {
 		default:
 		}
 	}
+}
+
+// StopSession permanently stops the session loop so it won't restart
+// after the current cycle finishes.  Call before StopAllChannels during
+// graceful shutdown to prevent the loop from racing with teardown.
+func (m *Manager) StopSession() {
+	m.TriggerSessionStop()
+	m.sessionMu.Lock()
+	m.sessionStopped = true
+	m.sessionMu.Unlock()
 }
 
 // SessionInfo returns the remaining recording time and whether a session
@@ -376,6 +387,15 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 	ch := thing.(*channel.Channel)
 	ch.PipelineQueue.ResumePending()
 	ch.Resume(0)
+
+	// Restart the session loop if it exited (e.g. when channels were claimed after
+	// an empty startup).  If the session is already active this is a no-op.
+	// Newly claimed channels then participate in the next session boundary
+	// (stop → process → upload → resume cycle).
+	m.sessionDeadlineMu.Lock()
+	dur := m.sessionDuration
+	m.sessionDeadlineMu.Unlock()
+	m.StartSession(dur)
 
 	fmt.Printf("[manager] created channel from assignment: %s/%s\n", ca.Site, ca.Username)
 	return nil
@@ -642,7 +662,6 @@ func (m *Manager) StopWithProcessingQueue(workers int) {
 	})
 
 	m.CancelAllChannels()
-	m.StopWatcher()
 
 	log.Printf("[session] waiting for %d channels to close recordings...", len(chs))
 	m.WaitForAllChannels()
@@ -718,29 +737,19 @@ func (m *Manager) StartSession(d time.Duration) {
 		return
 	}
 	m.sessionMu.Lock()
+	m.sessionDuration = d // persist so CreateChannelFromAssignment can restart the session later
 	if m.sessionStarted {
 		m.sessionMu.Unlock()
 		return
 	}
 	m.sessionStarted = true
+	m.sessionStopped = false
 	m.sessionMu.Unlock()
 	go m.sessionLoop(d)
 }
 
 func (m *Manager) sessionLoop(d time.Duration) {
-	channels := m.channelCount()
-	if channels == 0 {
-		m.sessionDeadlineMu.Lock()
-		m.sessionDeadline = time.Time{}
-		m.sessionDuration = 0
-		m.sessionDeadlineMu.Unlock()
-		log.Println("[session] no channels to record — stopping session loop")
-		m.sessionMu.Lock()
-		m.sessionStarted = false
-		m.sessionMu.Unlock()
-		return
-	}
-	log.Printf("[session] recording session started — next stop in %s with %d channel(s)", d, channels)
+	log.Printf("[session] recording session started — next stop in %s with %d channel(s)", d, m.channelCount())
 
 	deadline := time.Now().Add(d)
 	m.sessionDeadlineMu.Lock()
@@ -807,9 +816,24 @@ sessionWait:
 		log.Println("[session] upload-complete.flag written")
 	}
 
+	// Restart the session: resume channels and begin the next recording cycle.
+	// We keep sessionStarted = true so no other caller can start a duplicate
+	// session loop.  If StopSession() was called (e.g. during graceful shutdown),
+	// skip the restart.
 	m.sessionMu.Lock()
-	m.sessionStarted = false
+	stopped := m.sessionStopped
 	m.sessionMu.Unlock()
+	if stopped {
+		log.Println("[session] session permanently stopped — not restarting")
+		m.sessionMu.Lock()
+		m.sessionStarted = false
+		m.sessionMu.Unlock()
+		return
+	}
+
+	log.Println("[session] restarting recording session")
+	m.ResumeAllChannels()
+	m.sessionLoop(d)
 }
 
 // IsFileUploadInFlight returns true if the given file path is currently

@@ -33,7 +33,7 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 	postData.Set("bandwidth", "high")
 
 	if !AllowChaturbateRequest() {
-		return "", fmt.Errorf("circuit breaker open: %w", ErrChannelOffline)
+		return "", ErrCircuitBreakerOpen
 	}
 
 	var bodyStr string
@@ -42,7 +42,7 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 			return err
 		}
 		if !AllowChaturbateRequest() {
-			return fmt.Errorf("circuit breaker open: %w", ErrChannelOffline)
+			return ErrCircuitBreakerOpen
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBufferString(postData.Encode()))
@@ -96,7 +96,8 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode == 404 {
-			ReportChaturbateFailure()
+			// Expected state (channel deleted/renamed) — must NOT trip the
+			// global breaker or drag the rate limiter down.
 			return retry.Unrecoverable(ErrNotFound)
 		}
 
@@ -109,7 +110,15 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 		bodyStr = string(body)
 
 		if resp.StatusCode == 403 {
-			ReportChaturbateFailure()
+			// A 403 can be either an expected private show OR a Cloudflare
+			// challenge (site-wide block). The GET path detects the challenge
+			// via the body; the POST path must do the same so a real block
+			// still feeds the breaker/rate limiter. Private shows are expected
+			// per-channel states and must NOT trip the global breaker.
+			if strings.Contains(bodyStr, "Just a moment...") {
+				ReportChaturbateFailure()
+				return retry.Unrecoverable(ErrCloudflareBlocked)
+			}
 			fmt.Printf("[DEBUG] POST API 403 response for %s: %s\n", username, bodyStr)
 			return retry.Unrecoverable(fmt.Errorf("forbidden: %w", ErrPrivateStream))
 		}

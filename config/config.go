@@ -483,20 +483,20 @@ func New(c *cli.Context) (*entity.Config, error) {
 	}
 
 	sessionDuration := strings.TrimSpace(c.String("session-duration"))
-	if sessionDuration == "" {
-		sessionDuration = "5h20m0s"
-	}
-	if sessionDuration != "0" {
+	// When SESSION_DURATION is not set, leave as 0 for continuous recording.
+	// The flag default is "".  Only parse when a non-empty, non-zero value is given.
+	// (Node-3 session-system parity.)
+	if sessionDuration != "" && sessionDuration != "0" {
 		parsed, err := time.ParseDuration(sessionDuration)
 		if err != nil {
 			// A bad SESSION_DURATION (e.g. trailing newline in a GitHub secret)
-			// must never kill the recorder. Warn and fall back to the default.
-			fmt.Printf("⚠️  Invalid session-duration %q: %v — using default 5h20m0s\n", sessionDuration, err)
-			sessionDuration = "5h20m0s"
-			parsed, _ = time.ParseDuration(sessionDuration)
+			// must never kill the recorder. Warn and continue with continuous
+			// recording (0) instead of crashing the node.
+			fmt.Printf("⚠️  Invalid session-duration %q: %v — running continuous (no session stop)\n", sessionDuration, err)
+		} else {
+			cfg.SessionDuration = sessionDuration
+			cfg.SessionDurationParsed = parsed
 		}
-		cfg.SessionDuration = sessionDuration
-		cfg.SessionDurationParsed = parsed
 	}
 
 	return cfg, nil

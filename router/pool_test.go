@@ -58,6 +58,7 @@ func (s *stubManager) WaitForAllChannels() {
 func (s *stubManager) StopWatcher() {}
 func (s *stubManager) StartSession(duration time.Duration) {
 }
+func (s *stubManager) StopSession() {}
 func (s *stubManager) StartWatcher() {}
 func (s *stubManager) IsFileUploadInFlight(filePath string) bool {
 	return false

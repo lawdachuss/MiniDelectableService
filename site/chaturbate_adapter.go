@@ -85,13 +85,13 @@ func (s *ChaturbateSite) fetchBiocontext(ctx context.Context, req *internal.Req,
 			return err
 		}
 		if !internal.AllowChaturbateRequest() {
-			return fmt.Errorf("circuit breaker open: %w", internal.ErrChannelOffline)
+			return internal.ErrCircuitBreakerOpen
 		}
 
 		var e error
 		body, e = req.Get(ctx, apiURL)
 		if e != nil {
-			internal.ReportChaturbateFailure()
+			internal.ReportChaturbateFailureUnlessExpected(e)
 			return e
 		}
 		if body == "" {
@@ -188,7 +188,7 @@ func (s *ChaturbateSite) GetRoomStatus(ctx context.Context, req *internal.Req, u
 	apiURL := fmt.Sprintf("%sapi/chatvideocontext/%s/", server.Config.Domain, username)
 
 	if !internal.AllowChaturbateRequest() {
-		return "", fmt.Errorf("circuit breaker open: %w", internal.ErrChannelOffline)
+		return "", internal.ErrCircuitBreakerOpen
 	}
 
 	var body string
@@ -197,13 +197,13 @@ func (s *ChaturbateSite) GetRoomStatus(ctx context.Context, req *internal.Req, u
 			return err
 		}
 		if !internal.AllowChaturbateRequest() {
-			return fmt.Errorf("circuit breaker open: %w", internal.ErrChannelOffline)
+			return internal.ErrCircuitBreakerOpen
 		}
 
 		var e error
 		body, e = req.Get(ctx, apiURL)
 		if e != nil {
-			internal.ReportChaturbateFailure()
+			internal.ReportChaturbateFailureUnlessExpected(e)
 			return e
 		}
 		if body == "" {

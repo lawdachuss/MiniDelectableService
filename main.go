@@ -626,6 +626,9 @@ func start(c *cli.Context) error {
 			coord.StartDraining()
 		}
 
+		// Permanently stop the session loop so it can't restart a recording
+		// cycle while we're tearing down (node-3 session-system parity).
+		server.Manager.StopSession()
 		server.Manager.StopAllChannels()
 		server.Manager.StopWatcher()
 		fmt.Println("[SHUTDOWN] all channels stopped - waiting for mux/thumbnail/upload/Supabase to finish...")

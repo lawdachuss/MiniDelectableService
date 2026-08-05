@@ -15,6 +15,13 @@ var (
 	ErrStopped              = errors.New("channel stopped")
 	ErrGeoBlocked           = errors.New("stream not accessible (may be geo-blocked)")
 	ErrNotFound             = errors.New("not found (404)")
+	// ErrCircuitBreakerOpen is returned when the global Chaturbate API circuit
+	// breaker is tripped and requests are being rejected for a cooldown period.
+	// It is deliberately NOT wrapped in ErrChannelOffline: the channel itself
+	// may be fine — upstream API traffic is throttled globally, so the Monitor
+	// loop must treat this as a transient error (retry in seconds) rather than
+	// benching the channel for the full Interval.
+	ErrCircuitBreakerOpen = errors.New("circuit breaker open")
 	// ErrStreamStalled is returned when the HLS segment loop makes no forward
 	// progress for several consecutive poll cycles.  This usually means the
 	// CDN session token embedded in the segment URLs has expired.  The Monitor

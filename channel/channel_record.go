@@ -64,6 +64,7 @@ func (ch *Channel) Monitor(runID uint64) {
 			return errors.Is(err, internal.ErrChannelOffline) ||
 				errors.Is(err, internal.ErrPrivateStream) ||
 				errors.Is(err, internal.ErrHiddenStream) ||
+				errors.Is(err, internal.ErrNotFound) ||
 				errors.Is(err, internal.ErrAgeVerification) ||
 				errors.Is(err, internal.ErrCloudflareBlocked) ||
 				errors.Is(err, internal.ErrRoomPasswordRequired)
@@ -80,6 +81,8 @@ func (ch *Channel) Monitor(runID uint64) {
 
 			if errors.Is(err, internal.ErrChannelOffline) {
 				ch.Info("channel is offline, try again in %d min(s)", server.Config.Interval)
+			} else if errors.Is(err, internal.ErrNotFound) {
+				ch.Info("channel not found (deleted/renamed), try again in %d min(s)", server.Config.Interval)
 			} else if errors.Is(err, internal.ErrPrivateStream) {
 				ch.Info("channel is in a private show, try again in %d min(s)", server.Config.Interval)
 			} else if errors.Is(err, internal.ErrHiddenStream) {

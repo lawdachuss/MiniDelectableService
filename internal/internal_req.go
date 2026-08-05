@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,6 +48,34 @@ func ReportChaturbateFailure() {
 // Returns false if the circuit is open and requests should not proceed.
 func AllowChaturbateRequest() bool {
 	return chaturbateBreaker.Allow()
+}
+
+// IsExpectedChannelError reports whether err is a normal per-channel state
+// (offline, private, hidden, deleted/404, age-gate, password-gate) rather than
+// a genuine upstream failure. Expected states must NOT feed the global circuit
+// breaker or adaptive rate limiter — with hundreds of channels, private shows
+// and 404s are constant, and counting them trips the breaker for everyone,
+// blocking ALL Chaturbate API traffic (recording, room status, profile
+// scrapes) for the cooldown period.
+func IsExpectedChannelError(err error) bool {
+	return errors.Is(err, ErrChannelOffline) ||
+		errors.Is(err, ErrPrivateStream) ||
+		errors.Is(err, ErrHiddenStream) ||
+		errors.Is(err, ErrNotFound) ||
+		errors.Is(err, ErrAgeVerification) ||
+		errors.Is(err, ErrRoomPasswordRequired) ||
+		errors.Is(err, ErrGeoBlocked)
+}
+
+// ReportChaturbateFailureUnlessExpected feeds the circuit breaker and adaptive
+// rate limiter only for genuine upstream failures. Expected per-channel states
+// (private shows, 404s, hidden rooms, etc.) are skipped so a busy channel list
+// can never trip the global breaker or drag the API rate down.
+func ReportChaturbateFailureUnlessExpected(err error) {
+	if IsExpectedChannelError(err) {
+		return
+	}
+	ReportChaturbateFailure()
 }
 
 // ChaturbateRate returns the current adaptive rate limit in req/s.

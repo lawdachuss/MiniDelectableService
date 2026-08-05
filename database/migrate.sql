@@ -283,6 +283,9 @@ CREATE TABLE IF NOT EXISTS nodes (
                      CHECK (status IN ('online','offline','draining')),
     current_load     INT NOT NULL DEFAULT 0,
     last_heartbeat   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    session_deadline TIMESTAMPTZ,  -- written by Register() via computeSessionDeadline();
+                                   -- the deadline-migration loop moves channels off
+                                   -- a node before its GitHub 6h runner kill fires
     web_url          TEXT NOT NULL DEFAULT '',
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -305,6 +308,7 @@ CREATE TABLE IF NOT EXISTS channel_assignments (
     live_checked_at TIMESTAMPTZ,
     assigned_at     TIMESTAMPTZ,
     last_heartbeat  TIMESTAMPTZ,
+    last_recorded_at TIMESTAMPTZ,  -- bumped by MarkChannelRecording (liveness loop)
     framerate       INT NOT NULL DEFAULT 60,
     resolution      INT NOT NULL DEFAULT 2160,
     pattern         TEXT NOT NULL DEFAULT '',
