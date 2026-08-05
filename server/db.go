@@ -53,7 +53,9 @@ func detectPoolMode() string {
 // 3. os.Hostname() (VPS / local)
 // 4. Random fallback (defensive)
 func detectNodeID() string {
-	if id := os.Getenv("NODE_ID"); id != "" {
+	// Ignore placeholder values (empty/whitespace/"-") so a "-" NODE_ID secret
+	// can never register a bogus "-" row in the Supabase nodes table.
+	if id := strings.TrimSpace(os.Getenv("NODE_ID")); id != "" && id != "-" {
 		return id
 	}
 	if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {

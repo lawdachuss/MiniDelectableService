@@ -151,7 +151,7 @@ $script:shortenSb = {
   return $null
 }
 function Get-NodeId {
-  if (-not [string]::IsNullOrWhiteSpace($env:NODE_ID)) { return $env:NODE_ID }
+  if (-not [string]::IsNullOrWhiteSpace($env:NODE_ID) -and $env:NODE_ID.Trim() -ne '-') { return $env:NODE_ID.Trim() }
   if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY)) {
     $parts = $env:GITHUB_REPOSITORY -split '/'
     if ($parts.Count -ge 2) { return $parts[1] }

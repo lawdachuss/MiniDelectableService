@@ -414,7 +414,9 @@ func (c *Coordinator) currentLoad() int {
 //
 // IMPORTANT: this must stay in sync with server/db.go:detectNodeID().
 func detectNodeID() string {
-	if id := os.Getenv("NODE_ID"); id != "" {
+	// Ignore placeholder values (empty/whitespace/"-") so a "-" NODE_ID secret
+	// can never register a bogus "-" row in the Supabase nodes table.
+	if id := strings.TrimSpace(os.Getenv("NODE_ID")); id != "" && id != "-" {
 		return id
 	}
 	if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
