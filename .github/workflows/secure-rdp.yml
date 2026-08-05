@@ -35,6 +35,10 @@ jobs:
       CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
       NODE_ID: ${{ secrets.NODE_ID }}
       SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
+      # Defer videos shorter than this (seconds) for merging instead of uploading
+      # them. Mirrors the per-channel min_duration_before_upload=1200 in the pool
+      # so the watcher/orphan/pending-flush paths (global-only) never upload shorts.
+      MIN_DURATION_BEFORE_UPLOAD: '1200'
       VIDHIDE_API_KEY: ${{ secrets.VIDHIDE_API_KEY }}
       STREAMWISH_API_KEY: ${{ secrets.STREAMWISH_API_KEY }}
       UPNSHARE_KEY: ${{ secrets.UPNSHARE_KEY }}

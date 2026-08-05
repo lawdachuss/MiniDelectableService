@@ -8,7 +8,7 @@
   <span data-upload-progress="{{ .UploadProgress }}" style="display:none"></span>
 
   <!-- Mobile back -->
-  <button type="button" onclick="history.back()" class="md:hidden inline-flex items-center gap-1.5 mb-4 text-xs font-medium text-zinc-500 hover:text-zinc-200 transition-colors">
+  <button type="button" data-action="history-back" class="md:hidden inline-flex items-center gap-1.5 mb-4 text-xs font-medium text-zinc-500 hover:text-zinc-200 transition-colors">
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
     Channels
   </button>
@@ -19,7 +19,6 @@
     <img src="/api/thumb/{{ .Username }}" decoding="async"
          alt="{{ .Username }}"
          class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
-         onerror="this.parentElement.style.display='flex';this.parentElement.style.alignItems='center';this.parentElement.style.justifyContent='center';this.style.display='none'"
          loading="lazy" />
     {{ else }}
     <div class="w-full h-full flex items-center justify-center" style="background:rgba(255,255,255,0.03)">
@@ -152,15 +151,15 @@
   <div class="grid grid-cols-2 gap-2 mt-4">
     <div>
       {{ if .IsPaused }}
-      <button class="w-full flex items-center justify-center gap-1.5 py-2.5 text-xs font-semibold rounded-xl transition-all"
+      <button type="button" class="w-full flex items-center justify-center gap-1.5 py-2.5 text-xs font-semibold rounded-xl transition-all"
               style="background:linear-gradient(135deg,#d4a053,#a07830);color:white;box-shadow:0 4px 12px rgba(212,160,83,0.25)"
-              onclick="window.location.href='/resume_channel/{{ .Username }}'">
+              data-action="navigate" data-href="/resume_channel/{{ .Username }}">
         <svg class="w-3.5 h-3.5 shrink-0" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
         Resume
       </button>
       {{ else }}
-      <button class="info-btn w-full flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium rounded-xl transition-all text-zinc-400 hover:text-zinc-200"
-              onclick="window.location.href='/pause_channel/{{ .Username }}'">
+      <button type="button" class="info-btn w-full flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium rounded-xl transition-all text-zinc-400 hover:text-zinc-200"
+              data-action="navigate" data-href="/pause_channel/{{ .Username }}">
         <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
           <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
         </svg>
@@ -169,7 +168,7 @@
       {{ end }}
     </div>
     <div>
-      <button type="button" onclick="openDeleteChannelDialog('{{ .Username }}')"
+      <button type="button" data-action="delete-channel" data-username="{{ .Username }}"
               class="info-btn-delete w-full flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium rounded-xl transition-all text-amber-500 hover:text-amber-300">
         <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
           <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>

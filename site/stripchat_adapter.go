@@ -1,6 +1,7 @@
 package site
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,15 +19,10 @@ func NewStripchatSite() *StripchatSite {
 }
 
 type camResponse struct {
-	Cam struct {
-		StreamName        string            `json:"streamName"`
-		IsCamActive       bool              `json:"isCamActive"`
-		ViewServers       map[string]string `json:"viewServers"`
-		BroadcastSettings struct {
-			BroadcastType string `json:"broadcastType"`
-		} `json:"broadcastSettings"`
-		Topic string `json:"topic"`
-	} `json:"cam"`
+	// Stripchat returns an object here while a model is live and an array
+	// ([]) when it is idle/offline. RawMessage keeps the top-level unmarshal
+	// from failing on either shape; parseCam decodes it leniently below.
+	Cam json.RawMessage `json:"cam"`
 	User struct {
 		User struct {
 			ID                 int64  `json:"id"`
@@ -39,6 +35,37 @@ type camResponse struct {
 			SnapshotTimestamp  int64  `json:"snapshotTimestamp"`
 		} `json:"user"`
 	} `json:"user"`
+}
+
+// camData is the object form of the "cam" field (present while live).
+type camData struct {
+	StreamName        string            `json:"streamName"`
+	IsCamActive       bool              `json:"isCamActive"`
+	ViewServers       map[string]string `json:"viewServers"`
+	BroadcastSettings struct {
+		BroadcastType string `json:"broadcastType"`
+	} `json:"broadcastSettings"`
+	Topic string `json:"topic"`
+}
+
+// parseCam decodes the raw "cam" field. Stripchat returns an object while a
+// model is live and an array ([]) when idle/offline, so an array simply means
+// "no active cam" — the zero value is returned in that case. If the array
+// ever carries cam payloads, the first element wins. Never fails: an
+// unparseable shape is treated as "no active cam".
+func parseCam(raw json.RawMessage) camData {
+	var c camData
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return c
+	}
+	if err := json.Unmarshal(raw, &c); err == nil {
+		return c
+	}
+	var arr []camData
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+		return arr[0]
+	}
+	return c
 }
 
 func mapGender(g string) string {
@@ -70,6 +97,7 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 	}
 
 	u := resp.User.User
+	cam := parseCam(resp.Cam)
 
 	// Build room status string from Stripchat's status field.
 	roomStatus := u.Status
@@ -80,8 +108,8 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 	}
 
 	tags := []string{}
-	if resp.Cam.Topic != "" {
-		for _, word := range strings.Fields(resp.Cam.Topic) {
+	if cam.Topic != "" {
+		for _, word := range strings.Fields(cam.Topic) {
 			if strings.HasPrefix(word, "#") {
 				tag := strings.TrimPrefix(word, "#")
 				tag = strings.Trim(tag, ".,!?;:")
@@ -108,7 +136,7 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 
 	info := &StreamInfo{
 		RoomStatus:   roomStatus,
-		RoomTitle:    resp.Cam.Topic,
+		RoomTitle:    cam.Topic,
 		Tags:         tags,
 		Gender:       mapGender(u.BroadcastGender),
 		LiveThumbURL: thumbURL,
@@ -121,17 +149,17 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 	if !u.IsOnline && !u.IsLive {
 		return info, internal.ErrChannelOffline
 	}
-	if !resp.Cam.IsCamActive {
+	if !cam.IsCamActive {
 		return info, internal.ErrChannelOffline
 	}
 	if roomStatus != "public" {
 		return info, internal.ErrChannelOffline
 	}
 
-	streamName := resp.Cam.StreamName
+	streamName := cam.StreamName
 
 	var hlsURL string
-	if server, ok := resp.Cam.ViewServers["flashphoner-hls"]; ok && server != "" {
+	if server, ok := cam.ViewServers["flashphoner-hls"]; ok && server != "" {
 		hlsURL = fmt.Sprintf(
 			"https://b-%s.doppiocdn.com/hls/%s/master_%s.m3u8",
 			server, streamName, streamName,

@@ -121,8 +121,9 @@ func SetupViews(r *gin.Engine) {
 }
 
 // LoadHTMLFromEmbedFS loads specific HTML templates from an embedded filesystem and registers them with Gin.
-func LoadHTMLFromEmbedFS(r *gin.Engine, embeddedFS embed.FS, files ...string) error {
-	templ := template.New("").Funcs(template.FuncMap{
+// templateFuncs returns the shared FuncMap registered on all HTML templates.
+func templateFuncs() template.FuncMap {
+	return template.FuncMap{
 		"printf": fmt.Sprintf,
 		"subOnline": func(chs []*entity.ChannelInfo) int {
 			n := 0
@@ -152,7 +153,12 @@ func LoadHTMLFromEmbedFS(r *gin.Engine, embeddedFS embed.FS, files ...string) er
 		"divBytes": func(b int64) float64 { return float64(b) / 1024 / 1024 },
 		"add": func(a, b int) int { return a + b },
 		"isWebp": func(url string) bool { return strings.HasSuffix(url, ".webp") },
-	})
+	}
+}
+
+// LoadHTMLFromEmbedFS loads specific HTML templates from an embedded filesystem and registers them with Gin.
+func LoadHTMLFromEmbedFS(r *gin.Engine, embeddedFS embed.FS, files ...string) error {
+	templ := template.New("").Funcs(templateFuncs())
 	for _, file := range files {
 		content, err := embeddedFS.ReadFile(file)
 		if err != nil {

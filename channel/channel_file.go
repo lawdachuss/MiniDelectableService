@@ -1615,9 +1615,15 @@ func mergeVideos(inputs []string, outputPath string) error {
 // they are merged together and the merged result is uploaded via
 // MoveToOutputDir.
 //
+// A failed merge (or a merged output that is still below the threshold) never
+// triggers an upload: the current video — or the consolidated merged output —
+// is parked with the pending segments instead, so the next recording can try
+// merging everything again.
+//
 // Returns true if the video was handled (deferred to pending or merged+uploaded)
 // so the caller should stop processing it.  Returns false when the caller
-// should proceed with its normal upload logic.
+// should proceed with its normal upload logic (only when the feature is
+// disabled or the video meets the threshold with no pending segments).
 func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 	mu := pendingMu(ch.Config.Username)
 	mu.Lock()
@@ -1670,16 +1676,45 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 		mErr := mergeVideos(allInputs, mergedPath)
 		if mErr != nil {
 			os.Remove(mergedPath) // clean up partial output
-			ch.Error("min-duration: merge failed: %v — uploading current video separately, KEEPING pending segments for a future merge", mErr)
-			return false
+			// Hold, don't upload: a failed merge must never push any of this
+			// content out as a separate upload that bypasses the threshold.
+			// Park the current video with the pending segments so the next
+			// recording can attempt the merge again.
+			if pkErr := moveToPendingDir(videoPath, ch.Config.Username); pkErr != nil {
+				ch.Error("min-duration: merge failed (%v) and could not park %s in pending: %v — keeping it in place, NOT uploading",
+					mErr, filepath.Base(videoPath), pkErr)
+			} else {
+				ch.Error("min-duration: merge failed: %v — holding %s with %d pending segment(s) for a future merge",
+					mErr, filepath.Base(videoPath), len(mergeInputs))
+			}
+			return true
 		}
 
 		mergedDur, probeErr := VideoDurationSeconds(mergedPath)
 		if probeErr != nil || mergedDur < float64(minDur) {
-			ch.Warn("min-duration: merged output for %s is %.1fs (< %ds) — uploading current video separately, KEEPING pending segments",
-				filepath.Base(mergedPath), mergedDur, minDur)
-			os.Remove(mergedPath)
-			return false
+			if probeErr != nil {
+				ch.Warn("min-duration: could not probe merged output (%v) — holding it in pending, NOT uploading", probeErr)
+			} else {
+				ch.Warn("min-duration: merged output for %s is %.1fs (< %ds) — holding it in pending, NOT uploading",
+					filepath.Base(mergedPath), mergedDur, minDur)
+			}
+			// The current video is already incorporated into the merged output:
+			// drop the original and park the consolidated file with the pending
+			// segments so nothing below the threshold is ever uploaded.
+			_ = os.Remove(videoPath)
+			if pkErr := moveToPendingDir(mergedPath, ch.Config.Username); pkErr != nil {
+				ch.Error("min-duration: could not park merged output %s in pending: %v — keeping it in place, NOT uploading",
+					filepath.Base(mergedPath), pkErr)
+			}
+			// The parked merged file already contains the pending segments, so
+			// drop the originals — otherwise the next merge attempt would
+			// concatenate the short content a second time.
+			mu.Lock()
+			for _, s := range mergeInputs {
+				os.Remove(s)
+			}
+			mu.Unlock()
+			return true
 		}
 
 		mu.Lock()

@@ -501,7 +501,6 @@
                         <th>Channel</th>
                         <th>Site</th>
                         <th>Status</th>
-                        <th>Last Error</th>
                         <th>Duration</th>
                         <th>Filesize</th>
                         <th>Upload</th>
@@ -526,13 +525,6 @@
                                 <span class="status-badge pending">Connecting</span>
                             {{ else }}
                                 <span class="status-badge" style="background:rgba(113,113,122,0.12);color:#71717a">Offline</span>
-                            {{ end }}
-                        </td>
-                        <td style="max-width:200px">
-                            {{ if $ch.LastError }}
-                            <span class="mono" style="font-size:10px;color:#ef4444;word-break:break-word" title="{{ $ch.LastError }}">{{ $ch.LastError }}</span>
-                            {{ else }}
-                            <span style="color:var(--text-muted);font-size:10px">—</span>
                             {{ end }}
                         </td>
                         <td class="mono">{{ $ch.Duration }}</td>
@@ -1012,7 +1004,7 @@
                 </div>
                 <div class="detail-item">
                     <div class="label">FFmpeg Path</div>
-                    <div class="val">{{ if .FFmpegBin }}{{ .FFmpegBin }}{{ else }}default{{ end }}</div>
+                    <div class="val">{{ if .Config.FFmpegPath }}{{ .Config.FFmpegPath }}{{ else }}default{{ end }}</div>
                 </div>
                 <div class="detail-item">
                     <div class="label">Port</div>

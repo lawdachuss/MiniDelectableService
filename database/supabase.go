@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -496,6 +498,104 @@ func (c *Client) GetAllUploadLinks() ([]UploadLink, error) {
 	var links []UploadLink
 	err := c.get("/upload_links?limit=50000", &links)
 	return links, err
+}
+
+// CountUploadedVideosBelowDuration returns how many recordings with a probed
+// duration strictly between 0 and thresholdSeconds seconds have been uploaded
+// (i.e. have at least one row in upload_links). Recordings whose duration is
+// 0 or NULL (ffprobe miss) are excluded.
+//
+// It delegates to ListUploadedVideosBelowDuration so both helpers share the
+// same two-query logic, threshold guard and 50000-row cap. The two reads are
+// not atomic, so a video uploaded in the brief window between them may be
+// missed — fine for a monitoring/stats count.
+func (c *Client) CountUploadedVideosBelowDuration(thresholdSeconds float64) (int, error) {
+	list, err := c.ListUploadedVideosBelowDuration(thresholdSeconds)
+	if err != nil {
+		return 0, err
+	}
+	return len(list), nil
+}
+
+// RecordingWithLinks is one uploaded recording paired with the URLs it was
+// uploaded to, keyed by upload host (e.g. "GoFile", "Streamtape", "Vidara").
+type RecordingWithLinks struct {
+	ID        string            `json:"id"`
+	Username  string            `json:"username"`
+	Filename  string            `json:"filename"`
+	Timestamp string            `json:"timestamp"`
+	Duration  float64           `json:"duration"`
+	Filesize  int64             `json:"filesize"`
+	Links     map[string]string `json:"links"` // upload host -> URL
+}
+
+// ListUploadedVideosBelowDuration returns the recordings with a probed
+// duration strictly between 0 and thresholdSeconds seconds that have been
+// uploaded (i.e. have at least one row in upload_links), each with its upload
+// links keyed by host. Results are ordered by duration ascending (shortest
+// first) so the smallest uploads surface first for review. Recordings whose
+// duration is 0 or NULL (ffprobe miss) and recordings with no upload links
+// are excluded.
+//
+// Like CountUploadedVideosBelowDuration it uses two batched GETs (upload_links
+// then duration-filtered recordings) intersected in memory, because PostgREST's
+// embedded-resource join is not usable on deployments whose schema cache lacks
+// the recordings → upload_links foreign key (PGRST200). The result is capped
+// at 50000 matching recordings, matching the other GetAll* helpers.
+func (c *Client) ListUploadedVideosBelowDuration(thresholdSeconds float64) ([]RecordingWithLinks, error) {
+	if thresholdSeconds <= 0 || math.IsNaN(thresholdSeconds) || math.IsInf(thresholdSeconds, 0) {
+		return nil, nil
+	}
+
+	// Step 1: group upload links by recording id.
+	links, err := c.GetAllUploadLinks()
+	if err != nil {
+		return nil, err
+	}
+	byRecording := make(map[string][]UploadLink)
+	for _, l := range links {
+		if l.RecordingID != "" {
+			byRecording[l.RecordingID] = append(byRecording[l.RecordingID], l)
+		}
+	}
+	if len(byRecording) == 0 {
+		return nil, nil
+	}
+
+	// Step 2: recordings with 0 < duration < threshold, keeping only uploaded ones.
+	// The duration filters run server-side so only eligible rows are transferred.
+	path := fmt.Sprintf("/recordings?select=id,username,filename,timestamp,duration,filesize&duration=gt.0&duration=lt.%s&limit=50000",
+		strconv.FormatFloat(thresholdSeconds, 'f', -1, 64))
+	var recs []Recording
+	if err := c.get(path, &recs); err != nil {
+		return nil, err
+	}
+
+	var out []RecordingWithLinks
+	for _, r := range recs {
+		recLinks, ok := byRecording[r.ID]
+		if !ok || len(recLinks) == 0 {
+			continue
+		}
+		linksMap := make(map[string]string, len(recLinks))
+		for _, l := range recLinks {
+			if l.Host != "" {
+				linksMap[l.Host] = l.URL
+			}
+		}
+		out = append(out, RecordingWithLinks{
+			ID:        r.ID,
+			Username:  r.Username,
+			Filename:  r.Filename,
+			Timestamp: r.Timestamp,
+			Duration:  r.Duration,
+			Filesize:  r.Filesize,
+			Links:     linksMap,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Duration < out[j].Duration })
+	return out, nil
 }
 
 // ============================================================================

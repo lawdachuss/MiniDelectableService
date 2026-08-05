@@ -66,6 +66,28 @@ func Index(c *gin.Context) {
 	})
 }
 
+// proxyInfo is one proxy pool entry rendered by the optional proxy status
+// section on the admin page.
+type proxyInfo struct {
+	IP         string
+	Current    bool
+	CookiesAge string
+	DeadUntil  string
+	Refreshing bool
+}
+
+// proxyStatus describes the proxy pool state.  AdminPage leaves ProxyStatus
+// nil so the (frontend-driven) proxy section stays hidden until the backend
+// populates it — a nil pointer keeps the admin page from aborting rendering.
+type proxyStatus struct {
+	PoolSize   int
+	CookiesOK  bool
+	Refreshing bool
+	Prewarming bool
+	DeadCount  int
+	Proxies    []proxyInfo
+}
+
 // ChannelPipelinesEntry holds per-channel pipeline queue counts for the admin page.
 type ChannelPipelinesEntry struct {
 	Username string
@@ -99,6 +121,9 @@ type AdminData struct {
 
 	// Per-channel pipeline counts (keyed by username for easy template lookup)
 	PipelineMap map[string]ChannelPipelinesEntry
+
+	// Optional proxy pool status (nil hides the proxy section on the page).
+	ProxyStatus *proxyStatus
 
 	// Distributed shards
 	Nodes           []database.Node
@@ -1404,16 +1429,20 @@ func NodesPage(c *gin.Context) {
 // PoolEntry is a unified row for the pool editor page.  It represents either a
 // distributed channel assignment (pooled mode, source="pool") or a locally
 // configured channel (isolated mode, source="local").
+//
+// JSON tags are snake_case to match what pool.html's JavaScript reads
+// (a.username, a.site, a.assigned_node, a.is_live, ...). Without them
+// encoding/json emits PascalCase keys and every row renders as "undefined".
 type PoolEntry struct {
-	Username     string
-	Site         string
-	AssignedNode string
-	Status       string
-	IsLive       bool
-	Resolution   int
-	Framerate    int
-	AssignedAt   string
-	Source       string // "pool" (channel_assignments) or "local" (configured channels)
+	Username     string `json:"username"`
+	Site         string `json:"site"`
+	AssignedNode string `json:"assigned_node"`
+	Status       string `json:"status"`
+	IsLive       bool   `json:"is_live"`
+	Resolution   int    `json:"resolution"`
+	Framerate    int    `json:"framerate"`
+	AssignedAt   string `json:"assigned_at"`
+	Source       string `json:"source"` // "pool" (channel_assignments) or "local" (configured channels)
 }
 
 // PoolData represents the data structure for the pool editor page.

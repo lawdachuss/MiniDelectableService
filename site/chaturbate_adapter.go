@@ -69,11 +69,54 @@ type biocontextResponse struct {
 	RoomStatus      string          `json:"room_status"`
 }
 
+// fetchBiocontext fetches the api/biocontext/{username}/ payload through the
+// shared Chaturbate adaptive rate limiter and circuit breaker, exactly like
+// the chatvideocontext API. The biocontext endpoint is served by the same
+// Cloudflare-protected host, so unthrottled bursts — e.g. 200+ channels all
+// scraping profiles / last-broadcast at boot — trigger the "Just a moment..."
+// challenge. Failure feedback also feeds the adaptive limiter so it backs off
+// for ALL Chaturbate API traffic when the site starts blocking.
+func (s *ChaturbateSite) fetchBiocontext(ctx context.Context, req *internal.Req, username string) (string, error) {
+	apiURL := fmt.Sprintf("%sapi/biocontext/%s/", server.Config.Domain, username)
+
+	var body string
+	err := retry.Do(func() error {
+		if err := internal.WaitForChaturbateRateLimit(ctx); err != nil {
+			return err
+		}
+		if !internal.AllowChaturbateRequest() {
+			return fmt.Errorf("circuit breaker open: %w", internal.ErrChannelOffline)
+		}
+
+		var e error
+		body, e = req.Get(ctx, apiURL)
+		if e != nil {
+			internal.ReportChaturbateFailure()
+			return e
+		}
+		if body == "" {
+			internal.ReportChaturbateFailure()
+			return fmt.Errorf("empty response body")
+		}
+		internal.ReportChaturbateSuccess()
+		return nil
+	},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.Delay(1*time.Second),
+		retry.MaxDelay(10*time.Second),
+		retry.DelayType(retry.BackOffDelay),
+	)
+	if err != nil {
+		return "", err
+	}
+	return body, nil
+}
+
 // FetchProfile implements site.Site via the biocontext API, returning the
 // model's full public profile so the archive site can display it.
 func (s *ChaturbateSite) FetchProfile(ctx context.Context, req *internal.Req, username string) (*database.ChannelProfile, error) {
-	apiURL := fmt.Sprintf("%sapi/biocontext/%s/", server.Config.Domain, username)
-	body, err := req.Get(ctx, apiURL)
+	body, err := s.fetchBiocontext(ctx, req, username)
 	if err != nil {
 		return nil, fmt.Errorf("fetch biocontext: %w", err)
 	}
@@ -121,8 +164,7 @@ func (s *ChaturbateSite) FetchProfile(ctx context.Context, req *internal.Req, us
 
 // FetchLastBroadcast implements site.Site via the biocontext API.
 func (s *ChaturbateSite) FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error) {
-	apiURL := fmt.Sprintf("%sapi/biocontext/%s/", server.Config.Domain, username)
-	body, err := req.Get(ctx, apiURL)
+	body, err := s.fetchBiocontext(ctx, req, username)
 	if err != nil {
 		return 0, fmt.Errorf("fetch biocontext: %w", err)
 	}

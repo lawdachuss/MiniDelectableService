@@ -238,6 +238,37 @@ func TestRemoveFromPoolIsolatedStopsChannel(t *testing.T) {
 	}
 }
 
+// TestPoolJSONUsesSnakeCaseKeys verifies /api/pool returns snake_case keys
+// matching what pool.html's JavaScript reads (a.username, a.site, a.is_live,
+// ...). Without this the JS sees undefined for every field and the whole
+// table renders with "undefined" usernames.
+func TestPoolJSONUsesSnakeCaseKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	server.Config = &entity.Config{}
+	setStubManager(t, &stubManager{channels: []*entity.ChannelInfo{
+		{Username: "alice", Site: "chaturbate", IsOnline: true},
+	}})
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/pool", nil)
+
+	GetPoolJSON(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"username"`, `"site"`, `"status"`, `"is_live"`, `"source"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("pool JSON missing snake_case key %s; body: %s", want, body)
+		}
+	}
+	if !strings.Contains(body, `"username":"alice"`) {
+		t.Fatalf("pool JSON missing username value; body: %s", body)
+	}
+}
+
 // TestPoolPageRendersLocalChannels verifies the pool page renders configured
 // channels in isolated mode instead of showing an empty page.
 func TestPoolPageRendersLocalChannels(t *testing.T) {
