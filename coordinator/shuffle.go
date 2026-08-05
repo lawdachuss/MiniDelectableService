@@ -23,6 +23,11 @@ const deadlineMigrationInterval = 60 * time.Second
 // start migrating its channels away.
 const deadlineMigrationWindow = 15 * time.Minute
 
+// reconcileInterval is the fast watchdog that stops channels that are no longer
+// assigned to this node (e.g. after a deadline migration or reaper reclaim),
+// bounding any brief overlap to this interval.
+const reconcileInterval = 15 * time.Second
+
 // dbShuffler is the subset of *database.Client used by the shuffle and
 // deadline-migration cycles, expressed as an interface so the cycles can be
 // unit-tested with a mock.
@@ -347,6 +352,88 @@ func (c *Coordinator) runDeadlineMigrationCycleWith(db dbShuffler) {
 			}
 			loadMap[target.NodeID]++
 			log.Printf("[coordinator] deadline migration: moved %s/%s from %s -> %s", ca.Site, ca.Username, imm.NodeID, target.NodeID)
+		}
+	}
+}
+
+// StartReconcileLoop is a fast watchdog that keeps the local recorder in sync
+// with DB assignments. It stops any local channel no longer assigned to this
+// node (e.g. after a deadline migration or reaper reclaim) and starts channels
+// assigned to this node that aren't running yet. This bounds the brief
+// recording overlap after a migration/reclaim to reconcileInterval instead of
+// waiting for the next claim cycle (up to 60s).
+func (c *Coordinator) StartReconcileLoop(ctx context.Context) {
+	if !c.IsPooled() || c.Client == nil {
+		return
+	}
+
+	const name = "reconcile"
+
+	c.runLoopWithRestart(ctx, name, reconcileInterval, func(stopCh <-chan struct{}, tickerC <-chan time.Time) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopCh:
+				return
+			case <-tickerC:
+				c.cycleGuardReconcile.tryRun(name, c.runReconcileCycle)
+			}
+		}
+	})
+}
+
+// runReconcileCycle stops local channels that are no longer assigned to this
+// node and starts assigned-but-not-running ones. On any DB error it returns
+// immediately and removes NOTHING — a transient DB hiccup must never cause us
+// to drop live recordings.
+func (c *Coordinator) runReconcileCycle() {
+	c.runReconcileCycleWith(c.Client)
+}
+
+func (c *Coordinator) runReconcileCycleWith(db dbShuffler) {
+	if !c.isActive() {
+		return
+	}
+	if c.Manager == nil {
+		return
+	}
+
+	dbAssignments, err := db.GetNodeAssignments(c.NodeID)
+	if err != nil {
+		log.Printf("[coordinator] reconcile: get node assignments error: %v", err)
+		return
+	}
+
+	dbMap := make(map[string]bool, len(dbAssignments))
+	for _, a := range dbAssignments {
+		dbMap[a.Username] = true
+	}
+
+	local := c.Manager.GetLocalChannels()
+	localSet := make(map[string]bool, len(local))
+	for _, lc := range local {
+		localSet[lc] = true
+	}
+
+	// Stop channels no longer assigned to us (e.g. migrated away / reaped).
+	for _, lc := range local {
+		if !dbMap[lc] {
+			log.Printf("[coordinator] reconcile: channel %s no longer assigned to this node — stopping", lc)
+			if err := c.Manager.RemoveChannelForReassignment(lc); err != nil {
+				log.Printf("[coordinator] reconcile: remove %s error: %v", lc, err)
+			}
+		}
+	}
+
+	// Start channels assigned to us that aren't running locally yet (e.g. a
+	// channel migrated here by the deadline loop). CreateChannelFromAssignment
+	// is idempotent, so this is safe to run every cycle.
+	for _, a := range dbAssignments {
+		if !localSet[a.Username] {
+			if err := c.Manager.CreateChannelFromAssignment(&a); err != nil {
+				log.Printf("[coordinator] reconcile: start %s error: %v", a.Username, err)
+			}
 		}
 	}
 }

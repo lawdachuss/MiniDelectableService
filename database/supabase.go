@@ -1172,6 +1172,20 @@ func (c *Client) ReleaseChannel(username, site string) error {
 		})
 }
 
+// MarkChannelRecording marks a channel as actively recording on its node and
+// bumps its recording heartbeat. Called by the liveness loop for this node's
+// live channels so "live+recording" is authoritative in the DB.
+func (c *Client) MarkChannelRecording(username, site string) error {
+	return c.patch(
+		fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s",
+			url.QueryEscape(username), url.QueryEscape(site)),
+		map[string]interface{}{
+			"status":           "recording",
+			"last_recorded_at": "now()",
+			"last_heartbeat":   "now()",
+		})
+}
+
 // RepairOrphanedAssignments fixes rows where assigned_node is set but
 // status is still 'unassigned'. This can happen if a claim was partially
 // rolled back (assigned_node written, status not updated) or if a

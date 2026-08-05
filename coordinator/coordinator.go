@@ -168,6 +168,7 @@ func (c *Coordinator) startHealthCheckLoop(ctx context.Context) {
 			c.checkCycleHealth("reaper", &c.cycleGuardReaper)
 			c.checkCycleHealth("offline-shuffle", &c.cycleGuardShuffle)
 			c.checkCycleHealth("deadline-migration", &c.cycleGuardDeadline)
+			c.checkCycleHealth("reconcile", &c.cycleGuardReconcile)
 		}
 		}
 	}()
@@ -242,6 +243,7 @@ type Coordinator struct {
 	cycleGuardReaper        cycleGuard
 	cycleGuardShuffle       cycleGuard
 	cycleGuardDeadline      cycleGuard
+	cycleGuardReconcile     cycleGuard
 }
 
 // New creates a new Coordinator. If CHANNEL_POOL_MODE=pooled, Start() must
@@ -281,6 +283,7 @@ func (c *Coordinator) Start(ctx context.Context) {
 	c.StartReaperLoop(ctx)
 	c.StartOfflineShuffleLoop(ctx)
 	c.StartDeadlineMigrationLoop(ctx)
+	c.StartReconcileLoop(ctx)
 
 	// Start the health check watchdog that detects stalled cycles
 	c.startHealthCheckLoop(ctx)
@@ -433,13 +436,21 @@ func detectNodeID() string {
 	return fmt.Sprintf("node-%x", n)
 }
 
-// channelPoolMode returns the pool mode from env var.
+// channelPoolMode returns the pool mode from env var, falling back to
+// auto-detection for node-* repos (GITHUB_REPOSITORY). MUST stay in sync with
+// server/db.go:detectPoolMode() — a mismatch silently runs the coordinator
+// isolated while the web UI thinks the node is pooled.
 func channelPoolMode() string {
-	mode := os.Getenv("CHANNEL_POOL_MODE")
-	if mode == "" {
-		return entity.PoolModeIsolated
+	if mode := os.Getenv("CHANNEL_POOL_MODE"); mode != "" {
+		return mode
 	}
-	return mode
+	if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
+		// Auto-enable pooled mode for repos named node-*
+		if strings.Contains(repo, "node-") {
+			return entity.PoolModePooled
+		}
+	}
+	return entity.PoolModeIsolated
 }
 
 // computeSessionDeadline determines when this node will be forcibly killed so

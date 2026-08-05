@@ -371,6 +371,12 @@ func main() {
 				Value:   "",
 			},
 			&cli.StringFlag{
+				Name:    "affiliate-wm",
+				Usage:   "Webmaster code for the affiliate onlinerooms bulk liveness check",
+				EnvVars: []string{"AFFILIATE_WM"},
+				Value:   "",
+			},
+			&cli.StringFlag{
 				Name:    "stripchat-pdkey",
 				Usage:   "MOUFLON v2 decryption key for Stripchat HLS streams",
 				EnvVars: []string{"STRIPCHAT_PDKEY"},
@@ -736,6 +742,16 @@ func start(c *cli.Context) error {
 type liveChecker struct{}
 
 func (l *liveChecker) IsLive(ctx context.Context, siteName, username string) bool {
+	// Tier 0: Affiliate API (fastest, single cached call covers all channels).
+	// The onlinerooms endpoint is served on the cb.xxx domain this deployment
+	// uses. A model confirmed live here skips the per-channel check entirely.
+	if server.Config != nil && server.Config.AffiliateWM != "" {
+		affiliateLive, _, err := internal.CheckAffiliateLive(ctx, server.Config.AffiliateWM, server.Config.Domain, username)
+		if err == nil && affiliateLive {
+			return true
+		}
+	}
+
 	var siteImpl site.Site
 	switch siteName {
 	case "stripchat":

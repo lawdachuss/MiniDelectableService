@@ -457,6 +457,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		SupabaseURL:    c.String("supabase-url"),
 		SupabaseAPIKey: c.String("supabase-api-key"),
 		StripchatPDKey: c.String("stripchat-pdkey"),
+		AffiliateWM:    c.String("affiliate-wm"),
 
 		CompletedDir:       c.String("completed-dir"),
 		FinalizeMode:       entity.NormalizeFinalizeMode(c.String("finalize-mode")),

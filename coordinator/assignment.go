@@ -229,6 +229,26 @@ func (c *Coordinator) runClaimCycle() {
 		myOfflineCount, myLiveCount, fairShare, maxOfflineAllowed, totalPool)
 }
 
+// RebalanceAtSessionBoundary is called at session boundaries (after uploads
+// complete, before the next session's channels resume). It releases this node's
+// DB assignments and triggers a fresh claim cycle so the pool is redistributed
+// evenly across all nodes. All nodes hit the session boundary at roughly the
+// same time (same SESSION_DURATION), so each releases its channels and then
+// each node claims a random fair share.
+func (c *Coordinator) RebalanceAtSessionBoundary() {
+	if !c.IsPooled() || c.Client == nil {
+		return
+	}
+	log.Printf("[coordinator] session boundary — releasing %s assignments and rebalancing", c.NodeID)
+
+	if err := c.Client.ReleaseNodeChannels(c.NodeID); err != nil {
+		log.Printf("[coordinator] rebalance: release error: %v", err)
+		return
+	}
+	log.Printf("[coordinator] rebalance: assignments released, running fresh claim cycle")
+	c.runClaimCycle()
+}
+
 // CreateChannelAssignment creates a channel_assignments row for a new channel.
 // The row is created with status='unassigned' so any node can claim it.
 func (c *Coordinator) CreateChannelAssignment(conf *entity.ChannelConfig) error {

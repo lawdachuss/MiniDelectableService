@@ -33,6 +33,14 @@ func (c *Coordinator) StartReaperLoop(ctx context.Context) {
 
 // runReapCycle finds dead nodes and reclaims their channel assignments.
 func (c *Coordinator) runReapCycle(timeout time.Duration) {
+	// Self-heal first so stale orphaned rows (assigned_node set but
+	// status=unassigned) don't deadlock the reclaim logic below.
+	if repaired, err := c.Client.RepairOrphanedAssignments(); err != nil {
+		log.Printf("[coordinator] reaper: repair orphaned error: %v", err)
+	} else if repaired > 0 {
+		log.Printf("[coordinator] reaper: repaired %d orphaned assignment(s)", repaired)
+	}
+
 	// Find nodes with expired heartbeats
 	deadNodeIDs, err := c.Client.GetDeadNodes(timeout)
 	if err != nil {

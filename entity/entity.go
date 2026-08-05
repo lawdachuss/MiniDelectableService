@@ -213,6 +213,10 @@ type Config struct {
 
 	StripchatPDKey string
 
+	// AffiliateWM is the webmaster code for the affiliate onlinerooms API
+	// used as a bulk liveness check (single call covers all channels).
+	AffiliateWM string
+
 	FFmpegPath string
 
 	// Finalization: how closed recordings are post-processed
