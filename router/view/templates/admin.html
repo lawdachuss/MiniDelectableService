@@ -707,9 +707,10 @@
                             {{ else }}
                                 <span class="status-badge" style="background:rgba(113,113,122,0.12);color:#71717a">Offline</span>
                             {{ end }}
-                        </td>
-                        <td class="mono">{{ .CurrentLoad }}</td>
-                        <td class="mono">{{ .SoftwareVersion }}</td>
+                        </td>						<td class="mono">
+							{{ if eq .Status "offline" }}<span style="color:var(--text-muted)">—</span>{{ else }}{{ .CurrentLoad }}{{ end }}
+						</td>
+						<td class="mono">{{ .SoftwareVersion }}</td>
                         <td>{{ .InstanceLabel }}</td>
                         <td class="mono" style="font-size:10px">{{ .LastHeartbeat }}</td>
                         <td>

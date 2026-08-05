@@ -216,8 +216,10 @@ func AdminPage(c *gin.Context) {
 		} else if n.Status == "draining" {
 			drainingNodes++
 		}
-		totalNodeLoad += n.CurrentLoad
 	}
+	// Same as the nodes page: a dead node's frozen current_load must not
+	// inflate the pool load total.
+	totalNodeLoad = sumNodeLoad(nodes)
 
 	c.HTML(200, "admin.html", &AdminData{
 		Config:   server.Config,
@@ -1378,6 +1380,21 @@ func DeleteOrphans(c *gin.Context) {
 
 // ─── Nodes Dashboard ─────────────────────────────────────────────────────────
 
+// sumNodeLoad totals the current load across nodes that can still hold
+// channels (online/draining). A node's current_load is only written by its own
+// heartbeat, so an offline node's value is frozen at its last report and counts
+// channels that were already reclaimed — including it would inflate the pool's
+// Total Load (e.g. a dead node stuck at 280 while holding 0 assignments).
+func sumNodeLoad(nodes []database.Node) int {
+	total := 0
+	for _, n := range nodes {
+		if n.Status != "offline" {
+			total += n.CurrentLoad
+		}
+	}
+	return total
+}
+
 // NodesData represents the data structure for the nodes page.
 type NodesData struct {
 	Nodes        []database.Node
@@ -1404,15 +1421,18 @@ func NodesPage(c *gin.Context) {
 
 	onlineCount := 0
 	drainingCount := 0
-	totalLoad := 0
 	for _, n := range nodes {
 		if n.Status == "online" {
 			onlineCount++
 		} else if n.Status == "draining" {
 			drainingCount++
 		}
-		totalLoad += n.CurrentLoad
 	}
+	// Only online/draining nodes contribute to Total Load. An offline
+	// node's current_load is frozen at its last heartbeat and counts
+	// channels that were already reclaimed — including it would inflate
+	// the metric (e.g. a dead node stuck at 280 while holding 0).
+	totalLoad := sumNodeLoad(nodes)
 
 	c.HTML(200, "nodes.html", &NodesData{
 		Nodes:         nodes,

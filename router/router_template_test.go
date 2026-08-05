@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"html/template"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -155,6 +156,61 @@ func TestNodesTemplateRendersCompletely(t *testing.T) {
 	})
 }
 
+// TestOfflineNodeLoadCellHidden verifies the per-node Load cell never shows a
+// dead node's frozen current_load (only ever written by the node's own
+// heartbeat) — it renders a muted dash instead, on both the nodes page and
+// the admin page.
+//
+// The load metric cards are set to a distinct value (999) so they can't be
+// confused with the per-node cell values in the assertions. The online node's
+// cell renders "280\n...</td>" (template whitespace), so "\u2265280\n" matches
+// exactly one load cell; the offline node's cell renders a dash instead.
+func TestOfflineNodeLoadCellHidden(t *testing.T) {
+	// Load value chosen to not collide with anything in the templates
+	// (admin.html contains max-width:280px in its CSS).
+	const load = 283
+	nodes := []database.Node{
+		{NodeID: "node-16", Status: "online", CurrentLoad: load},
+		{NodeID: "node-19", Status: "offline", CurrentLoad: load}, // dead — must not show its load
+	}
+
+	checkCells := func(name, out string) {
+		t.Helper()
+		if !strings.Contains(out, ">999<") {
+			t.Fatalf("%s: load metric card missing\n%s", name, out[len(out)-800:])
+		}
+		// The online node's load cell is the ONLY place the load value may
+		// appear (metric cards use 999, no timestamps are set, and the offline
+		// node's stale value must be replaced by a dash). Exactly one
+		// occurrence proves the offline cell no longer renders the frozen load.
+		if got := strings.Count(out, strconv.Itoa(load)); got != 1 {
+			t.Fatalf("%s: expected exactly one load cell with %d (online node only), got %d\n%s", name, load, got, out[len(out)-1200:])
+		}
+		if !strings.Contains(out, "\u2014") {
+			t.Fatalf("%s: offline node load cell should render a dash", name)
+		}
+	}
+
+	checkCells("nodes.html", renderTemplate(t, "nodes.html", &NodesData{
+		Nodes:       nodes,
+		OnlineCount: 1,
+		TotalLoad:   999, // distinct metric value, not a load cell
+		Mode:        "pooled",
+		MyNodeID:    "node-16",
+	}))
+
+	checkCells("admin.html", renderTemplate(t, "admin.html", &AdminData{
+		Config:        &entity.Config{FFmpegPath: "/usr/bin/ffmpeg"},
+		Disk:          &entity.DiskInfo{Total: "1 TB", Used: "1 GB", Free: "999 GB", Percent: 1},
+		Uploads:       &entity.UploadsResponse{},
+		Nodes:         nodes,
+		OnlineNodes:   1,
+		TotalNodeLoad: 999, // distinct metric value, not a load cell
+		PoolMode:      "pooled",
+		MyNodeID:      "node-16",
+	}))
+}
+
 func TestPoolTemplateRendersCompletely(t *testing.T) {
 	renderTemplate(t, "pool.html", &PoolData{
 		Assignments: []PoolEntry{
@@ -166,4 +222,29 @@ func TestPoolTemplateRendersCompletely(t *testing.T) {
 
 func TestLogsTemplateRendersCompletely(t *testing.T) {
 	renderTemplate(t, "logs.html", nil)
+}
+
+// TestSumNodeLoadExcludesOffline verifies that offline nodes' frozen
+// current_load (never corrected after death, since only the node's own
+// heartbeat writes it) is excluded from the dashboard's Total Load, while
+// online and draining nodes still count.
+func TestSumNodeLoadExcludesOffline(t *testing.T) {
+	nodes := []database.Node{
+		{NodeID: "node-16", Status: "online", CurrentLoad: 280},
+		{NodeID: "node-17", Status: "online", CurrentLoad: 280},
+		{NodeID: "node-18", Status: "draining", CurrentLoad: 280},
+		{NodeID: "node-19", Status: "offline", CurrentLoad: 280}, // dead — must not count
+	}
+	if got := sumNodeLoad(nodes); got != 840 {
+		t.Fatalf("sumNodeLoad = %d, want 840 (offline node excluded)", got)
+	}
+}
+
+func TestSumNodeLoadAllOffline(t *testing.T) {
+	nodes := []database.Node{
+		{NodeID: "node-19", Status: "offline", CurrentLoad: 280},
+	}
+	if got := sumNodeLoad(nodes); got != 0 {
+		t.Fatalf("sumNodeLoad = %d, want 0 (single offline node)", got)
+	}
 }

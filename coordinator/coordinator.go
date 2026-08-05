@@ -325,6 +325,12 @@ func (c *Coordinator) Stop() {
 		log.Printf("[coordinator] error deregistering node: %v", err)
 	}
 
+	// Zero our own load: all assignments were released above, so a stale
+	// current_load would otherwise linger on the row and inflate Total Load.
+	if err := c.Client.ResetNodeLoad(c.NodeID); err != nil {
+		log.Printf("[coordinator] error resetting node load: %v", err)
+	}
+
 	log.Printf("[coordinator] node %q stopped cleanly", c.NodeID)
 }
 

@@ -180,6 +180,73 @@ func TestIntegrationClaimChannels(t *testing.T) {
 	}
 }
 
+// TestIntegrationClaimOfflineVsLive verifies the live-aware claim split: an
+// offline claim (ClaimOfflineChannels) must never return a live channel, and a
+// live claim (ClaimLiveChannels) must never return an offline channel. This is
+// the fix for live channels being swept wholesale by whichever node had
+// offline budget room after a reclaim.
+func TestIntegrationClaimOfflineVsLive(t *testing.T) {
+	client := skipIfNoSupabase(t)
+	defer cleanupAssignments(t, client, testNodeID)
+	defer cleanupNode(t, client)
+
+	coord := New(client, &mockChannelManager{})
+	coord.NodeID = testNodeID
+	coord.Mode = entity.PoolModePooled
+	coord.Register()
+
+	// One live + one offline unassigned channel. Composite keys are unique so
+	// no foreign unassigned rows can be claimed for these exact keys.
+	live := database.ChannelAssignment{Username: testNodeID + "-live", Site: "chaturbate", Status: "unassigned", IsLive: true, Framerate: 60, Resolution: 1080}
+	off := database.ChannelAssignment{Username: testNodeID + "-off", Site: "stripchat", Status: "unassigned", IsLive: false, Framerate: 30, Resolution: 720}
+	if err := client.BulkInsertAssignments([]database.ChannelAssignment{live, off}); err != nil {
+		t.Fatalf("BulkInsertAssignments error: %v", err)
+	}
+	defer func() {
+		_ = client.DeleteAssignment(live.Username, live.Site)
+		_ = client.DeleteAssignment(off.Username, off.Site)
+	}()
+
+	// Offline claim (limit 1): the offline channel must be claimed, never the live one.
+	claimedOff, err := client.ClaimOfflineChannels(testNodeID, 1)
+	if err != nil {
+		t.Fatalf("ClaimOfflineChannels error: %v", err)
+	}
+	if len(claimedOff) != 1 {
+		t.Fatalf("ClaimOfflineChannels returned %d rows, want 1", len(claimedOff))
+	}
+	for _, c := range claimedOff {
+		if c.IsLive {
+			t.Errorf("offline claim returned live channel %s", c.Username)
+		}
+		if c.AssignedNode != testNodeID {
+			t.Errorf("claimed %s assigned to %q, want %q", c.Username, c.AssignedNode, testNodeID)
+		}
+	}
+
+	// Live claim (limit 1): the live channel must be claimed, never the offline one.
+	claimedLive, err := client.ClaimLiveChannels(testNodeID, 1)
+	if err != nil {
+		t.Fatalf("ClaimLiveChannels error: %v", err)
+	}
+	if len(claimedLive) != 1 {
+		t.Fatalf("ClaimLiveChannels returned %d rows, want 1", len(claimedLive))
+	}
+	for _, c := range claimedLive {
+		if !c.IsLive {
+			t.Errorf("live claim returned offline channel %s", c.Username)
+		}
+		if c.AssignedNode != testNodeID {
+			t.Errorf("claimed %s assigned to %q, want %q", c.Username, c.AssignedNode, testNodeID)
+		}
+	}
+
+	// Both distinct rows claimed, no double-claim.
+	if claimedOff[0].Username == claimedLive[0].Username {
+		t.Errorf("offline and live claims returned the same channel %s", claimedOff[0].Username)
+	}
+}
+
 // TestIntegrationFairShareAcrossNodes verifies that multiple nodes get a fair share.
 func TestIntegrationFairShareAcrossNodes(t *testing.T) {
 	client := skipIfNoSupabase(t)

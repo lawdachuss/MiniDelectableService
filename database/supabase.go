@@ -959,6 +959,17 @@ func (c *Client) UpdateNodeStatus(nodeID, status string) error {
 	})
 }
 
+// ResetNodeLoad zeroes a node's current_load. current_load is only ever
+// written by the node's own heartbeat, so a node that goes offline or dies
+// would otherwise carry a frozen load forever — inflating the dashboard's
+// "Total Load" with channels that were already reclaimed. Called by the
+// reaper and graceful shutdown after the node's assignments are released.
+func (c *Client) ResetNodeLoad(nodeID string) error {
+	return c.patch(fmt.Sprintf("/nodes?node_id=eq.%s", url.QueryEscape(nodeID)), map[string]interface{}{
+		"current_load": 0,
+	})
+}
+
 // UpdateNodeWebURL sets the public web URL for a node.  Used by the cloudflared
 // tunnel reporter so the admin panel's "Visit" link reflects the live tunnel.
 func (c *Client) UpdateNodeWebURL(nodeID, webURL string) error {
@@ -1085,18 +1096,17 @@ type AssignmentStats struct {
 	TotalAliveNodes    int `json:"total_alive_nodes"`
 }
 
-// ClaimChannels atomically claims up to `limit` unassigned channels for this node.
-// Uses the PostgreSQL claim_channels RPC, which locks candidate rows with
-// SELECT ... FOR UPDATE SKIP LOCKED so two nodes can never claim the same
-// channel concurrently (no TOCTOU between a GET and a PATCH).  Returns the
-// rows that were successfully claimed (empty slice if none available).
-func (c *Client) ClaimChannels(nodeID string, limit int) ([]ChannelAssignment, error) {
+// claimRPC posts to a claim_* RPC with the standard (p_node_id, p_limit)
+// payload and decodes the claimed rows. All claim RPCs use SELECT ... FOR
+// UPDATE SKIP LOCKED so two nodes can never claim the same channel
+// concurrently (no TOCTOU between a GET and a PATCH).
+func (c *Client) claimRPC(rpcName, nodeID string, limit int) ([]ChannelAssignment, error) {
 	body := map[string]interface{}{
 		"p_node_id": nodeID,
 		"p_limit":   limit,
 	}
 
-	resp, err := c.requestWithRetry("POST", "/rpc/claim_channels", body)
+	resp, err := c.requestWithRetry("POST", "/rpc/"+rpcName, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1112,6 +1122,32 @@ func (c *Client) ClaimChannels(nodeID string, limit int) ([]ChannelAssignment, e
 		return nil, fmt.Errorf("decode claimed: %w", err)
 	}
 	return claimed, nil
+}
+
+// ClaimChannels atomically claims up to `limit` unassigned channels for this
+// node, regardless of is_live. Kept for compatibility; the claim cycle now
+// prefers ClaimOfflineChannels/ClaimLiveChannels so offline budget claims can
+// never sweep live channels.
+func (c *Client) ClaimChannels(nodeID string, limit int) ([]ChannelAssignment, error) {
+	return c.claimRPC("claim_channels", nodeID, limit)
+}
+
+// ClaimOfflineChannels atomically claims up to `limit` unassigned OFFLINE
+// channels (is_live=false) for this node via the claim_offline_channels RPC.
+// Used by the claim cycle to fill a node's offline fair-share budget without
+// accidentally absorbing live channels that should be spread across nodes.
+func (c *Client) ClaimOfflineChannels(nodeID string, limit int) ([]ChannelAssignment, error) {
+	return c.claimRPC("claim_offline_channels", nodeID, limit)
+}
+
+// ClaimLiveChannels atomically claims up to `limit` unassigned LIVE channels
+// (is_live=true) for this node via the claim_live_channels RPC. The claim
+// cycle uses it to claim live channels only up to the node's live fair share
+// (ceil(totalLive / aliveNodes)), so live channels are spread across nodes
+// instead of being swept wholesale by whichever node had offline budget room
+// after a reclaim.
+func (c *Client) ClaimLiveChannels(nodeID string, limit int) ([]ChannelAssignment, error) {
+	return c.claimRPC("claim_live_channels", nodeID, limit)
 }
 
 // ClaimSpecificChannel atomically claims one specific channel for this node.

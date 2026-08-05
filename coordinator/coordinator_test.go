@@ -280,6 +280,40 @@ func TestFairShareCalculation(t *testing.T) {
 	}
 }
 
+// TestLiveClaimBudget verifies the live fair-share budget: how many live
+// channels a node may still claim = ceil(totalLive/aliveNodes) minus its own
+// live count, clamped at 0. This is the fix for live channels being swept
+// wholesale by one node — each node claims live channels only up to its share.
+func TestLiveClaimBudget(t *testing.T) {
+	tests := []struct {
+		name          string
+		myLiveCount   int
+		totalLive     int
+		totalNodes    int
+		expectedBudget int
+	}{
+		{"30 live, 3 nodes, node holds 0 → 10", 0, 30, 3, 10},
+		{"30 live, 3 nodes, node holds 10 → 0 (at share)", 10, 30, 3, 0},
+		{"30 live, 3 nodes, node holds 15 → 0 (over share, sticky)", 15, 30, 3, 0},
+		{"1 live, 3 nodes, node holds 0 → 1 (ceil rounds up)", 0, 1, 3, 1},
+		{"7 live, 3 nodes, node holds 2 → 1", 2, 7, 3, 1},
+		{"7 live, 3 nodes, node holds 3 → 0", 3, 7, 3, 0},
+		{"0 live, 3 nodes → 0 (nothing to claim)", 0, 0, 3, 0},
+		{"3 live, 1 node → 3 (single node takes all)", 0, 3, 1, 3},
+		{"3 live, 0 nodes → 3 (defensive: treat as 1)", 0, 3, 0, 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := liveClaimBudget(tt.myLiveCount, tt.totalLive, tt.totalNodes)
+			if got != tt.expectedBudget {
+				t.Errorf("liveClaimBudget(%d, %d, %d) = %d, want %d",
+					tt.myLiveCount, tt.totalLive, tt.totalNodes, got, tt.expectedBudget)
+			}
+		})
+	}
+}
+
 // TestStartStop verifies that Start and Stop don't panic when in pooled mode.
 func TestStartStop(t *testing.T) {
 	os.Setenv("CHANNEL_POOL_MODE", "pooled")

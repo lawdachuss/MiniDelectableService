@@ -114,6 +114,13 @@ func (c *Coordinator) fence() {
 		if err := c.Client.ReleaseNodeChannels(c.NodeID); err != nil {
 			log.Printf("[coordinator] fence: release channels error: %v", err)
 		}
+		// Zero our load for dashboard consistency — same as the reaper and
+		// graceful shutdown. Best-effort: if the DB is unreachable the row
+		// simply keeps its last reported load until a healthy heartbeat
+		// corrects it.
+		if err := c.Client.ResetNodeLoad(c.NodeID); err != nil {
+			log.Printf("[coordinator] fence: reset load error: %v", err)
+		}
 	}
 }
 

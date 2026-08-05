@@ -53,6 +53,22 @@ func (c *Coordinator) StartClaimLoop(ctx context.Context) {
 	})
 }
 
+// liveClaimBudget returns how many live channels this node may still claim to
+// reach its live fair share: ceil(totalLive/aliveNodes) - myLiveCount, clamped
+// at 0. A node already at or over its live share claims nothing new — live
+// channels are sticky and must never be released, so an over-share node simply
+// keeps what it has until the channels go offline naturally.
+func liveClaimBudget(myLiveCount, totalLive, totalNodes int) int {
+	if totalNodes <= 0 {
+		totalNodes = 1
+	}
+	liveShare := int(math.Ceil(float64(totalLive) / float64(totalNodes)))
+	if budget := liveShare - myLiveCount; budget > 0 {
+		return budget
+	}
+	return 0
+}
+
 // ReleaseChannel releases a single channel back to the pool.
 // Called when a channel is paused or deleted.
 func (c *Coordinator) ReleaseChannel(username, site string) {
@@ -202,16 +218,21 @@ func (c *Coordinator) runClaimCycle() {
 		return // let next cycle do the claiming to avoid races
 	}
 
-	// Claim offline channels up to our maxOfflineAllowed budget
+	didSomething := false
+
+	// Claim OFFLINE channels up to our maxOfflineAllowed budget. Live channels
+	// are deliberately NOT claimable here — an offline-budget claim must never
+	// sweep the live channels that should be spread across nodes.
 	if myOfflineCount < maxOfflineAllowed {
 		budget := maxOfflineAllowed - myOfflineCount
-		claimed, err := c.Client.ClaimChannels(c.NodeID, budget)
+		claimed, err := c.Client.ClaimOfflineChannels(c.NodeID, budget)
 		if err != nil {
-			log.Printf("[coordinator] claim cycle: claim error: %v", err)
+			log.Printf("[coordinator] claim cycle: claim offline error (is supabase/migrations/20260805000000_live_aware_claim.sql applied?): %v", err)
 			return
 		}
 		if len(claimed) > 0 {
-			log.Printf("[coordinator] claimed %d new channel(s) (offline: %d -> %d, live: %d, fairShare: %d, totalPool: %d)",
+			didSomething = true
+			log.Printf("[coordinator] claimed %d new offline channel(s) (offline: %d -> %d, live: %d, fairShare: %d, totalPool: %d)",
 				len(claimed), myOfflineCount, myOfflineCount+len(claimed), myLiveCount, fairShare, totalPool)
 			for _, ca := range claimed {
 				if c.Manager != nil {
@@ -221,12 +242,40 @@ func (c *Coordinator) runClaimCycle() {
 				}
 			}
 		}
-		return // claimed or error, nothing more to do this cycle
+	}
+
+	// Claim LIVE channels up to our live fair share. Live channels are the
+	// ones that actually get recorded, so they're spread across nodes (each
+	// node claims at most ceil(totalLive/aliveNodes)) instead of being swept
+	// wholesale by whichever node had offline room after a reclaim. A node that
+	// already holds more live than its share keeps them (live is sticky) but
+	// claims nothing new. Claiming live can push a node slightly over its total
+	// fair share; the excess-offline release above rebalances it next cycle.
+	if liveBudget := liveClaimBudget(myLiveCount, stats.TotalLiveChannels, totalNodes); liveBudget > 0 {
+		claimed, err := c.Client.ClaimLiveChannels(c.NodeID, liveBudget)
+		if err != nil {
+			log.Printf("[coordinator] claim cycle: claim live error (is supabase/migrations/20260805000000_live_aware_claim.sql applied?): %v", err)
+			return
+		}
+		if len(claimed) > 0 {
+			didSomething = true
+			log.Printf("[coordinator] claimed %d new live channel(s) (live: %d -> %d, liveBudget: %d, totalLive: %d)",
+				len(claimed), myLiveCount, myLiveCount+len(claimed), liveBudget, stats.TotalLiveChannels)
+			for _, ca := range claimed {
+				if c.Manager != nil {
+					if err := c.Manager.CreateChannelFromAssignment(&ca); err != nil {
+						log.Printf("[coordinator] error creating channel from assignment %s: %v", ca.Username, err)
+					}
+				}
+			}
+		}
 	}
 
 	// Nothing to claim or release this cycle — log for visibility
-	log.Printf("[coordinator] claim cycle: nothing to do (offline: %d, live: %d, fairShare: %d, maxOfflineAllowed: %d, totalPool: %d)",
-		myOfflineCount, myLiveCount, fairShare, maxOfflineAllowed, totalPool)
+	if !didSomething {
+		log.Printf("[coordinator] claim cycle: nothing to do (offline: %d, live: %d, fairShare: %d, maxOfflineAllowed: %d, totalPool: %d)",
+			myOfflineCount, myLiveCount, fairShare, maxOfflineAllowed, totalPool)
+	}
 }
 
 // RebalanceAtSessionBoundary is called at session boundaries (after uploads

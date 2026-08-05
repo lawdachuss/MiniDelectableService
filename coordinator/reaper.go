@@ -73,5 +73,12 @@ func (c *Coordinator) runReapCycle(timeout time.Duration) {
 		if err := c.Client.UpdateNodeStatus(deadNodeID, "offline"); err != nil {
 			log.Printf("[coordinator] reaper: update status for %s error: %v", deadNodeID, err)
 		}
+
+		// Zero the dead node's frozen current_load so the dashboard's Total
+		// Load stops counting channels that were just reclaimed. The dead
+		// node's process is gone, so its heartbeat can never correct it.
+		if err := c.Client.ResetNodeLoad(deadNodeID); err != nil {
+			log.Printf("[coordinator] reaper: reset load for %s error: %v", deadNodeID, err)
+		}
 	}
 }
