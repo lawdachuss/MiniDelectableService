@@ -38,13 +38,13 @@ func SaveSettings() error {
 		Csrftoken:       Config.Csrftoken,
 		CfClearance:     Config.CfClearance,
 		UserAgent:       Config.UserAgent,
-		VoeSXAPIKey:     Config.VoeSXAPIKey,
-		StreamtapeLogin: Config.StreamtapeLogin,
-		StreamtapeKey:   Config.StreamtapeKey,
-		MixdropEmail:    Config.MixdropEmail,
-		MixdropToken:    Config.MixdropToken,
-		VidaraKey:       Config.VidaraKey,
-		StripchatPDKey:  Config.StripchatPDKey,
+		VoeSXAPIKey:     validPersistedValue(Config.VoeSXAPIKey),
+		StreamtapeLogin: validPersistedValue(Config.StreamtapeLogin),
+		StreamtapeKey:   validPersistedValue(Config.StreamtapeKey),
+		MixdropEmail:    validPersistedValue(Config.MixdropEmail),
+		MixdropToken:    validPersistedValue(Config.MixdropToken),
+		VidaraKey:       validPersistedValue(Config.VidaraKey),
+		StripchatPDKey:  validPersistedValue(Config.StripchatPDKey),
 	}
 	ConfigMu.RUnlock()
 
@@ -87,26 +87,26 @@ func LoadSettings() error {
 	if s.UserAgent != "" {
 		Config.UserAgent = s.UserAgent
 	}
-	if s.VoeSXAPIKey != "" {
-		Config.VoeSXAPIKey = s.VoeSXAPIKey
+	if v := validPersistedValue(s.VoeSXAPIKey); v != "" {
+		Config.VoeSXAPIKey = v
 	}
-	if s.StreamtapeLogin != "" {
-		Config.StreamtapeLogin = s.StreamtapeLogin
+	if v := validPersistedValue(s.StreamtapeLogin); v != "" {
+		Config.StreamtapeLogin = v
 	}
-	if s.StreamtapeKey != "" {
-		Config.StreamtapeKey = s.StreamtapeKey
+	if v := validPersistedValue(s.StreamtapeKey); v != "" {
+		Config.StreamtapeKey = v
 	}
-	if s.MixdropEmail != "" {
-		Config.MixdropEmail = s.MixdropEmail
+	if v := validPersistedValue(s.MixdropEmail); v != "" {
+		Config.MixdropEmail = v
 	}
-	if s.MixdropToken != "" {
-		Config.MixdropToken = s.MixdropToken
+	if v := validPersistedValue(s.MixdropToken); v != "" {
+		Config.MixdropToken = v
 	}
-	if s.VidaraKey != "" {
-		Config.VidaraKey = s.VidaraKey
+	if v := validPersistedValue(s.VidaraKey); v != "" {
+		Config.VidaraKey = v
 	}
-	if s.StripchatPDKey != "" {
-		Config.StripchatPDKey = s.StripchatPDKey
+	if v := validPersistedValue(s.StripchatPDKey); v != "" {
+		Config.StripchatPDKey = v
 	}
 
 	// Parse Config.Cookies back into individual fields if they are empty.
@@ -136,8 +136,29 @@ func extractCookie(cookieStr, name string) string {
 	return ""
 }
 
+// validPersistedValue returns s trimmed, or "" when s is empty, whitespace-only,
+// or the placeholder dash ("-"). The web UI and settings blob have previously
+// stored "-" for unset API keys; treating it as a real value made startup
+// (LoadSettings) overwrite working .env credentials and all uploads failed with
+// 401 "invalid api_key". Callers must skip the value when this returns "".
+func validPersistedValue(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "-" {
+		return ""
+	}
+	return s
+}
+
 // UpdateUploaderCredentials updates upload service credentials and protects concurrent access with a mutex.
 func UpdateUploaderCredentials(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, vidaraKey string) {
+	// Ignore placeholder dash values so the web UI can't wipe real .env keys.
+	voeSXAPIKey = validPersistedValue(voeSXAPIKey)
+	streamtapeLogin = validPersistedValue(streamtapeLogin)
+	streamtapeKey = validPersistedValue(streamtapeKey)
+	mixdropEmail = validPersistedValue(mixdropEmail)
+	mixdropToken = validPersistedValue(mixdropToken)
+	vidaraKey = validPersistedValue(vidaraKey)
+
 	ConfigMu.Lock()
 	if voeSXAPIKey != "" {
 		Config.VoeSXAPIKey = voeSXAPIKey

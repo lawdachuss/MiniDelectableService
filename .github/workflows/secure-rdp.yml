@@ -15,12 +15,9 @@ permissions:
   contents: read
   actions: write
 
-# One long-running recorder at a time: a new dispatch queues instead of
-# overlapping the active 6h session (replaces the old gh run list self-cancel).
-concurrency:
-  group: secure-rdp
-  cancel-in-progress: false
-
+# One long-running recorder at a time. Instead of a concurrency group (which
+# left scheduled runs stuck in pending), a new run self-cancels in Init when
+# another session is still active within its 6h window.
 env:
   GH_TOKEN: ${{ github.token }}
   # Opt into Node 24 now (default since June 16, 2026) and keep the safety
@@ -65,6 +62,10 @@ jobs:
           echo "REPO_DIR=D:\repos\$repoName" >> $env:GITHUB_ENV
           Remove-Item "D:\repos\$repoName\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
           echo "START_TIME=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
+          # Self-cancel instead of queuing: if another run is still recording
+          # within its 6h window (<348 min), cancel THIS run and exit.
+          $r = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status,startedAt 2>$null | ConvertFrom-Json
+          if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt 348)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
 
       # ── Caches: restore everything, save everything ──────────────────────────
       # Go modules + build cache are handled by setup-go below (cache: true).

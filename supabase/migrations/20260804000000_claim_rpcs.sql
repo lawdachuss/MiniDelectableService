@@ -8,6 +8,7 @@
 CREATE OR REPLACE FUNCTION claim_channels(p_node_id TEXT, p_limit INT)
 RETURNS SETOF channel_assignments
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
     RETURN QUERY
@@ -35,6 +36,7 @@ $$;
 CREATE OR REPLACE FUNCTION claim_specific_channel(p_username TEXT, p_site TEXT, p_node_id TEXT)
 RETURNS SETOF channel_assignments
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     picked channel_assignments%ROWTYPE;
@@ -68,6 +70,7 @@ $$;
 CREATE OR REPLACE FUNCTION reassign_channel(p_username TEXT, p_site TEXT, p_from_node TEXT, p_to_node TEXT)
 RETURNS VOID
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
     UPDATE channel_assignments ca
