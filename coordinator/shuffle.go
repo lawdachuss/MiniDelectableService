@@ -177,6 +177,9 @@ func (c *Coordinator) runOfflineShuffleCycleWith(db dbShuffler) {
 		if localSet[ca.Username] {
 			continue
 		}
+		if c.Manager != nil && c.Manager.HasPendingSegments(ca.Username) {
+			continue
+		}
 		offline = append(offline, ca)
 	}
 	if len(offline) == 0 {

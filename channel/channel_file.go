@@ -1402,7 +1402,7 @@ func collectPendingSegmentsInDir(dir string) []string {
 }
 
 // deletePendingSegments removes all pending segments for a channel and cleans
-// up the (now empty) directory.
+// up the (now empty) directory, including any quarantined corrupt segments.
 func deletePendingSegments(username string) {
 	dir := pendingSegmentsDir(username)
 	entries, err := os.ReadDir(dir)
@@ -1410,9 +1410,53 @@ func deletePendingSegments(username string) {
 		return
 	}
 	for _, e := range entries {
+		if e.IsDir() && e.Name() == "corrupt" {
+			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+			continue
+		}
 		_ = os.Remove(filepath.Join(dir, e.Name()))
 	}
 	_ = os.Remove(dir)
+}
+
+// quarantineSegment moves a corrupt pending segment into the corrupt/
+// subdirectory of its pending dir, preserving it for manual inspection while
+// ensuring it can never block a future merge.
+func quarantineSegment(path string) error {
+	corruptDir := filepath.Join(filepath.Dir(path), "corrupt")
+	if err := os.MkdirAll(corruptDir, 0777); err != nil {
+		return err
+	}
+	dest := filepath.Join(corruptDir, filepath.Base(path))
+	_ = os.Remove(dest) // overwrite a previously quarantined copy
+	return os.Rename(path, dest)
+}
+
+// quarantineInvalidSegments probes each pending segment and moves any that
+// cannot be probed (corrupt, truncated, or unreadable) into the corrupt/
+// subdirectory so a single bad segment can never poison an entire merge.  It
+// returns the probe-valid segments and the number quarantined.  Callers must
+// hold the channel's pending mutex.
+func quarantineInvalidSegments(username string, segments []string) ([]string, int) {
+	valid := make([]string, 0, len(segments))
+	quarantined := 0
+	for _, s := range segments {
+		dur, err := VideoDurationSeconds(s)
+		if err != nil || dur <= 0 {
+			if err == nil {
+				err = fmt.Errorf("zero duration")
+			}
+			log.Printf("[min-duration] quarantining corrupt pending segment %s (%v)", filepath.Base(s), err)
+			if qErr := quarantineSegment(s); qErr != nil {
+				log.Printf("[min-duration] could not quarantine %s: %v — excluding it from merge anyway", filepath.Base(s), qErr)
+			} else {
+				quarantined++
+			}
+			continue
+		}
+		valid = append(valid, s)
+	}
+	return valid, quarantined
 }
 
 // mergedPendingName returns a stable name for a consolidated pending segment:
@@ -1676,6 +1720,18 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			return false // no pending — proceed normally
 		}
 
+		// Quarantine any corrupt pending segments so a single bad file cannot
+		// poison the merge. If nothing probe-valid remains, upload the current
+		// (already >= min-duration) video normally instead of parking it.
+		segments, quarantined := quarantineInvalidSegments(ch.Config.Username, segments)
+		if quarantined > 0 {
+			ch.Warn("min-duration: quarantined %d corrupt pending segment(s) for %s", quarantined, ch.Config.Username)
+		}
+		if len(segments) == 0 {
+			mu.Unlock()
+			return false // no valid pending — proceed with normal upload
+		}
+
 		// Merge pending segments with the current video.
 		// Release the lock during the potentially long ffmpeg encode.
 		mergedPath := videoPath + ".merged.mp4"
@@ -1765,6 +1821,10 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 	// If multiple segments have now accumulated, merge them and check the
 	// combined duration. Only upload if the merged result meets the threshold.
 	segments := collectPendingSegments(ch.Config.Username)
+	segments, quarantined := quarantineInvalidSegments(ch.Config.Username, segments)
+	if quarantined > 0 {
+		ch.Warn("min-duration: quarantined %d corrupt pending segment(s) for %s", quarantined, ch.Config.Username)
+	}
 	if len(segments) > 1 {
 		// Write to a unique scratch name first so the output can never collide
 		// with an existing "merged-*" input segment, then finalize below.
@@ -1860,6 +1920,16 @@ func processAllPendingSegments() {
 				continue
 			}
 
+			// Quarantine corrupt segments so they can never poison a merge.
+			segments, quarantined := quarantineInvalidSegments(username, segments)
+			if quarantined > 0 {
+				recoveryLogf(filepath.Join(pendingRoot, username), "quarantined %d corrupt pending segment(s) for %s", quarantined, username)
+			}
+			if len(segments) < 1 {
+				mu.Unlock()
+				continue
+			}
+
 			// If min-duration is disabled, upload everything directly (legacy behavior).
 			if minDur <= 0 {
 				for _, s := range segments {
@@ -1879,6 +1949,25 @@ func processAllPendingSegments() {
 			segCopy := make([]string, len(segments))
 			copy(segCopy, segments)
 			mu.Unlock()
+
+			// A single remaining segment can still be uploaded if it alone meets
+			// the threshold (e.g. all other segments were quarantined as corrupt).
+			if len(segCopy) == 1 {
+				singleDur, dErr := VideoDurationSeconds(segCopy[0])
+				if dErr == nil && singleDur >= float64(minDur) {
+					recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (>= %ds) — uploading", singleDur, minDur)
+					thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(segCopy[0])
+					UploadOrphanedFile(segCopy[0], thumbURL, spriteURL, previewURL)
+					_ = os.Remove(segCopy[0])
+				} else {
+					if dErr != nil {
+						recoveryLogf(segCopy[0], "recovery: could not probe single pending segment (%v) — keeping pending", dErr)
+					} else {
+						recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (< %ds) — keeping pending", singleDur, minDur)
+					}
+				}
+				continue
+			}
 
 			pendingDir := pendingSegmentsDir(username)
 			stableName := mergedPendingName(segments)

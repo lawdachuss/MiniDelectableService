@@ -441,6 +441,29 @@ func (m *Manager) GetLocalChannels() []string {
 	return list
 }
 
+// HasPendingSegments implements coordinator.ChannelManager.
+// Returns true if the channel has any pending recording segments on
+// this node's disk (files waiting to be merged/uploaded).  The
+// shuffle skips such channels so pending files are never orphaned
+// by a reassignment.
+func (m *Manager) HasPendingSegments(username string) bool {
+	dir := "videos"
+	if server.Config != nil && server.Config.OutputDir != "" {
+		dir = server.Config.OutputDir
+	}
+	pendingDir := filepath.Join(dir, ".pending", username)
+	entries, err := os.ReadDir(pendingDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 // RemoveChannelForReassignment implements coordinator.ChannelManager.
 // Removes a channel from this node when it's been reassigned to another node.
 func (m *Manager) RemoveChannelForReassignment(username string) error {

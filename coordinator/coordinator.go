@@ -211,6 +211,7 @@ type ChannelManager interface {
 	CreateChannelFromAssignment(ca *database.ChannelAssignment) error
 	RemoveChannelForReassignment(username string) error
 	GetLocalChannels() []string
+	HasPendingSegments(username string) bool
 }
 
 // LivenessChecker is the interface for checking if a channel is currently live.

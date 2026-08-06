@@ -83,6 +83,10 @@ func (m *mockChannelManager) GetLocalChannels() []string {
 	return list
 }
 
+func (m *mockChannelManager) HasPendingSegments(username string) bool {
+	return false
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -545,6 +549,56 @@ func TestRunOfflineShuffleCycle(t *testing.T) {
 	}
 	if len(mgr.removed) != 1 || mgr.removed[0] != "off1" {
 		t.Fatalf("expected local channel off1 removed, got %v", mgr.removed)
+	}
+}
+
+// mockChannelManagerWithPending is a mockChannelManager that reports
+// pending segments for specific usernames, so the shuffle can be
+// verified to skip them.
+type mockChannelManagerWithPending struct {
+	mockChannelManager
+	pendingSet map[string]bool
+}
+
+func (m *mockChannelManagerWithPending) HasPendingSegments(username string) bool {
+	return m.pendingSet[username]
+}
+
+// TestRunOfflineShuffleCycleSkipsPending verifies that the shuffle
+// never moves a channel that has pending recording segments on the
+// local node, even when the channel is otherwise offline.
+func TestRunOfflineShuffleCycleSkipsPending(t *testing.T) {
+	mock := &mockClient{
+		stats: &database.AssignmentStats{TotalPoolChannels: 2},
+		aliveNodes: []database.Node{
+			{NodeID: "node-a", CurrentLoad: 2},
+			{NodeID: "node-b", CurrentLoad: 0},
+		},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			"node-a": {
+				{Username: "offline_with_pending", Site: "chaturbate", Status: "claimed", IsLive: false},
+				{Username: "offline_clean", Site: "chaturbate", Status: "claimed", IsLive: false},
+			},
+		},
+	}
+	mgr := &mockChannelManagerWithPending{
+		pendingSet: map[string]bool{"offline_with_pending": true},
+	}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
+
+	c.runOfflineShuffleCycleWith(mock)
+
+	// fairShare=ceil(2/2)=1, myLoad=2 → moveCount=1. Only
+	// offline_clean should be moved; offline_with_pending is
+	// protected by the pending-segment guard.
+	if len(mock.reassignCalls) != 1 {
+		t.Fatalf("expected 1 reassign, got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
+	}
+	if mock.reassignCalls[0].username != "offline_clean" {
+		t.Fatalf("expected offline_clean to be shuffled, got %q", mock.reassignCalls[0].username)
+	}
+	if mock.reassignCalls[0].toNode != "node-b" {
+		t.Fatalf("expected move to node-b, got %q", mock.reassignCalls[0].toNode)
 	}
 }
 
