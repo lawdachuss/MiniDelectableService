@@ -174,6 +174,24 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		).Run()
 
 		if err != nil {
+			// Fast seek failed; retry with slow seek (-ss after -i).
+			// This handles certain codecs/formats where fast seek causes
+			// ffmpeg to crash (exit 0xffffffea on Windows).
+			errFn("thumb: fast seek failed for %s: %v, retrying with slow seek", baseName, err)
+			err = config.FFmpegCommandContext(thumbCtx,
+				"-y",
+				"-i", videoPath,
+				"-ss", seekPos,
+				"-vframes", "1",
+				"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
+					thumbWidth, thumbHeight, thumbWidth, thumbHeight),
+				"-c:v", "mjpeg",
+				"-q:v", "5",
+				thumbJPG,
+			).Run()
+		}
+
+		if err != nil {
 			errFn("thumb: failed for %s: %v", baseName, err)
 			thumbDone <- ""
 			return

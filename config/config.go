@@ -450,6 +450,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		MixdropEmail:            c.String("mixdrop-email"),
 		MixdropToken:            c.String("mixdrop-token"),
 		VidaraKey:               c.String("vidara-key"),
+		CatboxProxyURL:          c.String("catbox-proxy-url"),
 		UploadMaxConcurrent:     c.Int("upload-max-concurrent"),
 		UploadHostConcurrency:   c.Int("upload-host-concurrency"),
 		PipelineWorkers:         c.Int("pipeline-workers"),

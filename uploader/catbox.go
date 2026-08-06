@@ -10,16 +10,23 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/teacat/chaturbate-dvr/server"
 )
 
 // CatboxUploader handles uploading images to Catbox.moe.
 // No API key required — anonymous uploads are supported.
+// When a CatboxProxyURL is configured, uploads are routed through
+// the proxy Cloudflare Worker instead of going directly to catbox.moe.
 type CatboxUploader struct {
-	client *http.Client
+	client  *http.Client
+	proxyURL string
 }
 
 // NewCatboxUploader creates a new Catbox.moe uploader.
-// Always connects directly — Catbox is CDN-backed and accessible from any IP.
+// When a proxy URL is configured (via the catbox-proxy-url setting),
+// uploads are routed through the Cloudflare Worker proxy to avoid
+// direct IP blocks from Catbox.
 func NewCatboxUploader() *CatboxUploader {
 	transport := &http.Transport{
 		MaxIdleConns:          100,
@@ -29,11 +36,17 @@ func NewCatboxUploader() *CatboxUploader {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	proxyURL := ""
+	if server.Config != nil {
+		proxyURL = server.Config.CatboxProxyURL
+	}
+
 	return &CatboxUploader{
 		client: &http.Client{
 			Timeout:   2 * time.Minute,
 			Transport: transport,
 		},
+		proxyURL: proxyURL,
 	}
 }
 
@@ -107,7 +120,7 @@ func (u *CatboxUploader) uploadOnce(filePath string) (string, error) {
 	totalLen := int64(preamble.Len()) + fi.Size() + int64(len(closing))
 	body := io.MultiReader(&preamble, file, bytes.NewReader([]byte(closing)))
 
-	req, err := http.NewRequest("POST", "https://catbox.moe/user/api.php", body)
+	req, err := http.NewRequest("POST", u.uploadURL(), body)
 	if err != nil {
 		return "", fmt.Errorf("catbox: create request: %w", err)
 	}
@@ -145,6 +158,16 @@ func (u *CatboxUploader) uploadOnce(filePath string) (string, error) {
 	}
 
 	return text, nil
+}
+
+// uploadURL returns the endpoint for Catbox uploads.
+// When a proxy URL is configured, uploads route through the
+// Cloudflare Worker proxy to avoid direct IP blocks from Catbox.
+func (u *CatboxUploader) uploadURL() string {
+	if u.proxyURL != "" {
+		return u.proxyURL
+	}
+	return "https://catbox.moe/user/api.php"
 }
 
 // isRetryableCatboxError returns true if the error represents a transient

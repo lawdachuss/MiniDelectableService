@@ -202,6 +202,7 @@ type Config struct {
 	MixdropEmail     string
 	MixdropToken     string
 	VidaraKey        string
+	CatboxProxyURL   string
 
 	// Upload throughput tuning.
 	UploadMaxConcurrent   int // max video files uploading concurrently (0 = default 100)

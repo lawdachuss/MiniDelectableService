@@ -339,6 +339,12 @@ func main() {
 				EnvVars: []string{"VIDARA_KEY"},
 				Value:   "",
 			},
+			&cli.StringFlag{
+				Name:    "catbox-proxy-url",
+				Usage:   "Cloudflare Worker proxy URL for Catbox uploads (avoids direct IP blocks)",
+				EnvVars: []string{"CATBOX_PROXY_URL"},
+				Value:   "",
+			},
 			&cli.IntFlag{
 				Name:    "upload-max-concurrent",
 				Usage:   "Maximum number of video files uploading at once (0 = default 100)",
