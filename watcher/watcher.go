@@ -102,6 +102,7 @@ func isSidecar(name string) bool {
 		strings.HasSuffix(name, ".sprite.webp") ||
 		strings.HasSuffix(name, ".sprite.jpg") ||
 		strings.HasSuffix(name, ".preview.webp") ||
+		strings.HasSuffix(name, ".preview.mp4") ||
 		strings.HasSuffix(name, ".thumb") ||
 		strings.HasSuffix(name, ".sprite") ||
 		strings.HasSuffix(name, ".video.mp4") ||
