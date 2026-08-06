@@ -19,8 +19,7 @@ import (
 // pendingFile tracks a closed recording file awaiting post-processing
 // (finalize → move to output dir → thumbnail → upload → DB save → deletion).
 type pendingFile struct {
-	videoPath       string
-	skipMinDuration bool // when true, bypass the minimum-duration threshold (used on pause)
+	videoPath string
 }
 
 // Channel represents a channel instance.

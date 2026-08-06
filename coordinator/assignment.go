@@ -227,7 +227,7 @@ func (c *Coordinator) runClaimCycle() {
 		budget := maxOfflineAllowed - myOfflineCount
 		claimed, err := c.Client.ClaimOfflineChannels(c.NodeID, budget)
 		if err != nil {
-			log.Printf("[coordinator] claim cycle: claim offline error (is supabase/migrations/20260805000000_live_aware_claim.sql applied?): %v", err)
+			log.Printf("[coordinator] claim cycle: claim offline error (is database/migrate-combined.sql applied?): %v", err)
 			return
 		}
 		if len(claimed) > 0 {
@@ -254,7 +254,7 @@ func (c *Coordinator) runClaimCycle() {
 	if liveBudget := liveClaimBudget(myLiveCount, stats.TotalLiveChannels, totalNodes); liveBudget > 0 {
 		claimed, err := c.Client.ClaimLiveChannels(c.NodeID, liveBudget)
 		if err != nil {
-			log.Printf("[coordinator] claim cycle: claim live error (is supabase/migrations/20260805000000_live_aware_claim.sql applied?): %v", err)
+			log.Printf("[coordinator] claim cycle: claim live error (is database/migrate-combined.sql applied?): %v", err)
 			return
 		}
 		if len(claimed) > 0 {

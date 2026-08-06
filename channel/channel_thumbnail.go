@@ -45,8 +45,8 @@ func GenerateThumbnailForFile(videoPath string) (thumbURL, spriteURL, previewURL
 }
 
 // generateThumbnailForFile creates a static thumbnail (JPEG), a multi-frame sprite
-// sheet (JPEG), and an MP4 hover preview (6 seconds of smooth clips from
-// across the full video).  All three are uploaded to remote hosts and the
+// sheet (JPEG), and an animated WEBP hover preview (6 seconds of smooth clips
+// from across the full video).  All three are uploaded to remote hosts and the
 // URLs returned.  Local temp files are always cleaned up.
 //
 // JPEG is used for thumbnail and sprite because:
@@ -54,11 +54,12 @@ func GenerateThumbnailForFile(videoPath string) (thumbURL, spriteURL, previewURL
 //   - mjpeg encoder is fast (minimal encoding lag)
 //   - Small filesize with good visual quality
 //
-// MP4 is used for the animated preview because:
-//   - ~90% smaller than GIF at same quality
-//   - Full 24-bit color (no 256-color palette limit)
+// Animated WEBP is used for the preview because:
+//   - ~90% smaller than GIF at same quality, full 24-bit color
 //   - Smooth native-framerate playback (GIF was variable ~1-8fps)
-//   - Catbox accepts MP4 files (free, permanent, CDN-backed)
+//   - Hosted by Catbox (primary) and ImgBB (fallback) — both accept WEBP
+//     (the IamAPTBA/ImgBB API no-op, image hosts all accept it) so the
+//     preview never depends on MP4-specific hosts like PixelDrain.
 //
 // The preview uses filter_complex to extract 12 short clips (~0.5s each)
 // from evenly-spaced points across the full video and stitch them together.
@@ -253,12 +254,13 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 	}()
 
-	// ── MP4 hover preview (smooth clips from across the video, 6s total) ──
-	// H.264 MP4 is used instead of GIF because:
+	// ── Animated WEBP hover preview (smooth clips from across the video, 6s) ─
+	// Animated WEBP is used instead of GIF because:
 	//   - ~90% smaller file size for the same visual quality
 	//   - Full 24-bit color (vs 256-color palette in GIF)
 	//   - Smooth native-framerate playback (GIF was variable ~1-8fps)
-	//   - Catbox accepts MP4 files (200MB limit, permanent storage)
+	//   - Catbox (primary) and ImgBB (fallback) both accept WEBP files, so no
+	//     MP4-only host (PixelDrain) is required.
 	//
 	// Instead of isolated frame sampling (which produces a jerky slideshow),
 	// we extract 12 short continuous clips (~0.5s each) from evenly-spaced
@@ -269,7 +271,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	//   1 min:   12 clips × 0.5s = 6s (5s between clips)
 	//   60 min:  12 clips × 0.5s = 6s (5 min between clips)
 	//
-	// Uploaded to Catbox.moe (free, permanent, CDN-backed) with PixelDrain
+	// Uploaded to Catbox.moe (free, permanent, CDN-backed) with ImgBB
 	// as fallback — both return direct file URLs suitable for embedding.
 	go func() {
 		defer func() {
@@ -284,13 +286,13 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		previewCtx, previewCancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer previewCancel()
 
-		previewMP4 := videoPath + ".preview.mp4"
-		// Remove on final return, but NOT if ffmpeg failed — leave the file
-		// on disk so a later restart or manual retry can pick it up.
+		previewPath := videoPath + ".preview.webp"
+		// Remove on the final return, but NOT if ffmpeg failed — leave the
+		// file on disk so a later restart or manual retry can pick it up.
 		var previewGenerated bool
 		defer func() {
 			if previewGenerated {
-				os.Remove(previewMP4)
+				os.Remove(previewPath)
 			}
 		}()
 
@@ -301,7 +303,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		// successfully.  Retrying with a short delay resolves this.
 		waitForPreviewFile := func() bool {
 			for delay := 0; delay < 5; delay++ {
-				if fileExists(previewMP4) {
+				if fileExists(previewPath) {
 					return true
 				}
 				time.Sleep(time.Duration(50*(1<<delay)) * time.Millisecond) // 50, 100, 200, 400, 800 ms
@@ -315,16 +317,17 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		var err error
 		if dur <= previewDuration || dur <= 0 {
 			// Short or unmeasurable video — no segmenting needed, just scale.
+			// libwebp needs a constant frame rate, so -r 15 forces CFR.
 			err = config.FFmpegCommandContext(previewCtx,
 				"-y",
 				"-i", videoPath,
 				"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
-				"-c:v", "libx264",
-				"-preset", "fast",
-				"-crf", "23",
-				"-movflags", "+faststart",
+				"-c:v", "libwebp",
+				"-lossless", "0",
+				"-q:v", "60",
+				"-r", "15",
 				"-an",
-				previewMP4,
+				previewPath,
 			).Run()
 		} else {
 			// Build a filter_complex that extracts clips and stitches them.
@@ -362,12 +365,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				"-i", videoPath,
 				"-filter_complex", filterComplex,
 				"-map", "[out]",
-				"-c:v", "libx264",
-				"-preset", "fast",
-				"-crf", "23",
-				"-movflags", "+faststart",
+				"-c:v", "libwebp",
+				"-lossless", "0",
+				"-q:v", "60",
+				"-r", "15",
 				"-an",
-				previewMP4,
+				previewPath,
 			).Run()
 
 			// If the complex filter_complex failed, fall back to a simple
@@ -379,7 +382,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			//
 			// Use a fresh context so the fallback gets its own 5-minute
 			// timeout instead of inheriting the nearly-expired previewCtx.
-			if err != nil || !fileExists(previewMP4) {
+			if err != nil || !fileExists(previewPath) {
 				if err != nil {
 					errFn("preview: complex filter failed for %s: %v, trying simple fallback", baseName, err)
 				} else {
@@ -393,12 +396,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					"-i", videoPath,
 					"-t", fmt.Sprintf("%.2f", previewDuration),
 					"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
-					"-c:v", "libx264",
-					"-preset", "fast",
-					"-crf", "23",
-					"-movflags", "+faststart",
+					"-c:v", "libwebp",
+					"-lossless", "0",
+					"-q:v", "60",
+					"-r", "15",
 					"-an",
-					previewMP4,
+					previewPath,
 				).Run()
 			}
 		}
@@ -418,12 +421,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		previewGenerated = true
 
 		catboxUploader := uploader.NewCatboxUploader()
-		pixeldrainUploader := uploader.NewPixelDrainUploader(os.Getenv("PIXELDRAIN_API_KEY"))
+		imgbbUploader := uploader.NewImgBBUploader()
 
-		remoteURL, uploadErr := catboxUploader.Upload(previewMP4)
+		remoteURL, uploadErr := catboxUploader.Upload(previewPath)
 		if uploadErr != nil {
-			errFn("preview: catbox failed for %s: %v, trying PixelDrain fallback", baseName, uploadErr)
-			remoteURL, uploadErr = pixeldrainUploader.Upload(previewMP4)
+			errFn("preview: catbox failed for %s: %v, trying ImgBB fallback", baseName, uploadErr)
+			remoteURL, uploadErr = imgbbUploader.Upload(previewPath)
 		}
 
 		if uploadErr == nil {

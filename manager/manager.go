@@ -317,9 +317,36 @@ func (m *Manager) LoadPooledConfig() error {
 	}
 
 	// Fetch assignments that belong to this node (status != unassigned).
-	myAssignments, err := client.GetNodeAssignments(server.NodeID())
-	if err != nil {
-		return fmt.Errorf("get node assignments: %w", err)
+	// Retry with backoff across transient Supabase failures (e.g. Cloudflare
+	// HTTP 530 / 1033 in front of the project). A brief flap at startup must
+	// never abort the whole process (which previously caused an exit-1 restart
+	// loop in keep-alive.ps1, wasting ~3 min on cookie refresh each cycle).
+	// If it is still unreachable, degrade to an empty channel set: the
+	// coordinator's 60s claim loop reconciles assignments and creates the
+	// channels as soon as Supabase recovers.
+	var myAssignments []database.ChannelAssignment
+	var fetchErr error
+	const maxAssignmentAttempts = 10
+	for attempt := 0; attempt < maxAssignmentAttempts; attempt++ {
+		myAssignments, fetchErr = client.GetNodeAssignments(server.NodeID())
+		if fetchErr == nil {
+			break
+		}
+		if attempt < maxAssignmentAttempts-1 {
+			backoff := time.Duration(1<<uint(attempt)) * 2 * time.Second
+			if backoff > 15*time.Second {
+				backoff = 15 * time.Second
+			}
+			fmt.Printf("[WARN] LoadPooledConfig: get node assignments failed (attempt %d/%d), retrying in %v: %v\n",
+				attempt+1, maxAssignmentAttempts, backoff, fetchErr)
+			time.Sleep(backoff)
+		}
+	}
+	if fetchErr != nil {
+		fmt.Printf("[WARN] LoadPooledConfig: could not fetch node assignments after %d attempts: %v\n"+
+			"   Starting with an empty channel set — the coordinator claim loop will pick up assignments when Supabase recovers.\n",
+			maxAssignmentAttempts, fetchErr)
+		myAssignments = nil
 	}
 
 	created := 0

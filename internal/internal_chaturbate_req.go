@@ -42,7 +42,9 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 			return err
 		}
 		if !AllowChaturbateRequest() {
-			return ErrCircuitBreakerOpen
+			// Opens can last minutes (escalated cooldown); don't spin 3 instant
+			// retries against an open circuit — fail fast, retry next cycle.
+			return retry.Unrecoverable(ErrCircuitBreakerOpen)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBufferString(postData.Encode()))

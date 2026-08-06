@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -147,6 +148,37 @@ func validPersistedValue(s string) string {
 		return ""
 	}
 	return s
+}
+
+// ApplyCentralSessionDuration reconciles the session length so every node
+// follows the same value. Precedence:
+//  1. A locally-set SESSION_DURATION (env/flag) always wins — per-node override.
+//  2. Otherwise the central value stored in Supabase (app_settings
+//     "session_duration") is adopted, so nodes need no env at all.
+//  3. If neither is set, a CI runner (GITHUB_RUN_ID) falls back to a ~5m-35m
+//     buffer (5h35m) before the workflow's hard kill so it still stops,
+//     processes and uploads instead of being force-flushed mid-recording.
+func ApplyCentralSessionDuration() {
+	ConfigMu.Lock()
+	defer ConfigMu.Unlock()
+
+	// Local env value already parsed — keep it.
+	if Config.SessionDurationParsed > 0 || Config.SessionDuration != "" {
+		return
+	}
+
+	if central := LoadSessionDurationFromDB(); central != "" {
+		if parsed, err := time.ParseDuration(central); err == nil && parsed > 0 {
+			Config.SessionDuration = central
+			Config.SessionDurationParsed = parsed
+			return
+		}
+	}
+
+	if os.Getenv("GITHUB_RUN_ID") != "" {
+		Config.SessionDuration = "335m"
+		Config.SessionDurationParsed = 335 * time.Minute
+	}
 }
 
 // UpdateUploaderCredentials updates upload service credentials and protects concurrent access with a mutex.

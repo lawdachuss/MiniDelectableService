@@ -164,11 +164,11 @@ func (ch *Channel) processPendingFile(pf pendingFile) {
 	}
 
 	if ch.Config.Compress {
-		if !pf.skipMinDuration && ch.handleMinDurationAndMerge(finalPath) {
+		if ch.handleMinDurationAndMerge(finalPath) {
 			return
 		}
 		ch.CompressFile(finalPath)
-	} else if !pf.skipMinDuration && ch.handleMinDurationAndMerge(finalPath) {
+	} else if ch.handleMinDurationAndMerge(finalPath) {
 		return
 	} else {
 		ch.MoveToOutputDir(finalPath)
@@ -231,8 +231,7 @@ func (ch *Channel) cleanupLocked() error {
 	} else if fileInfo != nil {
 		ch.cleanupMu.Lock()
 		ch.pendingFiles = append(ch.pendingFiles, pendingFile{
-			videoPath:       filename,
-			skipMinDuration: ch.Config.IsPaused.Load(),
+			videoPath: filename,
 		})
 		ch.cleanupMu.Unlock()
 		ch.Info("cleanup: queued %s for post-processing", filepath.Base(filename))
@@ -944,10 +943,23 @@ func CleanupOrphanedFiles() {
 				}
 				base := strings.TrimSuffix(name, suffix)
 				hasMain := false
-				for ext := range map[string]bool{".mp4": true, ".mkv": true, ".ts": true} {
-					if _, ok := mainVideos[base+ext]; ok {
-						hasMain = true
-						break
+				// base may or may not already carry a video extension. A main video's
+				// stem is its name minus its own extension, so match BOTH forms:
+				//   - base IS a main video (e.g. "X.mp4.merged.mp4" -> stem "X.mp4.merged")
+				//   - base needs an extension appended (e.g. "recording" sidecar whose
+				//     main is "recording.mp4" -> stem "recording")
+				// Previously this only tested mainVideos[base+ext], which never matched
+				// previews/thumbnails of .merged.mp4 (or other already-.mp4) outputs —
+				// the cleanup deleted their freshly-generated sidecars mid-upload.
+				if _, ok := mainVideos[strings.TrimSuffix(base, filepath.Ext(base))]; ok {
+					hasMain = true
+				}
+				if !hasMain {
+					for ext := range map[string]bool{".mp4": true, ".mkv": true, ".ts": true} {
+						if _, ok := mainVideos[strings.TrimSuffix(base+ext, filepath.Ext(base+ext))]; ok {
+							hasMain = true
+							break
+						}
 					}
 				}
 				if !hasMain {
@@ -1607,8 +1619,7 @@ func mergeVideos(inputs []string, outputPath string) error {
 
 // handleMinDurationAndMerge checks whether a finalized video file meets the
 // minimum-duration threshold.  If the feature is disabled the check is skipped
-// and the caller proceeds to upload normally.  Callers should skip this
-// function entirely when skipMinDuration is set (channel pause).
+// and the caller proceeds to upload normally.
 //
 // When a video is shorter than the threshold it is moved into a pending
 // directory.  If pending segments already exist (including the one just moved),

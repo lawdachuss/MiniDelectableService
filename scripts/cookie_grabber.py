@@ -276,6 +276,38 @@ def click_turnstile_checkbox(page):
     return False
 
 
+def _is_managed_challenge(page):
+    """Detect a Cloudflare 'managed' Turnstile challenge.
+
+    cb.xxx serves this mode to datacenter IPs (GitHub Actions runners), and a
+    managed challenge cannot be cleared by manually clicking the checkbox —
+    Cloudflare never auto-verifies it. The DVR logs the same discovery
+    ("The turnstile version discovered is 'managed'") when it probes the
+    challenge config. Positive-only detection: reads window._cf_chl_opt.cType
+    (a.k.a. the turnstile mode); if the key is absent or the value differs,
+    returns False and the normal solve path runs unchanged.
+    """
+    try:
+        raw = page.evaluate(
+            """() => {
+                try {
+                    const opt = window._cf_chl_opt || {};
+                    return JSON.stringify({cType: opt.cType || '', turbo: opt.turbo || ''});
+                } catch (e) { return ''; }
+            }"""
+        )
+    except Exception:
+        return False
+    if not raw:
+        return False
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        return False
+    needle = (cfg.get("cType") or "").lower()
+    return "managed" in needle or "managed" in (cfg.get("turbo") or "").lower()
+
+
 def on_real_site(page):
     """True when the current page is the actual site, not a challenge."""
     try:
@@ -327,6 +359,11 @@ def solve_challenge(page, ctx, timeout):
         if state != last_state:
             print(f"  page state: {state} (title='{(page.title() or '')[:50]}')")
             last_state = state
+        if state == "challenge" and _is_managed_challenge(page):
+            print("  [FAIL] Managed Turnstile challenge detected — manual checkbox clicking can never clear it; abandoning early")
+            print("  [INFO] Keeping the stored cookie set in Supabase - NOT overwriting with unverified cookies")
+            sys.stdout.flush()
+            return False
         has_cf = any(c.get("name") == "cf_clearance" for c in ctx.cookies())
         if has_cf and state == "real":
             # Give the proof-of-work a moment to settle, then verify for real.

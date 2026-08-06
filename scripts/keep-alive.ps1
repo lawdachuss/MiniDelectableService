@@ -396,7 +396,13 @@ while ($true) {
     Send-Notify "error" "DVR exited code $($dvr.ExitCode)`nLast stderr: $($lastLogs -join "`n")"
     $null = [System.Console]::Out.Flush()
     $env:SESSION_DURATION = "$([Math]::Max(1, [math]::Floor((5*3600+20*60 - $elapsed)/60)))m0s"
-    $dvr = Start-Process -FilePath $dvrExe -ArgumentList "--no-tunnel --output-dir `"$videosDir`"" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
+    # Skip the slow browser cookie-grab on RESTART: cookies are already loaded
+    # from Supabase by LoadSettings(), and re-running cookie_grabber.py would
+    # stall startup for up to ~3-4 min (scrapling/playwright spend the full
+    # timeout on cb.xxx's managed Turnstile from a datacenter IP). The first
+    # launch still refreshes; only the restart path opts out.
+    $dvrArgs = "--no-tunnel --output-dir `"$videosDir`" --refresh-cookies=false"
+    $dvr = Start-Process -FilePath $dvrExe -ArgumentList $dvrArgs -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
   }
 
 

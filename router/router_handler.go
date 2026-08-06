@@ -994,6 +994,56 @@ func TriggerSessionStop(c *gin.Context) {
 	c.JSON(200, gin.H{"success": true})
 }
 
+// SetSessionDuration sets the central recording-session length shared by all
+// nodes. The value is persisted to Supabase so every node adopts it on the
+// next cycle; the running session is unaffected mid-cycle.
+func SetSessionDuration(c *gin.Context) {
+	var req struct {
+		Duration string `json:"duration"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.Duration = strings.TrimSpace(req.Duration)
+	if req.Duration == "" || req.Duration == "0" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "duration is required (e.g. \"5h20m0s\", or \"0\" for continuous)"})
+		return
+	}
+	parsed, err := time.ParseDuration(req.Duration)
+	if err != nil || parsed < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid duration %q: %v", req.Duration, err)})
+		return
+	}
+	if parsed == 0 {
+		// Explicitly disable sessions centrally.
+		if err := server.SaveSessionDurationToDB(""); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		server.ConfigMu.Lock()
+		server.Config.SessionDuration = ""
+		server.Config.SessionDurationParsed = 0
+		server.ConfigMu.Unlock()
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	if err := server.SaveSessionDurationToDB(req.Duration); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	server.ConfigMu.Lock()
+	server.Config.SessionDuration = req.Duration
+	server.Config.SessionDurationParsed = parsed
+	server.ConfigMu.Unlock()
+	// Apply it now so a subsequent cycle uses it (no-op if a session is active).
+	if server.Manager != nil {
+		server.Manager.StartSession(parsed)
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "duration": req.Duration})
+}
+
 func ListOrphans(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"orphans": scanOrphanFiles()})
 }
@@ -1093,6 +1143,10 @@ func RetryOrphan(c *gin.Context) {
 					results[idx] = result{Path: p, Status: "failed", Error: fmt.Sprintf("panic: %v", r)}
 				}
 			}()
+			if channel.MaybeDeferToPending(p) {
+				results[idx] = result{Path: p, Status: "deferred", Error: "below min-duration threshold — moved to pending"}
+				return
+			}
 			thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(p)
 			if !channel.UploadOrphanedFile(p, thumbURL, spriteURL, previewURL) {
 				results[idx] = result{Path: p, Status: "failed", Error: "upload did not complete successfully"}
@@ -1160,6 +1214,10 @@ func RescanOutputDir(c *gin.Context) {
 						res = rescanResult{Path: path, Status: "failed", Error: fmt.Sprintf("panic: %v", r)}
 					}
 				}()
+				if channel.MaybeDeferToPending(path) {
+					res = rescanResult{Path: path, Status: "deferred", Error: "below min-duration threshold — moved to pending"}
+					return
+				}
 				thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(path)
 				if !channel.UploadOrphanedFile(path, thumbURL, spriteURL, previewURL) {
 					res = rescanResult{Path: path, Status: "failed", Error: "upload did not complete successfully"}

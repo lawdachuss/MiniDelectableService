@@ -234,7 +234,7 @@ func (c *Client) SaveChannel(ch *Channel) error {
 
 // ChannelProfile holds the full-profile fields scraped from the site's
 // biocontext API and stored in the existing channels table (see
-// database/migrate-channel-profiles.sql). Only the profile columns are
+// database/migrate-combined.sql). Only the profile columns are
 // touched — config columns (is_paused, framerate, pattern, …) stay intact.
 //
 // Every field except Username is omitempty so a partial API response never
@@ -853,7 +853,7 @@ func (c *Client) DeleteJournalByHash(fileHash string) error {
 // PIPELINE STATES
 // ============================================================================
 //
-// Schema defined in migrate.sql (CREATE TABLE pipeline_states).
+// Schema defined in migrate-combined.sql (CREATE TABLE pipeline_states).
 
 type PipelineState struct {
 	FileHash     string `json:"file_hash"`

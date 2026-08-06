@@ -85,7 +85,7 @@ func (s *ChaturbateSite) fetchBiocontext(ctx context.Context, req *internal.Req,
 			return err
 		}
 		if !internal.AllowChaturbateRequest() {
-			return internal.ErrCircuitBreakerOpen
+			return retry.Unrecoverable(internal.ErrCircuitBreakerOpen)
 		}
 
 		var e error
@@ -197,7 +197,7 @@ func (s *ChaturbateSite) GetRoomStatus(ctx context.Context, req *internal.Req, u
 			return err
 		}
 		if !internal.AllowChaturbateRequest() {
-			return internal.ErrCircuitBreakerOpen
+			return retry.Unrecoverable(internal.ErrCircuitBreakerOpen)
 		}
 
 		var e error

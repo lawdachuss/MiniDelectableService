@@ -114,7 +114,7 @@ func fetchAPIResponse(ctx context.Context, client *internal.Req, username string
 			return err
 		}
 		if !internal.AllowChaturbateRequest() {
-			return internal.ErrCircuitBreakerOpen
+			return retry.Unrecoverable(internal.ErrCircuitBreakerOpen)
 		}
 
 		var e error

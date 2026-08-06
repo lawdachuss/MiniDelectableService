@@ -362,6 +362,44 @@ func loadJSONSettingWithClient(key string, client *http.Client) []byte {
 	return []byte(string(entries[0].Value))
 }
 
+// ─── Central session duration ────────────────────────────────────────────────
+
+// sessionDurationKey is the app_settings key holding the single central
+// recording-session length shared by every node. Storing it apart from the
+// per-node dvr_settings blob means nodes never overwrite it with their own
+// (possibly empty) env value on startup.
+const sessionDurationKey = "session_duration"
+
+// SaveSessionDurationToDB persists the central session duration (a Go duration
+// string such as "5h20m0s") to Supabase. Empty values are ignored so a node
+// can never wipe the shared setting.
+func SaveSessionDurationToDB(value string) error {
+	if value == "" {
+		return nil
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal session duration: %w", err)
+	}
+	return saveJSONSetting(sessionDurationKey, b)
+}
+
+// LoadSessionDurationFromDB returns the central session duration string, or ""
+// if unset/unreachable. Uses the fast startup client so node boot is not
+// blocked on a slow Supabase round trip.
+func LoadSessionDurationFromDB() string {
+	b := loadJSONSettingFast(sessionDurationKey)
+	if b == nil {
+		return ""
+	}
+	var v string
+	if err := json.Unmarshal(b, &v); err != nil {
+		// Tolerate a value stored without surrounding JSON quotes.
+		return strings.Trim(string(b), "\" \t\r\n")
+	}
+	return strings.TrimSpace(v)
+}
+
 // ─── Channels ─────────────────────────────────────────────────────────────────
 
 // SaveChannelsToDB saves channels to Supabase.

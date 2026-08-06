@@ -577,6 +577,12 @@ func start(c *cli.Context) error {
 	}
 	fmt.Printf("[startup] manager created in %v\n", time.Since(started).Round(time.Millisecond))
 
+	// Reconcile the session length before the coordinator registers its
+	// session_deadline: local SESSION_DURATION wins, else the central Supabase
+	// value, else a CI-safe fallback — so every node stops recording and
+	// uploads at the same time, even with no env set.
+	server.ApplyCentralSessionDuration()
+
 	// Route disk-threshold alerts through the notifier (Discord/ntfy).
 	server.DiskAlert = notifier.Notify
 
@@ -721,7 +727,7 @@ func start(c *cli.Context) error {
 	channel.CleanupOrphanedFiles()
 	go server.StartDiskMonitor(diskMonitorStop)
 
-	if err := server.Manager.CreateChannel(&entity.ChannelConfig{
+	if err := 	server.Manager.CreateChannel(&entity.ChannelConfig{
 		Site:                    c.String("site"),
 		Username:                c.String("username"),
 		Framerate:               c.Int("framerate"),

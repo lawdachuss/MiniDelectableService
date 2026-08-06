@@ -108,6 +108,9 @@ func (ch *Channel) Monitor(runID uint64) {
 				ch.Info("room requires a password, try again in %d min(s)", server.Config.Interval)
 			} else if errors.Is(err, context.Canceled) {
 				// channel stopped/paused — silent
+			} else if errors.Is(err, internal.ErrCircuitBreakerOpen) {
+				ch.Info("%s: upstream circuit breaker open (cooldown ~%v), will retry once it cools down",
+					ch.Config.Username, internal.CircuitBreakerCooldown())
 			} else {
 				ch.Error("on retry: %s: retrying in 10s", err.Error())
 			}

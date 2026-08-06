@@ -15,6 +15,7 @@ import (
 
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
+	"github.com/teacat/chaturbate-dvr/server"
 )
 
 // cycleGuard prevents overlapping coordinator cycles. When the DB is slow,
@@ -463,11 +464,19 @@ func channelPoolMode() string {
 // the coordinator can migrate its channels away beforehand.  The value is
 // persisted on the node row (session_deadline) at registration; the deadline
 // migration loop reads it.  Priority:
-//  1. SESSION_DURATION env (Go duration string, e.g. "5h20m") — explicit.
-//  2. GITHUB_RUN_ID present (CI runner, hard 6h cap) — use a buffer BEFORE the
+//  1. The effective session length on server.Config (env/flag, central
+//     Supabase value, or CI fallback — see ApplyCentralSessionDuration), so the
+//     recorder stop and the coordinator deadline always agree.
+//  2. SESSION_DURATION env (Go duration string, e.g. "5h20m") — defensive
+//     fallback if Config is unavailable.
+//  3. GITHUB_RUN_ID present (CI runner, hard 6h cap) — use a buffer BEFORE the
 //     workflow's 348-minute self-cancel so migration fires while we're still up.
-//  3. Neither — nil (permanent node, no deadline).
+//  4. None of the above — nil (permanent node, no deadline).
 func computeSessionDeadline() *time.Time {
+	if server.Config != nil && server.Config.SessionDurationParsed > 0 {
+		t := time.Now().Add(server.Config.SessionDurationParsed)
+		return &t
+	}
 	if d := os.Getenv("SESSION_DURATION"); d != "" {
 		if dur, err := time.ParseDuration(d); err == nil && dur > 0 {
 			t := time.Now().Add(dur)

@@ -109,3 +109,6 @@ last-run.txt
 
 # Note: database/ is NOT ignored here — see "Database files" section above
 # (only database/* with !recordings.json exceptions)
+
+# Local data backups
+.audit/

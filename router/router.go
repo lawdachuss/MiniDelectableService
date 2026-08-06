@@ -102,6 +102,7 @@ func SetupViews(r *gin.Engine) {
 
 	// Session control API
 	r.POST("/api/session/stop", TriggerSessionStop)
+	r.POST("/api/session/duration", SetSessionDuration)
 
 	// ── Distributed shards / nodes UI ─────────────────────────────────────
 	r.GET("/nodes", NodesPage)
