@@ -15,9 +15,16 @@ permissions:
   contents: read
   actions: write
 
-# One long-running recorder at a time. Instead of a concurrency group (which
-# left scheduled runs stuck in pending), a new run self-cancels in Init when
-# another session is still active within its 6h window.
+# One long-running recorder at a time, never a queued pile-up.
+# A default concurrency group keeps the active session running and auto-cancels
+# any older PENDING runs so only the newest queued run survives (older queued
+# runs are replaced the moment a newer one is triggered). We deliberately do NOT
+# set cancel-in-progress: true, which would also kill the currently recording
+# session — the active recorder must keep running; only queued extras vanish.
+concurrency:
+  group: secure-rdp
+  cancel-in-progress: false
+
 env:
   GH_TOKEN: ${{ github.token }}
   # Opt into Node 24 now (default since June 16, 2026) and keep the safety
