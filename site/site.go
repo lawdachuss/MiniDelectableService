@@ -11,6 +11,7 @@ import (
 const (
 	StatusPublic  = "public"
 	StatusPrivate = "private"
+	StatusHidden  = "hidden"
 	StatusAway    = "away"
 	StatusOffline = "offline"
 )

@@ -104,17 +104,18 @@ func (c *Client) GetRoomStatus(ctx context.Context, username string) (string, er
 func fetchAPIResponse(ctx context.Context, client *internal.Req, username string) (*APIResponse, error) {
 	apiURL := fmt.Sprintf("%sapi/chatvideocontext/%s/", server.Config.Domain, username)
 
-	if !internal.AllowChaturbateRequest() {
-		return nil, internal.ErrCircuitBreakerOpen
-	}
+	// NOTE: No circuit-breaker check here on purpose. The GET (chatvideocontext)
+	// endpoint only needs cookies (and is frequently answered cookie-less with a
+	// clean JSON body) and is the critical fallback when the POST API fails or
+	// the breaker opens. The breaker only gates the POST API — it must NOT block
+	// this fallback, or the node can never recover and record live channels
+	// during transient auth/CF issues (e.g. a fresh GitHub runner IP that has no
+	// minted cf_clearance yet).
 
 	var body string
 	err := retry.Do(func() error {
 		if err := internal.WaitForChaturbateRateLimit(ctx); err != nil {
 			return err
-		}
-		if !internal.AllowChaturbateRequest() {
-			return retry.Unrecoverable(internal.ErrCircuitBreakerOpen)
 		}
 
 		var e error

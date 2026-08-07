@@ -793,7 +793,8 @@ func (l *liveChecker) IsLive(ctx context.Context, siteName, username string) boo
 		return false
 	}
 
-	return status == site.StatusPublic || status == site.StatusPrivate
+	// Treat hidden (limitcam) as live — the model is streaming.
+	return status == site.StatusPublic || status == site.StatusPrivate || status == site.StatusHidden
 }
 
 func startTunnel(port string) {

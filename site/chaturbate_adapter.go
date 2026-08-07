@@ -187,17 +187,15 @@ func (s *ChaturbateSite) FetchLastBroadcast(ctx context.Context, req *internal.R
 func (s *ChaturbateSite) GetRoomStatus(ctx context.Context, req *internal.Req, username string) (string, error) {
 	apiURL := fmt.Sprintf("%sapi/chatvideocontext/%s/", server.Config.Domain, username)
 
-	if !internal.AllowChaturbateRequest() {
-		return "", internal.ErrCircuitBreakerOpen
-	}
+	// NOTE: No circuit-breaker check here on purpose. The GET (chatvideocontext)
+	// endpoint is the critical cookie-less fallback for liveness checks and must
+	// still work when the POST-only breaker is open (e.g. a fresh GitHub runner
+	// IP with no minted cf_clearance). See chaturbate.fetchAPIResponse.
 
 	var body string
 	err := retry.Do(func() error {
 		if err := internal.WaitForChaturbateRateLimit(ctx); err != nil {
 			return err
-		}
-		if !internal.AllowChaturbateRequest() {
-			return retry.Unrecoverable(internal.ErrCircuitBreakerOpen)
 		}
 
 		var e error
