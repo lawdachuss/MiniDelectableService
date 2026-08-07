@@ -185,11 +185,15 @@ func fetchStream(ctx context.Context, client *internal.Req, username string, roo
 			return nil, resp.RoomStatus, internal.ErrRoomPasswordRequired
 		}
 
+		// NOTE: no "hidden" case here on purpose — hidden (limitcam) rooms ARE
+		// streaming on Chaturbate and expose an hls_source just like public rooms.
+		// Rejecting them here (as this file did) meant limitcam channels were
+		// claimed as live by liveChecker.IsLive but never recorded. Hidden rooms
+		// fall through to the stream-URL check below; if the room has no URL it
+		// is correctly treated as offline.
 		switch resp.RoomStatus {
 		case StatusPrivate:
 			return nil, resp.RoomStatus, internal.ErrPrivateStream
-		case "hidden":
-			return nil, resp.RoomStatus, internal.ErrHiddenStream
 		case StatusAway, StatusOffline:
 			return nil, resp.RoomStatus, internal.ErrChannelOffline
 		}
@@ -264,11 +268,10 @@ func fetchStream(ctx context.Context, client *internal.Req, username string, roo
 		}
 	}
 
+	// Hidden (limitcam) rooms stream like public ones — do not reject (see above).
 	switch resp.RoomStatus {
 	case StatusPrivate:
 		return nil, resp.RoomStatus, internal.ErrPrivateStream
-	case "hidden":
-		return nil, resp.RoomStatus, internal.ErrHiddenStream
 	case StatusAway, StatusOffline:
 		return nil, resp.RoomStatus, internal.ErrChannelOffline
 	}

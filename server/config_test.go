@@ -98,6 +98,7 @@ func TestPerNodeCookieSaveLoadRoundTrip(t *testing.T) {
 		VoeSXAPIKey:     "voe-key",
 		StreamtapeKey:   "st-key",
 		StreamtapeLogin: "st-login",
+		AffiliateWM:     "wm-123",
 	}
 	defer func() { Config = oldConfig }()
 
@@ -127,7 +128,7 @@ func TestPerNodeCookieSaveLoadRoundTrip(t *testing.T) {
 	if node.UserAgent != "UA" {
 		t.Errorf("per-node user_agent = %q", node.UserAgent)
 	}
-	if node.VoeSXAPIKey != "" || node.StreamtapeKey != "" {
+	if node.VoeSXAPIKey != "" || node.StreamtapeKey != "" || node.AffiliateWM != "" {
 		t.Errorf("per-node blob leaked upload creds: %+v", node)
 	}
 
@@ -143,6 +144,9 @@ func TestPerNodeCookieSaveLoadRoundTrip(t *testing.T) {
 	if g.VoeSXAPIKey != "voe-key" || g.StreamtapeKey != "st-key" {
 		t.Errorf("global creds = voe:%q st:%q", g.VoeSXAPIKey, g.StreamtapeKey)
 	}
+	if g.AffiliateWM != "wm-123" {
+		t.Errorf("global creds affiliate_wm = %q, want wm-123", g.AffiliateWM)
+	}
 	if g.Cookies != "" || g.CfClearance != "" {
 		t.Errorf("global key leaked cookies: %+v", g)
 	}
@@ -153,6 +157,7 @@ func TestPerNodeCookieSaveLoadRoundTrip(t *testing.T) {
 	Config.Csrftoken = ""
 	Config.VoeSXAPIKey = ""
 	Config.StreamtapeKey = ""
+	Config.AffiliateWM = ""
 	if err := LoadSettings(); err != nil {
 		t.Fatalf("LoadSettings: %v", err)
 	}
@@ -164,6 +169,9 @@ func TestPerNodeCookieSaveLoadRoundTrip(t *testing.T) {
 	}
 	if Config.StreamtapeKey != "st-key" {
 		t.Errorf("after load streamtape = %q", Config.StreamtapeKey)
+	}
+	if Config.AffiliateWM != "wm-123" {
+		t.Errorf("after load affiliate_wm = %q, want wm-123", Config.AffiliateWM)
 	}
 }
 

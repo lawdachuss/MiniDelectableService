@@ -352,6 +352,7 @@ type UpdateConfigRequest struct {
 	MixdropToken    string `json:"mixdrop_token" form:"mixdrop_token"`
 	VidaraKey       string `json:"vidara_key" form:"vidara_key"`
 	StripchatPDKey  string `json:"stripchat_pdkey" form:"stripchat_pdkey"`
+	AffiliateWM     string `json:"affiliate_wm" form:"affiliate_wm"`
 }
 
 // UpdateConfig updates the server configuration from the Web UI form or API POST.
@@ -412,6 +413,15 @@ func UpdateConfig(c *gin.Context) {
 	if req.StripchatPDKey != "" {
 		server.ConfigMu.Lock()
 		server.Config.StripchatPDKey = req.StripchatPDKey
+		server.ConfigMu.Unlock()
+	}
+
+	// Update the affiliate webmaster code (used for the fast bulk onlinerooms
+	// liveness check). Empty values are ignored so the web UI can't wipe a
+	// value that is only set in .env / GitHub Actions.
+	if req.AffiliateWM != "" {
+		server.ConfigMu.Lock()
+		server.Config.AffiliateWM = req.AffiliateWM
 		server.ConfigMu.Unlock()
 	}
 

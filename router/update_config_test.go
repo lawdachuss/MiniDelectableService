@@ -20,8 +20,9 @@ func TestUpdateConfigAcceptsJSON(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 
 	body, err := json.Marshal(map[string]string{
-		"cookies":    "cf_clearance=test_cf; sessionid=test; csrftoken=abc123",
-		"user_agent": "TestAgent/1.0",
+		"cookies":      "cf_clearance=test_cf; sessionid=test; csrftoken=abc123",
+		"user_agent":   "TestAgent/1.0",
+		"affiliate_wm": "wm-router",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -44,5 +45,8 @@ func TestUpdateConfigAcceptsJSON(t *testing.T) {
 	}
 	if server.Config.CfClearance != "test_cf" {
 		t.Fatalf("CfClearance = %q", server.Config.CfClearance)
+	}
+	if server.Config.AffiliateWM != "wm-router" {
+		t.Fatalf("AffiliateWM = %q", server.Config.AffiliateWM)
 	}
 }

@@ -565,6 +565,16 @@ func start(c *cli.Context) error {
 		if err := server.SaveSettings(); err != nil {
 			fmt.Printf("⚠️  Failed to persist merged settings to Supabase: %v\n", err)
 		}
+
+		// AFFILIATE_WM is seeded into the global dvr_settings blob on every
+		// start, making Supabase the single source of truth: the first node
+		// that boots with a value (env/GitHub secret) writes it centrally, and
+		// every later node's LoadSettings applies that central value over its
+		// own env (an empty stored value is skipped, so it never wipes a
+		// locally-set one). Only the effective value is persisted.
+		if server.Config.AffiliateWM != "" {
+			fmt.Println("✅ AFFILIATE_WM persisted to Supabase — central single source of truth")
+		}
 	}
 
 	if server.Config.Cookies == "" || server.Config.UserAgent == "" {
@@ -574,6 +584,17 @@ func start(c *cli.Context) error {
 		fmt.Println("   OR update cookies in Supabase via the web UI")
 		fmt.Println("   IMPORTANT: Use Chrome 146+ on Windows for cookie collection so the TLS")
 		fmt.Println("   fingerprint matches the httpcloak preset.")
+		fmt.Println()
+	}
+
+	// The affiliate onlinerooms API gives a fast, single-call bulk liveness
+	// check that covers ALL channels (coordinator Phase 1 + liveChecker Tier 0).
+	// Without AFFILIATE_WM every channel falls back to a slower per-channel
+	// check, so surface a clear startup warning instead of silent degradation.
+	if server.Config.AffiliateWM == "" {
+		fmt.Println("⚠️  AFFILIATE_WM not set — affiliate bulk liveness check disabled (every channel uses the slower per-channel check)")
+		fmt.Println("   Set AFFILIATE_WM in .env, as a GitHub Actions secret, or via the web UI Settings dialog")
+		fmt.Println("   (persisted centrally to Supabase) to enable the fast onlinerooms bulk check.")
 		fmt.Println()
 	}
 

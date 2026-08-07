@@ -99,13 +99,21 @@ jobs:
           restore-keys: |
             tools-
 
+      # ── DVR binary cache ────────────────────────────────────────────────
+      # Restore ONLY on an exact source-hash match. The save key below must
+      # match exactly: the previous key included github.run_id, so the restore
+      # key could never hit it and the `restore-keys: dvr-` prefix fallback
+      # silently restored STALE binaries from older runs. Every node then ran
+      # a pre-fix exe (no per-IP cf_clearance, no CF HTML-block detection, no
+      # cookie-less GET chatvideocontext fallback) and recorded ZERO
+      # Chaturbate channels while StripChat kept working. Removing the prefix
+      # fallback + keying by source hash guarantees a miss triggers a rebuild
+      # from current source in parallel-setup.ps1.
       - name: Restore DVR binary
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.REPO_DIR }}\chaturbate-dvr.exe
-          key: dvr-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
-          restore-keys: |
-            dvr-
+          key: dvr-v2-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
 
       - uses: actions/setup-go@v5
         with:
@@ -144,7 +152,12 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ env.REPO_DIR }}\chaturbate-dvr.exe
-          key: dvr-${{ github.run_id }}-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
+          # Same key as restore (no github.run_id). The run_id-prefixed key
+          # could never be restored by the exact-key lookup, so every run
+          # re-saved a unique entry and the prefix fallback served stale
+          # binaries forever. A source change now changes the hash → cache
+          # miss → fresh build.
+          key: dvr-v2-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
 
       # DNS fix + pip/playwright deps + pinned Chrome 146 run in PARALLEL
       # background jobs (prepare-cookies.ps1), then cookie_grabber.py mints a

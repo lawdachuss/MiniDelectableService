@@ -6,7 +6,7 @@ param(
     [string]$Prefix = "node",
 
     [Parameter(Mandatory = $false)]
-    [int]$Count = 15,
+    [int]$Count = 18,
 
     [Parameter(Mandatory = $false)]
     [int]$Limit = 50,

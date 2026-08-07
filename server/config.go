@@ -28,11 +28,16 @@ type persistedSettings struct {
 	MixdropToken    string `json:"mixdrop_token,omitempty"`
 	VidaraKey       string `json:"vidara_key,omitempty"`
 	StripchatPDKey  string `json:"stripchat_pdkey,omitempty"`
+	AffiliateWM     string `json:"affiliate_wm,omitempty"`
 }
 
-// SaveSettings persists the shared upload credentials to the global
-// "dvr_settings" key, and each node's IP-bound cookies + user-agent under its
-// per-node key (dvr_settings:<node_id>).
+// SaveSettings persists the shared upload credentials and the effective
+// AFFILIATE_WM to the global "dvr_settings" key, and each node's IP-bound
+// cookies + user-agent under its per-node key (dvr_settings:<node_id>).
+//
+// Called at every startup after LoadSettings, so whichever value was effective
+// (env/GitHub secret, or the already-stored central one) is written back — the
+// global key is the single source of truth that all nodes converge on.
 func SaveSettings() error {
 	ConfigMu.RLock()
 	cookies := persistedSettings{
@@ -50,6 +55,7 @@ func SaveSettings() error {
 		MixdropToken:    validPersistedValue(Config.MixdropToken),
 		VidaraKey:       validPersistedValue(Config.VidaraKey),
 		StripchatPDKey:  validPersistedValue(Config.StripchatPDKey),
+		AffiliateWM:     validPersistedValue(Config.AffiliateWM),
 	}
 	ConfigMu.RUnlock()
 
@@ -103,6 +109,14 @@ func LoadSettings() error {
 		if v := validPersistedValue(s.StripchatPDKey); v != "" {
 			Config.StripchatPDKey = v
 		}
+		// Central value wins over .env/GitHub-secret AFFILIATE_WM, exactly like
+		// the upload credentials above: SaveSettings persists whatever value
+		// was effective at startup, so a node can seed Supabase once and every
+		// other node adopts it (an empty stored value is skipped, so it never
+		// wipes a locally-set one).
+		if v := validPersistedValue(s.AffiliateWM); v != "" {
+			Config.AffiliateWM = v
+		}
 		ConfigMu.Unlock()
 	}
 
@@ -131,6 +145,7 @@ func LoadSettings() error {
 		s.MixdropToken = ""
 		s.VidaraKey = ""
 		s.StripchatPDKey = ""
+		s.AffiliateWM = ""
 	}
 
 	ConfigMu.Lock()
