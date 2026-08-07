@@ -131,6 +131,18 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 			return fmt.Errorf("unexpected status %d", resp.StatusCode)
 		}
 
+		// A 200 with an HTML body means cb.xxx answered with a Cloudflare
+		// challenge/block page instead of the expected JSON. This happens when
+		// the configured cookie/session is stale or rejected. Treat it as a
+		// block so the caller can fall back to the cookie-less GET path instead
+		// of silently classifying every live channel as offline.
+		trimmed := strings.TrimSpace(bodyStr)
+		if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
+			ReportChaturbateFailure()
+			fmt.Printf("[DEBUG] POST API 200 non-JSON body for %s (len=%d), first 120: %q\n", username, len(bodyStr), trimmed[:min(len(trimmed), 120)])
+			return retry.Unrecoverable(ErrCloudflareBlocked)
+		}
+
 		ReportChaturbateSuccess()
 		return nil
 	},

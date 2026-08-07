@@ -26,6 +26,17 @@ func init() {
 	if instanceID == "" {
 		instanceID = "default"
 	}
+	syncNodeEnvironment()
+}
+
+// syncNodeEnvironment recomputes the cached node identity and pool mode from
+// the CURRENT process environment. init() runs before .env is loaded (main.go
+// calls loadDotEnv after package init), so NODE_ID / GITHUB_REPOSITORY values
+// that live only in .env would otherwise be missed and the cached NodeID()
+// would silently diverge from detectNodeID() (used everywhere else). Call this
+// once after loadDotEnv to keep NodeID(), the cookie settings key, and the
+// coordinator's detectNodeID() consistent.
+func syncNodeEnvironment() {
 	nodeID = detectNodeID()
 	channelPoolMode = detectPoolMode()
 }
@@ -74,6 +85,10 @@ func detectNodeID() string {
 // NodeID returns the current node's unique identifier.
 func NodeID() string { return nodeID }
 
+// SyncNodeEnvironment re-derives the cached node id / pool mode after .env has
+// been loaded. See syncNodeEnvironment.
+func SyncNodeEnvironment() { syncNodeEnvironment() }
+
 // ChannelPoolMode returns the current channel pool mode ("isolated" or "pooled").
 func ChannelPoolMode() string { return channelPoolMode }
 
@@ -82,6 +97,19 @@ func IsPooledMode() bool { return channelPoolMode == "pooled" }
 
 func channelsKey() string {
 	return "channels_" + instanceID
+}
+
+// CookieSettingsKey returns the app_settings key that stores THIS node's
+// cookies and user-agent. Cookies (especially cf_clearance) are IP + TLS-bound,
+// so a single shared "dvr_settings" blob mints on one node's IP then 403s on
+// every other node. Each node reads/writes only its own "dvr_settings:<node_id>".
+// Non-cookie upload credentials stay in the shared global key.
+func CookieSettingsKey() string {
+	id := detectNodeID()
+	if id == "" || id == "-" {
+		id = "unknown"
+	}
+	return "dvr_settings:" + id
 }
 
 // ─── Supabase client ──────────────────────────────────────────────────────────
@@ -287,8 +315,10 @@ func saveJSONSetting(key string, data []byte) error {
 
 	// Try PATCH first. Ask for the representation so we can tell whether any
 	// row was actually matched (empty array ⟹ no row yet).
+	// The key (e.g. "dvr_settings:node-99") must be URL-escaped so reserved
+	// characters (":","&","=",...) never corrupt the query filter.
 	patchResp, err := supabaseRequestWithPrefer(
-		"PATCH", "/app_settings?key=eq."+key,
+		"PATCH", "/app_settings?key=eq."+url.QueryEscape(key),
 		updateBody, "return=representation",
 	)
 	if err != nil {
@@ -336,7 +366,7 @@ func loadJSONSettingFast(key string) []byte {
 
 func loadJSONSettingWithClient(key string, client *http.Client) []byte {
 	resp, err := supabaseRequestWithClient("GET",
-		"/app_settings?key=eq."+key+"&select=value", nil, "", client)
+		"/app_settings?key=eq."+url.QueryEscape(key)+"&select=value", nil, "", client)
 	if err != nil {
 		return nil
 	}
@@ -521,6 +551,20 @@ func LoadSettingsFromDB() []byte {
 	// Use the fast (10s) client so the web server starts quickly even when
 	// Supabase is unreachable or slow.
 	return loadJSONSettingFast("dvr_settings")
+}
+
+// SaveSettingsToDBForKey writes the supplied JSON settings blob into the
+// given app_settings key (PATCH + INSERT fallback).
+func SaveSettingsToDBForKey(key string, data []byte) error {
+	if err := saveJSONSetting(key, data); err != nil {
+		return fmt.Errorf("save settings to Supabase (%s): %w", key, err)
+	}
+	return nil
+}
+
+// LoadSettingsFromDBKey reads a settings blob from the given app_settings key.
+func LoadSettingsFromDBKey(key string) []byte {
+	return loadJSONSettingWithClient(key, fastHTTPClient)
 }
 
 // ─── Recordings ───────────────────────────────────────────────────────────────
@@ -908,7 +952,13 @@ func SaveTunnelToDB(tunnelURL string, runID int) error {
 	return nil
 }
 
-// LoadCurrentTunnel loads the active tunnel URL from Supabase
+// LoadCurrentTunnel loads the active tunnel URL from Supabase, falling back
+// to the node's own web_url when no active tunnels row exists.  The tunnel URL
+// is mirrored onto nodes.web_url at save time, so either source should be
+// sufficient — but the cloudflared quick-tunnel URL rotates each run and the
+// tunnels insert can race/lose a row, leaving nodes.web_url as the fresher
+// source of truth. Returning the node's web_url instead of an error keeps the
+// admin panel's tunnel link live even when the tunnels table is empty.
 func LoadCurrentTunnel() (string, error) {
 	client := GetDBClient()
 	if client == nil {
@@ -916,11 +966,18 @@ func LoadCurrentTunnel() (string, error) {
 	}
 
 	tunnel, err := client.GetActiveTunnel(instanceID)
-	if err != nil {
-		return "", err
+	if err == nil && tunnel != nil && tunnel.URL != "" {
+		return tunnel.URL, nil
 	}
 
-	return tunnel.URL, nil
+	// Fall back to this node's web_url, which SaveTunnelToDB keeps in sync.
+	if id := NodeID(); id != "" {
+		if node, nerr := client.GetNode(id); nerr == nil && node != nil && node.WebURL != "" {
+			return node.WebURL, nil
+		}
+	}
+
+	return "", err
 }
 
 // ─── Preview Links ────────────────────────────────────────────────────────────

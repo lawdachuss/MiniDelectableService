@@ -30,15 +30,19 @@ type persistedSettings struct {
 	StripchatPDKey  string `json:"stripchat_pdkey,omitempty"`
 }
 
-// SaveSettings writes the runtime cookies and user-agent to Supabase.
+// SaveSettings persists the shared upload credentials to the global
+// "dvr_settings" key, and each node's IP-bound cookies + user-agent under its
+// per-node key (dvr_settings:<node_id>).
 func SaveSettings() error {
 	ConfigMu.RLock()
-	s := persistedSettings{
-		Cookies:         Config.Cookies,
-		SessionID:       Config.SessionID,
-		Csrftoken:       Config.Csrftoken,
-		CfClearance:     Config.CfClearance,
-		UserAgent:       Config.UserAgent,
+	cookies := persistedSettings{
+		Cookies:     Config.Cookies,
+		SessionID:   Config.SessionID,
+		Csrftoken:   Config.Csrftoken,
+		CfClearance: Config.CfClearance,
+		UserAgent:   Config.UserAgent,
+	}
+	creds := persistedSettings{
 		VoeSXAPIKey:     validPersistedValue(Config.VoeSXAPIKey),
 		StreamtapeLogin: validPersistedValue(Config.StreamtapeLogin),
 		StreamtapeKey:   validPersistedValue(Config.StreamtapeKey),
@@ -49,27 +53,84 @@ func SaveSettings() error {
 	}
 	ConfigMu.RUnlock()
 
+	if err := persistSettings(CookieSettingsKey(), &cookies); err != nil {
+		return fmt.Errorf("save per-node cookies (%s): %w", CookieSettingsKey(), err)
+	}
+	return persistSettings("dvr_settings", &creds)
+}
+
+// persistSettings marshals a settings snapshot and writes it under the given
+// app_settings key.
+func persistSettings(key string, s *persistedSettings) error {
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)
 	}
-
-	if err := SaveSettingsToDB(b); err != nil {
-		return fmt.Errorf("save settings to Supabase: %w", err)
-	}
-	return nil
+	return SaveSettingsToDBForKey(key, b)
 }
 
-// LoadSettings reads persisted cookies and user-agent from Supabase.
+// LoadSettings reads each node's persisted cookies from its per-node key
+// (dvr_settings:<node_id>) and the shared upload credentials from the global
+// "dvr_settings" key. For backwards compatibility, if the per-node key has no
+// cookie blob yet, it falls back to the legacy cookie fields stored in the
+// global key (so a node that already ran never finds itself with no cookies).
 func LoadSettings() error {
-	b := LoadSettingsFromDB()
-	if b == nil {
+	// 1) Credentials are always read from the global key.
+	if b := LoadSettingsFromDB(); b != nil {
+		var s persistedSettings
+		if err := json.Unmarshal(b, &s); err != nil {
+			return fmt.Errorf("unmarshal global settings: %w", err)
+		}
+		ConfigMu.Lock()
+		if v := validPersistedValue(s.VoeSXAPIKey); v != "" {
+			Config.VoeSXAPIKey = v
+		}
+		if v := validPersistedValue(s.StreamtapeLogin); v != "" {
+			Config.StreamtapeLogin = v
+		}
+		if v := validPersistedValue(s.StreamtapeKey); v != "" {
+			Config.StreamtapeKey = v
+		}
+		if v := validPersistedValue(s.MixdropEmail); v != "" {
+			Config.MixdropEmail = v
+		}
+		if v := validPersistedValue(s.MixdropToken); v != "" {
+			Config.MixdropToken = v
+		}
+		if v := validPersistedValue(s.VidaraKey); v != "" {
+			Config.VidaraKey = v
+		}
+		if v := validPersistedValue(s.StripchatPDKey); v != "" {
+			Config.StripchatPDKey = v
+		}
+		ConfigMu.Unlock()
+	}
+
+	// 2) node-scoped cookies: per-node key first, legacy global cookie fallback.
+	blob := LoadSettingsFromDBKey(CookieSettingsKey())
+	legacyFallback := false
+	if blob == nil {
+		blob = LoadSettingsFromDB() // legacy: cookies once lived in dvr_settings
+		legacyFallback = true
+	}
+	if blob == nil {
 		return nil
 	}
 
 	var s persistedSettings
-	if err := json.Unmarshal(b, &s); err != nil {
-		return fmt.Errorf("unmarshal settings: %w", err)
+	if err := json.Unmarshal(blob, &s); err != nil {
+		return fmt.Errorf("unmarshal cookie settings: %w", err)
+	}
+	if legacyFallback {
+		// Only take the cookie fields from a legacy global blob, never the
+		// credentials (already read above).
+		s.VoeSXAPIKey = ""
+		s.StreamtapeLogin = ""
+		s.StreamtapeKey = ""
+		s.MixdropEmail = ""
+		s.MixdropToken = ""
+		s.VidaraKey = ""
+		s.StripchatPDKey = ""
 	}
 
 	ConfigMu.Lock()
@@ -87,27 +148,6 @@ func LoadSettings() error {
 	}
 	if s.UserAgent != "" {
 		Config.UserAgent = s.UserAgent
-	}
-	if v := validPersistedValue(s.VoeSXAPIKey); v != "" {
-		Config.VoeSXAPIKey = v
-	}
-	if v := validPersistedValue(s.StreamtapeLogin); v != "" {
-		Config.StreamtapeLogin = v
-	}
-	if v := validPersistedValue(s.StreamtapeKey); v != "" {
-		Config.StreamtapeKey = v
-	}
-	if v := validPersistedValue(s.MixdropEmail); v != "" {
-		Config.MixdropEmail = v
-	}
-	if v := validPersistedValue(s.MixdropToken); v != "" {
-		Config.MixdropToken = v
-	}
-	if v := validPersistedValue(s.VidaraKey); v != "" {
-		Config.VidaraKey = v
-	}
-	if v := validPersistedValue(s.StripchatPDKey); v != "" {
-		Config.StripchatPDKey = v
 	}
 
 	// Parse Config.Cookies back into individual fields if they are empty.

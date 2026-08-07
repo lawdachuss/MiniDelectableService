@@ -13,8 +13,28 @@ Requires .env with SUPABASE_URL, SUPABASE_API_KEY.
 
 import json
 import os
+import socket
 import sys
+import urllib.parse
 from pathlib import Path
+
+
+def per_node_settings_key():
+    """Per-node app_settings key (dvr_settings:<node_id>). cf_clearance is
+    IP + TLS-bound, so each node keeps its own cookie set rather than sharing
+    one blob that only works on the IP that minted it."""
+    node_id = os.environ.get("NODE_ID", "").strip()
+    if not node_id or node_id == "-":
+        try:
+            node_id = os.environ.get("GITHUB_REPOSITORY", "").rsplit("-", 1)[-1]
+        except Exception:
+            node_id = ""
+    if not node_id or node_id in ("-", "unknown"):
+        try:
+            node_id = socket.gethostname()
+        except Exception:
+            node_id = "unknown"
+    return f"dvr_settings:{node_id}"
 
 
 def load_dotenv(path=".env"):
@@ -151,12 +171,11 @@ def try_refresh_with_curl_cffi(user_agent):
 
 
 def save_to_supabase(rest, api_key, value, is_seed=False):
-    patch_url = f"{rest}/app_settings?key=eq.dvr_settings"
-    # FIX: MERGE on top of the existing blob instead of replacing it. A bare
-    # PATCH wipes github_run_id (set by cookie_grabber.py so the DVR startup
-    # grabber can take the fast-path skip) plus any non-cookie settings
-    # (voesx_api_key, streamtape_*, mixdrop_*, ...) stored in the same row.
-    get_url = f"{rest}/app_settings?key=eq.dvr_settings&select=value"
+    settings_key = os.environ.get("COOKIE_SETTINGS_KEY", "") or per_node_settings_key()
+    patch_url = f"{rest}/app_settings?key=eq.{urllib.parse.quote(settings_key)}"
+    # FIX: MERGE on top of the existing blob instead of replacing it, so any
+    # non-cookie settings in the same per-node row are preserved.
+    get_url = f"{rest}/app_settings?key=eq.{urllib.parse.quote(settings_key)}&select=value"
     existing = supabase_request("GET", get_url, api_key)
     merged_value = dict(value)
     if existing and len(existing) > 0:
@@ -176,7 +195,7 @@ def save_to_supabase(rest, api_key, value, is_seed=False):
             "POST",
             f"{rest}/app_settings",
             api_key,
-            {"key": "dvr_settings", "value": value},
+            {"key": settings_key, "value": value},
         )
         if result is not None:
             print(f"  [OK] Cookies {label}d into Supabase")
@@ -204,10 +223,12 @@ def main():
         return
 
     rest = f"{supabase_url}/rest/v1"
-    get_url = f"{rest}/app_settings?key=eq.dvr_settings&select=value"
+    settings_key = os.environ.get("COOKIE_SETTINGS_KEY", "") or per_node_settings_key()
+    get_url = f"{rest}/app_settings?key=eq.{urllib.parse.quote(settings_key)}&select=value"
 
-    # --- Load current cookies from Supabase ---
+    # --- Load current cookies for THIS node from Supabase ---
     print("\n[1/3] Loading current cookies from Supabase...")
+    print(f"  Per-node settings key: {settings_key}")
     settings = supabase_request("GET", get_url, supabase_key)
 
     cookie_str = ""

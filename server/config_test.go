@@ -1,0 +1,189 @@
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"sync"
+	"testing"
+
+	"github.com/teacat/chaturbate-dvr/entity"
+)
+
+// fakeSupabase is an in-memory app_settings store that mimics the Supabase
+// REST endpoints saveJSONSetting / loadJSONSetting rely on (GET/POST/PATCH).
+type fakeSupabase struct {
+	mu sync.Mutex
+	m  map[string]json.RawMessage
+}
+
+func newFakeSupabase() *fakeSupabase { return &fakeSupabase{m: map[string]json.RawMessage{}} }
+
+// keyFromQuery extracts the key from "?key=eq.<key>..." (RawQuery form).
+func (f *fakeSupabase) keyFromQuery(rawQuery string) string {
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return ""
+	}
+	k := q.Get("key")
+	if len(k) > 3 && k[:3] == "eq." {
+		return k[3:]
+	}
+	return k
+}
+
+func (f *fakeSupabase) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		switch r.Method {
+		case http.MethodGet:
+			k := f.keyFromQuery(r.URL.RawQuery)
+			if v, ok := f.m[k]; ok {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[{"key":` + mustJSON(k) + `,"value":` + string(v) + `}]`))
+				return
+			}
+			w.Write([]byte(`[]`))
+		case http.MethodPost:
+			var body struct {
+				Key   string          `json:"key"`
+				Value json.RawMessage `json:"value"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.m[body.Key] = body.Value
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[{"key":` + mustJSON(body.Key) + `,"value":` + string(body.Value) + `}]`))
+		case http.MethodPatch:
+			var body struct {
+				Value json.RawMessage `json:"value"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			k := f.keyFromQuery(r.URL.RawQuery)
+			f.m[k] = body.Value
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[{"key":` + mustJSON(k) + `,"value":` + string(body.Value) + `}]`))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	return mux
+}
+
+func mustJSON(s string) string { b, _ := json.Marshal(s); return string(b) }
+
+// TestPerNodeCookieSaveLoadRoundTrip verifies the end-to-end split: cookies go
+// to the per-node key (dvr_settings:<node_id>), upload creds stay global, and
+// LoadSettings restores both from the right keys.
+func TestPerNodeCookieSaveLoadRoundTrip(t *testing.T) {
+	ts := httptest.NewServer(newFakeSupabase().handler())
+	defer ts.Close()
+
+	oldID := os.Getenv("NODE_ID")
+	os.Setenv("NODE_ID", "node-99")
+	defer os.Setenv("NODE_ID", oldID)
+
+	oldConfig := Config
+	Config = &entity.Config{
+		SupabaseURL:     ts.URL,
+		SupabaseAPIKey:  "test-key",
+		Cookies:         "cf_clearance=NODE_COOKIE; csrftoken=tok",
+		CfClearance:     "NODE_COOKIE",
+		Csrftoken:       "tok",
+		UserAgent:       "UA",
+		VoeSXAPIKey:     "voe-key",
+		StreamtapeKey:   "st-key",
+		StreamtapeLogin: "st-login",
+	}
+	defer func() { Config = oldConfig }()
+
+	if err := SaveSettings(); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	// Per-node key must hold cookies, never upload creds.
+	nodeKey := CookieSettingsKey()
+	if nodeKey != "dvr_settings:node-99" {
+		t.Fatalf("CookieSettingsKey = %q, want dvr_settings:node-99", nodeKey)
+	}
+	perNode := LoadSettingsFromDBKey(nodeKey)
+	if perNode == nil {
+		t.Fatalf("per-node key %q not written", nodeKey)
+	}
+	var node persistedSettings
+	if err := json.Unmarshal(perNode, &node); err != nil {
+		t.Fatalf("unmarshal per-node blob: %v", err)
+	}
+	if node.Cookies != "cf_clearance=NODE_COOKIE; csrftoken=tok" {
+		t.Errorf("per-node cookies = %q", node.Cookies)
+	}
+	if node.CfClearance != "NODE_COOKIE" {
+		t.Errorf("per-node cf_clearance = %q", node.CfClearance)
+	}
+	if node.UserAgent != "UA" {
+		t.Errorf("per-node user_agent = %q", node.UserAgent)
+	}
+	if node.VoeSXAPIKey != "" || node.StreamtapeKey != "" {
+		t.Errorf("per-node blob leaked upload creds: %+v", node)
+	}
+
+	// Global key must hold creds, never cookies.
+	global := LoadSettingsFromDB()
+	if global == nil {
+		t.Fatalf("global dvr_settings not written")
+	}
+	var g persistedSettings
+	if err := json.Unmarshal(global, &g); err != nil {
+		t.Fatalf("unmarshal global blob: %v", err)
+	}
+	if g.VoeSXAPIKey != "voe-key" || g.StreamtapeKey != "st-key" {
+		t.Errorf("global creds = voe:%q st:%q", g.VoeSXAPIKey, g.StreamtapeKey)
+	}
+	if g.Cookies != "" || g.CfClearance != "" {
+		t.Errorf("global key leaked cookies: %+v", g)
+	}
+
+	// Reset cookies in memory, then LoadSettings from DB and confirm restore.
+	Config.Cookies = ""
+	Config.CfClearance = ""
+	Config.Csrftoken = ""
+	Config.VoeSXAPIKey = ""
+	Config.StreamtapeKey = ""
+	if err := LoadSettings(); err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	if Config.Cookies != "cf_clearance=NODE_COOKIE; csrftoken=tok" {
+		t.Errorf("after load cookies = %q", Config.Cookies)
+	}
+	if Config.VoeSXAPIKey != "voe-key" {
+		t.Errorf("after load voesx = %q", Config.VoeSXAPIKey)
+	}
+	if Config.StreamtapeKey != "st-key" {
+		t.Errorf("after load streamtape = %q", Config.StreamtapeKey)
+	}
+}
+
+// TestSyncNodeEnvironmentAfterDotenv proves NodeID()/CookieSettingsKey() pick
+// up NODE_ID even though package init() runs before .env is loaded.
+func TestSyncNodeEnvironmentAfterEnv(t *testing.T) {
+	oldID := os.Getenv("NODE_ID")
+	oldRepo := os.Getenv("GITHUB_REPOSITORY")
+
+	os.Setenv("NODE_ID", "")
+	os.Setenv("GITHUB_REPOSITORY", "lawdachuss/node-12")
+	syncNodeEnvironment()
+	if got := NodeID(); got != "12" {
+		t.Errorf("NodeID after .env-sync = %q, want 12", got)
+	}
+	if got := CookieSettingsKey(); got != "dvr_settings:12" {
+		t.Errorf("CookieSettingsKey = %q, want dvr_settings:12", got)
+	}
+
+	os.Setenv("NODE_ID", oldID)
+	os.Setenv("GITHUB_REPOSITORY", oldRepo)
+	syncNodeEnvironment()
+}

@@ -39,9 +39,11 @@ Usage: python scripts/cookie_grabber.py
 import io
 import json
 import os
+import socket
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -137,18 +139,39 @@ if (originalQuery) {
 """
 
 
-def save_to_supabase(rest, api_key, value):
-    """PATCH the dvr_settings row (INSERT fallback) with the new settings blob.
+def per_node_settings_key():
+    """Per-node app_settings key. cf_clearance is IP + TLS-bound, so each node
+    must keep its own cookie set — a cookie minted on one node's IP 403s on the
+    others (the old shared "dvr_settings" blob was the fleet-wide block)."""
+    node_id = os.environ.get("NODE_ID", "").strip()
+    if not node_id or node_id == "-":
+        try:
+            node_id = os.environ.get("GITHUB_REPOSITORY", "").rsplit("-", 1)[-1]
+        except Exception:
+            node_id = ""
+    if not node_id or node_id in ("-", "unknown"):
+        try:
+            node_id = socket.gethostname()
+        except Exception:
+            node_id = "unknown"
+    return f"dvr_settings:{node_id}"
 
-    Merges cookie fields on top of the existing value so other settings
-    (voesx_api_key, streamtape_*, mixdrop_*, etc.) stored in the same row
-    are preserved.  Only the keys in `value` are updated.
+
+def save_to_supabase(rest, api_key, value):
+    """PATCH the per-node dvr_settings:<node_id> row (INSERT fallback) with the
+    new settings blob.
+
+    Merges cookie fields on top of the existing value so any node-specific
+    settings in the same row are preserved.  Only the keys in `value` are
+    updated.
     """
     import sys
-    patch_url = f"{rest}/app_settings?key=eq.dvr_settings"
 
-    # --- Load existing value first so we don't wipe non-cookie settings ---
-    get_url = f"{rest}/app_settings?key=eq.dvr_settings&select=value"
+    settings_key = os.environ.get("COOKIE_SETTINGS_KEY", "") or per_node_settings_key()
+    patch_url = f"{rest}/app_settings?key=eq.{urllib.parse.quote(settings_key)}"
+
+    # --- Load existing value first so we don't wipe other settings ---
+    get_url = f"{rest}/app_settings?key=eq.{urllib.parse.quote(settings_key)}&select=value"
     existing = supabase_request("GET", get_url, api_key)
     merged_value = {}
     if existing and len(existing) > 0:
@@ -159,7 +182,7 @@ def save_to_supabase(rest, api_key, value):
         else:
             print("  [WARN] Existing value is not a dict — will overwrite")
     else:
-        print("  [INFO] No existing dvr_settings row found — will INSERT")
+        print(f"  [INFO] No existing {settings_key} row found — will INSERT")
     sys.stdout.flush()
 
     # Merge: cookie fields from `value` overwrite existing, other keys preserved
@@ -170,11 +193,9 @@ def save_to_supabase(rest, api_key, value):
         print("  [OK] Cookies saved to Supabase (merged)")
         sys.stdout.flush()
         return True
-    # PATCH returns [] when row exists but Prefer:return=representation has no rows
-    # (shouldn't happen, but guard anyway).  Also handles missing-row case.
     print("  Row may not exist or PATCH returned empty, trying INSERT...")
     result = supabase_request(
-        "POST", f"{rest}/app_settings", api_key, {"key": "dvr_settings", "value": merged_value}
+        "POST", f"{rest}/app_settings", api_key, {"key": settings_key, "value": merged_value}
     )
     if result is not None:
         print("  [OK] Cookies inserted into Supabase")
@@ -578,9 +599,10 @@ def main():
         return 1
 
     rest = f"{supabase_url}/rest/v1"
-    get_url = f"{rest}/app_settings?key=eq.dvr_settings&select=value"
+    settings_key = os.environ.get("COOKIE_SETTINGS_KEY", "") or per_node_settings_key()
+    get_url = f"{rest}/app_settings?key=eq.{urllib.parse.quote(settings_key)}&select=value"
 
-    # --- Load existing cookies from Supabase ---
+    # --- Load existing cookies for THIS node from Supabase ---
     print("\n[1/4] Loading current cookies from Supabase...")
     settings = supabase_request("GET", get_url, api_key)
     old_str = ""
@@ -592,28 +614,14 @@ def main():
     old = parse_cookies(old_str)
     print(f"  Existing cookies: {len(old)}")
 
-    # Fast path: skip browser solve ONLY if this specific runner already minted a
-    # fresh cf_clearance during this same workflow run.  cf_clearance is IP-bound —
-    # a token from a previous run (different runner IP) will cause 403.
+    # cf_clearance is IP-bound — a token minted for a different IP/run 403s.
+    # Policy is ALWAYS-EXTRACT-FRESH: every node start re-mints a browser
+    # cf_clearance for this node's own IP and stores it under its per-node key.
     import sys
     sys.stdout.flush()
-    current_run_id = os.environ.get("GITHUB_RUN_ID", "")
-    stored_run_id = stored_val.get("github_run_id", "") if isinstance(stored_val, dict) else ""
     cf_val = old.get("cf_clearance", "")
-    print(f"  github_run_id: current={current_run_id!r}  stored={stored_run_id!r}")
-    print(f"  cf_clearance: {'len ' + str(len(cf_val)) if cf_val else '[NO]'}")
-    sys.stdout.flush()
-
-    if cf_val and len(cf_val) > 20 and current_run_id and current_run_id == stored_run_id:
-        print(f"  [OK] cf_clearance from THIS run (run_id={current_run_id}) — skipping browser solve")
-        print(f"  sessionid: {'[OK]' if 'sessionid' in old else '[NO]'}")
-        print(f"  csrftoken: {'[OK]' if 'csrftoken' in old else '[NO]'}")
-        sys.stdout.flush()
-        return 0
-    if cf_val and len(cf_val) > 20 and stored_run_id != current_run_id:
-        print(f"  [INFO] cf_clearance is from a DIFFERENT run (stored={stored_run_id!r}) — must mint fresh one for this runner's IP")
-    elif not cf_val or len(cf_val) <= 20:
-        print(f"  [INFO] No valid cf_clearance found — launching browser")
+    print(f"  Per-node settings key: {settings_key}")
+    print(f"  cf_clearance: {'len ' + str(len(cf_val)) if cf_val else '[NO]'} — extracting fresh")
     sys.stdout.flush()
 
     # CRITICAL: the DVR presents these cookies over httpcloak's
@@ -643,10 +651,6 @@ def main():
         for key in ("sessionid", "csrftoken", "cf_clearance", "__cf_bm"):
             if key in merged and merged[key]:
                 settings_value[key] = merged[key]
-        # Tag with run_id so the fast-path can confirm this cf_clearance was
-        # minted during THIS workflow run (i.e. by THIS runner's IP).
-        if current_run_id:
-            settings_value["github_run_id"] = current_run_id
 
         ok = save_to_supabase(rest, api_key, settings_value)
         if ok:
@@ -740,10 +744,6 @@ def main():
             for key in ("sessionid", "csrftoken", "cf_clearance", "__cf_bm"):
                 if key in merged and merged[key]:
                     settings_value[key] = merged[key]
-            # Tag with run_id so the fast-path can confirm this cf_clearance was
-            # minted during THIS workflow run (i.e. by THIS runner's IP).
-            if current_run_id:
-                settings_value["github_run_id"] = current_run_id
 
             ok = save_to_supabase(rest, api_key, settings_value)
             if ok:

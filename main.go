@@ -139,10 +139,19 @@ func runCookieScript(py string, pyArgs []string, name string) {
 		return
 	}
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+	// Give the cookie scripts enough headroom: cookie_refresher.py runs a
+	// curl_cffi fetch (≤60s) and cookie_grabber.py runs the Scrapling browser
+	// solve under its own GRAB_TOTAL_TIMEOUT watchdog (default 480s). The Go
+	// context must exceed that watchdog, else Go kills the solve before the
+	// script's own budget — a fresh cf_clearance would never be minted.
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
 	defer cancel()
 	args := append(append([]string{}, pyArgs...), script)
 	cmd := exec.CommandContext(ctx, py, args...)
+	// Inject the per-node cookie settings key so the Python script stores under
+	// exactly the same app_settings key the Go side reads (dvr_settings:<node_id>).
+	// This keeps Go's detectNodeID() and Python's per_node_settings_key() in sync.
+	cmd.Env = append(os.Environ(), "COOKIE_SETTINGS_KEY="+server.CookieSettingsKey())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -154,6 +163,10 @@ func runCookieScript(py string, pyArgs []string, name string) {
 
 func main() {
 	loadDotEnv(".env")
+	// package init() ran before .env was loaded, so re-derive the cached node
+	// id / pool mode now that NODE_ID & GITHUB_REPOSITORY are present. Keeps
+	// NodeID(), the per-node cookie key, and the coordinator in sync.
+	server.SyncNodeEnvironment()
 	app := &cli.App{
 		Name:    "chaturbate-dvr",
 		Version: version,
@@ -733,7 +746,7 @@ func start(c *cli.Context) error {
 	channel.CleanupOrphanedFiles()
 	go server.StartDiskMonitor(diskMonitorStop)
 
-	if err := 	server.Manager.CreateChannel(&entity.ChannelConfig{
+	if err := server.Manager.CreateChannel(&entity.ChannelConfig{
 		Site:                    c.String("site"),
 		Username:                c.String("username"),
 		Framerate:               c.Int("framerate"),
