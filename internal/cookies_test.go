@@ -1,6 +1,9 @@
 package internal
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCSRFFromCookies(t *testing.T) {
 	t.Parallel()
@@ -61,4 +64,53 @@ func TestParseCookiesStripsInnerInvalidBytes(t *testing.T) {
 	if got["affkey"] != "abc" {
 		t.Fatalf("affkey = %q, want abc (embedded quotes stripped)", got["affkey"])
 	}
+}
+
+// TestFormatCookieHeaderHasNoInvalidBytes is the end-to-end regression guard
+// for the Cloudflare block: the final Cookie header built for requests must
+// never contain quotes, semicolons, backslashes or control bytes (RFC 6265
+// cookie-octet), because a malformed header makes Cloudflare challenge the
+// request and trips the global circuit breaker for every channel.
+func TestFormatCookieHeaderHasNoInvalidBytes(t *testing.T) {
+	t.Parallel()
+	// Simulate a browser-pasted cookie string with quoted values (the exact
+	// shape that previously produced `invalid byte '"' in Cookie.Value`).
+	hdr := FormatCookieHeader(`sessionid="abc"; affkey="quoted"; csrftoken="tok"`, "new-token")
+	// `; ` is the valid pair separator; validate each VALUE individually.
+	for _, pair := range stringsSplitTrim(hdr) {
+		idx := stringsIndexByte(pair, '=')
+		if idx < 0 {
+			t.Fatalf("malformed pair in header %q", pair)
+		}
+		val := pair[idx+1:]
+		for _, b := range []byte(val) {
+			if b < 0x21 || b == '"' || b == ',' || b == ';' || b == '\\' || b >= 0x7f {
+				t.Fatalf("cookie value contains invalid byte %q: %q", b, val)
+			}
+		}
+	}
+	if stringsCount(hdr, "\"") != 0 {
+		t.Fatalf("Cookie header still contains quotes: %q", hdr)
+	}
+	// The rebuilt header must still carry a single csrftoken.
+	if CSRFFromCookies(hdr) != "new-token" {
+		t.Fatalf("csrftoken in header = %q, want new-token", CSRFFromCookies(hdr))
+	}
+}
+
+func stringsSplitTrim(s string) []string {
+	parts := strings.Split(s, ";")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
+
+func stringsIndexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
 }

@@ -353,7 +353,8 @@ type mediaRefererKey struct{}
 // ParseCookies converts a cookie string into a map.
 // Values are sanitized (quotes, semicolons, backslashes and control bytes
 // removed) so a browser-pasted cookie string with quoted values can never
-// produce a malformed Cookie header that Cloudflare rejects.
+// produce a malformed Cookie header that Cloudflare rejects.  Pairs whose
+// value sanitizes to empty are dropped, matching entity.SanitizeCookieString.
 func ParseCookies(cookieStr string) map[string]string {
 	cookies := make(map[string]string)
 	pairs := strings.Split(cookieStr, ";")
@@ -365,8 +366,12 @@ func ParseCookies(cookieStr string) map[string]string {
 			// Trim spaces around key and value
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
+			// Sanitize and drop empty/all-invalid values
+			if value = entity.SanitizeCookieValue(value); value == "" {
+				continue
+			}
 			// Store cookie name and value in the map
-			cookies[key] = entity.SanitizeCookieValue(value)
+			cookies[key] = value
 		}
 	}
 	return cookies

@@ -157,13 +157,13 @@ func LoadSettings() error {
 		Config.Cookies = entity.SanitizeCookieString(s.Cookies)
 	}
 	if s.SessionID != "" {
-		Config.SessionID = s.SessionID
+		Config.SessionID = entity.SanitizeCookieValue(s.SessionID)
 	}
 	if s.Csrftoken != "" {
-		Config.Csrftoken = s.Csrftoken
+		Config.Csrftoken = entity.SanitizeCookieValue(s.Csrftoken)
 	}
 	if s.CfClearance != "" {
-		Config.CfClearance = s.CfClearance
+		Config.CfClearance = entity.SanitizeCookieValue(s.CfClearance)
 	}
 	if s.UserAgent != "" {
 		Config.UserAgent = s.UserAgent
