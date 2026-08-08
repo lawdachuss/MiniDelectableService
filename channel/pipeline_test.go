@@ -29,7 +29,7 @@ func TestUploadTrackerNormalizesPaths(t *testing.T) {
 	}
 }
 
-func TestPipelineCleanupDeletesWithAnyLink(t *testing.T) {
+func TestPipelineCleanupDeletesWithLinksAndThumbnail(t *testing.T) {
 	oldConfig := server.Config
 	defer func() { server.Config = oldConfig }()
 	server.Config = &entity.Config{
@@ -51,13 +51,46 @@ func TestPipelineCleanupDeletesWithAnyLink(t *testing.T) {
 		FilePath: filePath,
 		Filename: filepath.Base(filePath),
 		Links:    map[string]string{"GoFile": "https://gofile.example/video"},
+		ThumbURL: "https://pixhost.example/thumb.jpg",
 	}
 
 	if err := p.stageCleanup(ch); err != nil {
 		t.Fatalf("stageCleanup: %v", err)
 	}
 	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
-		t.Fatalf("file should have been removed with at least 1 uploaded link: %v", err)
+		t.Fatalf("file should have been removed with at least 1 uploaded link and a thumbnail: %v", err)
+	}
+}
+
+func TestPipelineCleanupKeepsWhenNoThumbnails(t *testing.T) {
+	oldConfig := server.Config
+	defer func() { server.Config = oldConfig }()
+	server.Config = &entity.Config{
+		DeleteLocalAfterUpload: true,
+	}
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "nothumbs.mp4")
+	if err := os.WriteFile(filePath, []byte("video"), 0o666); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+
+	ch := &Channel{
+		Config:   &entity.ChannelConfig{Username: "tester"},
+		LogCh:    make(chan string, 20),
+		UpdateCh: make(chan bool, 1),
+	}
+	p := &Pipeline{
+		FilePath: filePath,
+		Filename: filepath.Base(filePath),
+		Links:    map[string]string{"GoFile": "https://gofile.example/video"},
+	}
+
+	if err := p.stageCleanup(ch); err != nil {
+		t.Fatalf("stageCleanup: %v", err)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("file should be kept when no thumbnails were generated: %v", err)
 	}
 }
 

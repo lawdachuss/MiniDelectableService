@@ -178,12 +178,18 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 		return nil
 	}
 	thumbURL, spriteURL, previewURL := ch.generateThumbnail(p.FilePath)
-	if thumbURL == "" && spriteURL == "" && previewURL == "" {
-		return nil
+	// Fill in only the pieces still missing so a partial failure (e.g. the
+	// preview generated but the thumbnail did not) never discards work that
+	// already succeeded.
+	if p.ThumbURL == "" {
+		p.ThumbURL = thumbURL
 	}
-	p.ThumbURL = thumbURL
-	p.SpriteURL = spriteURL
-	p.PreviewURL = previewURL
+	if p.SpriteURL == "" {
+		p.SpriteURL = spriteURL
+	}
+	if p.PreviewURL == "" {
+		p.PreviewURL = previewURL
+	}
 	return nil
 }
 
@@ -419,16 +425,28 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 
 // stageSaveMetadata persists recording metadata and all links to Supabase.
 func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
-	// Retry thumbnail generation if it failed during StageThumbnailUpload.
-	if p.ThumbURL == "" && p.SpriteURL == "" && p.PreviewURL == "" {
+	// Retry thumbnail generation if any piece is still missing after the
+	// StageThumbnailUpload pass.  Filling in only the missing pieces keeps
+	// whatever partial success already happened.
+	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
 		thumbURL, spriteURL, previewURL := ch.generateThumbnail(p.FilePath)
-		if thumbURL != "" || spriteURL != "" || previewURL != "" {
+		generated := false
+		if p.ThumbURL == "" && thumbURL != "" {
 			p.ThumbURL = thumbURL
+			generated = true
+		}
+		if p.SpriteURL == "" && spriteURL != "" {
 			p.SpriteURL = spriteURL
+			generated = true
+		}
+		if p.PreviewURL == "" && previewURL != "" {
 			p.PreviewURL = previewURL
-			ch.Info("upload: generated thumbnails for %s (retry)", p.Filename)
+			generated = true
+		}
+		if generated {
+			ch.Info("upload: generated missing thumbnails for %s (retry)", p.Filename)
 		} else {
-			ch.Warn("upload: thumbnail generation failed for %s (skipped)", p.Filename)
+			ch.Warn("upload: thumbnail generation failed for %s (skipped — local file kept for later retry)", p.Filename)
 		}
 	}
 
@@ -505,6 +523,16 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 
 	if len(p.Links) == 0 {
 		ch.Info("cleanup: keeping %s because no upload links exist", p.Filename)
+		return nil
+	}
+
+	// Keep the local file when no thumbnails were ever generated (the raw
+	// recording was unreadable enough that ffmpeg extraction failed).  The
+	// startup/periodic ScanThumbnails pass picks these files up and retries
+	// generation; deleting here would lose that chance forever, while the
+	// video itself is already safe in the cloud.
+	if p.ThumbURL == "" && p.SpriteURL == "" && p.PreviewURL == "" {
+		ch.Info("cleanup: keeping %s — thumbnails never generated (queued for thumbnail retry)", p.Filename)
 		return nil
 	}
 

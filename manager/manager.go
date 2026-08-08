@@ -482,8 +482,13 @@ func (m *Manager) RemoveChannelForReassignment(username string) error {
 // ScanThumbnails walks the videos directory and generates thumbnails for any
 // video file that is missing preview URLs in Supabase.
 func (m *Manager) ScanThumbnails() {
-	videoExts := map[string]bool{".mp4": true, ".mkv": true}
+	// .ts is included so legacy HLS recordings (finalize-mode=none) also get
+	// thumbnail backfill; with remux enabled the finalized files are .mp4.
+	videoExts := map[string]bool{".mp4": true, ".mkv": true, ".ts": true}
 	dirs := []string{"videos"}
+	if server.Config != nil && server.Config.OutputDir != "" {
+		dirs = append(dirs, server.Config.OutputDir)
+	}
 
 	for _, dir := range dirs {
 		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -496,6 +501,12 @@ func (m *Manager) ScanThumbnails() {
 			}
 			// Skip A/V track sidecars (but keep .video.muxed.mp4 which is the final muxed output)
 			if strings.HasSuffix(info.Name(), ".video.mp4") || strings.HasSuffix(info.Name(), ".audio.mp4") {
+				return nil
+			}
+			// Skip files a pipeline is currently processing — it generates its
+			// own thumbnails.  Racing it would collide on the shared sidecar
+			// filenames and could cause spurious thumbnail failures.
+			if channel.IsUploadInFlight(path) {
 				return nil
 			}
 			// Only process files that are missing any preview URLs in Supabase

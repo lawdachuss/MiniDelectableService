@@ -284,7 +284,10 @@ func main() {
 				Name:    "orphan-cleanup-interval",
 				Usage:   "Minutes between periodic orphan file cleanup and thumbnail scans (0 = disabled, run once at startup)",
 				EnvVars: []string{"ORPHAN_CLEANUP_INTERVAL"},
-				Value:   0,
+				// Default to 60 min so locally-kept files without thumbnails get
+				// a periodic ScanThumbnails retry on every deployment (CI runners
+				// have no .env to set this). Set 0 to disable.
+				Value: 60,
 			},
 			&cli.IntFlag{
 				Name:    "disk-warning-percent",
@@ -424,9 +427,13 @@ func main() {
 				Value:   "",
 			},
 			&cli.StringFlag{
-				Name:  "finalize-mode",
-				Usage: "Post-process closed recordings: none (fast seek index), remux, or transcode",
-				Value: "none",
+				Name:    "finalize-mode",
+				Usage:   "Post-process closed recordings: none (fast seek index), remux, or transcode",
+				EnvVars: []string{"FINALIZE_MODE"},
+				// Default to remux so every deployment (including CI runners
+				// without a .env) produces browser-playable MP4s. Explicitly
+				// set FINALIZE_MODE=none to keep the old raw-file behavior.
+				Value: "remux",
 			},
 			&cli.StringFlag{
 				Name:  "ffmpeg-encoder",

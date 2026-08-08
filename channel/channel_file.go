@@ -469,39 +469,77 @@ func (ch *Channel) runFFmpegFinalizer(filename string) (string, error) {
 	tempOutput := strings.TrimSuffix(filename, filepath.Ext(filename)) + ".finalizing" + outExt
 	_ = os.Remove(tempOutput)
 
-	args := []string{"-nostdin", "-y", "-i", filename}
-	switch server.Config.FinalizeMode {
-	case "remux":
-		args = append(args, "-c", "copy")
+	// buildArgs assembles the ffmpeg arguments for the current FinalizeMode.
+	// tolerant enables the corrupt-tail recovery flags (-err_detect ignore_err
+	// and -fflags +genpts+igndts) so ffmpeg skips damaged/truncated packets
+	// instead of aborting.  This rescues recordings whose final HLS fragment
+	// was cut short when the stream or session ended.
+	buildArgs := func(tolerant bool) []string {
+		args := []string{"-nostdin", "-y"}
+		if tolerant {
+			args = append(args, "-err_detect", "ignore_err", "-fflags", "+genpts+igndts")
+		}
+		args = append(args, "-i", filename)
+		switch server.Config.FinalizeMode {
+		case "remux":
+			args = append(args, "-c", "copy")
+		case "transcode":
+			encoder := strings.TrimSpace(server.Config.FFmpegEncoder)
+			if encoder == "" {
+				encoder = "libx264"
+			}
+			args = append(args, "-c:v", encoder)
+			args = append(args, qualityArgsForEncoder(encoder, server.Config.FFmpegQuality)...)
+			if preset := strings.TrimSpace(server.Config.FFmpegPreset); preset != "" {
+				args = append(args, "-preset", preset)
+			}
+			args = append(args, "-c:a", "copy")
+		default:
+			return nil // unsupported mode — handled before any command runs
+		}
 		if outExt == ".mp4" {
 			args = append(args, "-movflags", "+faststart")
 		}
-	case "transcode":
-		encoder := strings.TrimSpace(server.Config.FFmpegEncoder)
-		if encoder == "" {
-			encoder = "libx264"
-		}
-		args = append(args, "-c:v", encoder)
-		args = append(args, qualityArgsForEncoder(encoder, server.Config.FFmpegQuality)...)
-		if preset := strings.TrimSpace(server.Config.FFmpegPreset); preset != "" {
-			args = append(args, "-preset", preset)
-		}
-		args = append(args, "-c:a", "copy")
-		if outExt == ".mp4" {
-			args = append(args, "-movflags", "+faststart")
-		}
-	default:
+		args = append(args, tempOutput)
+		return args
+	}
+
+	if buildArgs(false) == nil {
 		return "", fmt.Errorf("unsupported finalization mode %q", server.Config.FinalizeMode)
 	}
-	args = append(args, tempOutput)
+
+	// run executes one finalization pass with its own full 30-minute budget,
+	// so the rescue pass never inherits a nearly-expired context.
+	run := func(tolerant bool) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		return config.FFmpegCommandContext(ctx, buildArgs(tolerant)...).CombinedOutput()
+	}
 
 	ch.Info("running ffmpeg %s for `%s`", server.Config.FinalizeMode, filepath.Base(filename))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
 	config.AcquireFFmpegHeavy()
 	defer config.ReleaseFFmpegHeavy()
 
-	outputBytes, err := config.FFmpegCommandContext(ctx, args...).CombinedOutput()
+	// Attempt 1: strict finalization.  A truncated tail (the last fragment
+	// cut short when the stream/session ends) makes ffmpeg abort here even
+	// though the file is 99% fine.
+	outputBytes, err := run(false)
+
+	// Attempt 2: rescue pass with tolerant flags.  A slightly shortened
+	// recording beats a completely unplayable one; if even this fails, the
+	// original raw file is kept (caller handles the error).
+	rescueUsed := false
+	if err != nil {
+		_ = os.Remove(tempOutput)
+		outStr := strings.TrimSpace(string(outputBytes))
+		if len(outStr) > 500 {
+			outStr = outStr[len(outStr)-500:]
+		}
+		ch.Warn("finalize %s: %s — retrying with corrupt-tail recovery", filepath.Base(filename), outStr)
+		outputBytes, err = run(true)
+		rescueUsed = err == nil
+	}
+
 	if err != nil {
 		_ = os.Remove(tempOutput)
 		msg := strings.TrimSpace(string(outputBytes))
@@ -509,6 +547,28 @@ func (ch *Channel) runFFmpegFinalizer(filename string) (string, error) {
 			msg = err.Error()
 		}
 		return "", fmt.Errorf("%s", msg)
+	}
+
+	// Validate the output before it replaces (and deletes) the original:
+	// ffmpeg can exit 0 while writing garbage when the source was too
+	// damaged.  An unreadable output always keeps the original; a rescue
+	// pass is only accepted when it still probes to at least half the
+	// source duration, so a broken recording can never be destroyed.
+	outDur, probeErr := VideoDurationSeconds(tempOutput)
+	if probeErr != nil {
+		_ = os.Remove(tempOutput)
+		return "", fmt.Errorf("finalize output unreadable: %v", probeErr)
+	}
+	if rescueUsed {
+		inDur, inErr := VideoDurationSeconds(filename)
+		if inErr == nil && inDur > 0 && outDur < inDur*0.5 {
+			_ = os.Remove(tempOutput)
+			ch.Warn("finalize %s: rescue output too short (%.1fs vs source %.1fs) — keeping original recording",
+				filepath.Base(filename), outDur, inDur)
+			return "", fmt.Errorf("rescue output too short (%.1fs < 50%% of source %.1fs)", outDur, inDur)
+		}
+		ch.Warn("finalize %s: rescue pass recovered %.1fs of %.1fs source",
+			filepath.Base(filename), outDur, inDur)
 	}
 	if finalPath == filename {
 		if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
@@ -1334,9 +1394,13 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 		recoveryLogf(filename, "saved recording metadata")
 	}
 
-	// Delete local file only once ALL hosts have the file safely and metadata
-	// is persisted. Otherwise the file remains available for retry.
-	if cfg.DeleteLocalAfterUpload && len(uploader.GetSuccessfulUploads(allResults)) > 0 && dbSaved {
+	// Delete local file only once ALL hosts have the file safely, metadata
+	// is persisted, and at least one thumbnail was generated.  Keeping the
+	// file when thumbnails failed lets a later ScanThumbnails pass retry
+	// generation and fill in the missing URLs — the video itself is already
+	// safe on the hosts.
+	if cfg.DeleteLocalAfterUpload && len(uploader.GetSuccessfulUploads(allResults)) > 0 && dbSaved &&
+		(thumbURL != "" || spriteURL != "" || previewURL != "") {
 		DeleteSidecarFiles(filePath)
 		if err := removeFileWithRetry(filePath); err != nil {
 			recoveryLogf(filename, "could not remove local file: %v — will retry on next restart", err)
