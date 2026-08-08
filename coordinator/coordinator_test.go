@@ -602,12 +602,16 @@ func TestRunOfflineShuffleCycleSkipsPending(t *testing.T) {
 	}
 }
 
+func timePtr(t time.Time) *time.Time {
+	return &t
+}
+
 // TestRunDeadlineMigrationCycle verifies ALL channels of an imminent-deadline
 // node (including live+recording) are reassigned to the least-loaded healthy
 // node, spreading across candidates.
 func TestRunDeadlineMigrationCycle(t *testing.T) {
 	mock := &mockClient{
-		imminentNodes: []database.Node{{NodeID: "node-x"}},
+		imminentNodes: []database.Node{{NodeID: "node-x", SessionDeadline: timePtr(time.Now().Add(5 * time.Minute))}},
 		aliveNodes: []database.Node{
 			{NodeID: "node-x", CurrentLoad: 5},
 			{NodeID: "node-y", CurrentLoad: 2},
@@ -640,6 +644,65 @@ func TestRunDeadlineMigrationCycle(t *testing.T) {
 		if call.toNode != "node-z" {
 			t.Fatalf("expected all moves to node-z, got %+v", call)
 		}
+	}
+}
+
+// TestRunDeadlineMigrationCycleSkipsPastDeadline guards against the root cause
+// of the fleet-wide churn: a node whose session_deadline has already passed but
+// which is still alive and heartbeating must NOT be drained — the old behavior
+// migrated its channels every 60s while its claim loop re-claimed them,
+// pinning channels to no node and overloading the migration targets.
+func TestRunDeadlineMigrationCycleSkipsPastDeadline(t *testing.T) {
+	mock := &mockClient{
+		imminentNodes: []database.Node{
+			{NodeID: "node-x", SessionDeadline: timePtr(time.Now().Add(-2 * time.Hour))},
+			{NodeID: "node-y", SessionDeadline: timePtr(time.Now().Add(-15 * time.Minute))},
+			{NodeID: "node-nil-deadline"},
+		},
+		aliveNodes: []database.Node{
+			{NodeID: "node-x", CurrentLoad: 10},
+			{NodeID: "node-y", CurrentLoad: 10},
+			{NodeID: "node-nil-deadline", CurrentLoad: 10},
+			{NodeID: "node-target", CurrentLoad: 0},
+		},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			"node-x":              {{Username: "ch1", Site: "chaturbate", Status: "claimed", IsLive: false}},
+			"node-y":              {{Username: "ch2", Site: "chaturbate", Status: "claimed", IsLive: false}},
+			"node-nil-deadline":   {{Username: "ch3", Site: "chaturbate", Status: "claimed", IsLive: false}},
+		},
+	}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: &mockChannelManager{}}
+
+	c.runDeadlineMigrationCycleWith(mock)
+
+	if len(mock.reassignCalls) != 0 {
+		t.Fatalf("expected 0 reassigns for past/nil deadlines, got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
+	}
+}
+
+// TestOwnDeadlineImminent verifies the claim-cycle self-drain guard: imminent
+// only inside the pre-deadline migration window; zero, far-future, and already-
+// passed deadlines never pause claiming (a node that outlives its deadline
+// resumes claiming since migration skips past deadlines).
+func TestOwnDeadlineImminent(t *testing.T) {
+	c := &Coordinator{}
+	if c.ownDeadlineImminent() {
+		t.Fatal("zero deadline must not be imminent")
+	}
+
+	c.ownDeadline = time.Now().Add(2 * time.Hour)
+	if c.ownDeadlineImminent() {
+		t.Fatal("far-future deadline must not be imminent")
+	}
+
+	c.ownDeadline = time.Now().Add(10 * time.Minute)
+	if !c.ownDeadlineImminent() {
+		t.Fatal("deadline within migration window must be imminent")
+	}
+
+	c.ownDeadline = time.Now().Add(-1 * time.Hour)
+	if c.ownDeadlineImminent() {
+		t.Fatal("already-passed deadline must not be imminent (node resumes claiming)")
 	}
 }
 

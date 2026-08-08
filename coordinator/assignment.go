@@ -93,6 +93,18 @@ func (c *Coordinator) runClaimCycle() {
 	if draining {
 		return
 	}
+	// Self-drain during the pre-deadline window: the deadline-migration cycle
+	// is reassigning this node's channels away before it is killed, so stop
+	// claiming new ones. Otherwise we would re-absorb the channels that were
+	// just migrated away — an infinite claim→migrate→reclaim ping-pong that
+	// pinned channels to no node while overloading the migration targets
+	// (seen fleet-wide when stale session_deadlines kept 9 of 18 nodes drained
+	// for hours). Claiming resumes once the deadline passes or the node is
+	// restarted with a fresh deadline.
+	if c.ownDeadlineImminent() {
+		log.Printf("[coordinator] claim cycle: own session deadline imminent — pausing new claims until it passes")
+		return
+	}
 	// Don't claim while fenced (DB unreachable / partitioned) — claiming would
 	// fight the healthy nodes that took over our released channels.
 	if c.isFenced() {

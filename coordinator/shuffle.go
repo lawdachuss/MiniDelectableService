@@ -336,6 +336,16 @@ func (c *Coordinator) runDeadlineMigrationCycleWith(db dbShuffler) {
 	}
 
 	for _, imm := range imminent {
+		// Never drain a node whose deadline has already passed: it is still
+		// alive and heartbeating (its session restart simply hasn't fired), so
+		// its claim loop would immediately re-claim whatever we move — the
+		// infinite claim→migrate→reclaim churn. Past deadlines are the
+		// reaper's job: if the node truly dies, its channels are reclaimed
+		// after the heartbeat timeout. (GetNodesWithImminentDeadline already
+		// excludes past deadlines via gt.now(); this is defense in depth.)
+		if imm.SessionDeadline == nil || !imm.SessionDeadline.After(time.Now()) {
+			continue
+		}
 		if imm.NodeID == c.NodeID {
 			log.Printf("[coordinator] deadline migration: this node's deadline is imminent — migrating channels away")
 		}

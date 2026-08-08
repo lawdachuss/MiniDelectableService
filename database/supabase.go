@@ -1026,12 +1026,20 @@ func (c *Client) GetDeadNodes(timeout time.Duration) ([]string, error) {
 }
 
 // GetNodesWithImminentDeadline returns online nodes whose session_deadline is
-// within `window` from now. Used to migrate a node's channels away BEFORE the
-// node is killed (e.g. GitHub's 6-hour runner limit).
+// within `window` from now (strictly in the FUTURE). Used to migrate a node's
+// channels away BEFORE the node is killed (e.g. GitHub's 6-hour runner limit).
+//
+// session_deadline=gt.now() is critical: a deadline that has already PASSED
+// must not count as "imminent", otherwise the 60s migration cycle keeps
+// draining a node that is still alive and heartbeating (its session restart
+// simply hasn't fired) while its claim loop re-claims the channels — an
+// infinite claim→migrate→reclaim churn that pins channels to no node and
+// overloads the migration targets. Past deadlines are the reaper's job: if the
+// node truly dies, its channels are reclaimed after the heartbeat timeout.
 func (c *Client) GetNodesWithImminentDeadline(window time.Duration) ([]Node, error) {
 	cutoff := time.Now().Add(window).UTC().Format(time.RFC3339)
 	var nodes []Node
-	err := c.get(fmt.Sprintf("/nodes?session_deadline=not.is.null&session_deadline=lt.%s&status=eq.online&order=node_id.asc",
+	err := c.get(fmt.Sprintf("/nodes?session_deadline=not.is.null&session_deadline=gt.now()&session_deadline=lt.%s&status=eq.online&order=node_id.asc",
 		url.QueryEscape(cutoff)), &nodes)
 	if err != nil {
 		return nil, err

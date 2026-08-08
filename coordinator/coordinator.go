@@ -229,6 +229,13 @@ type Coordinator struct {
 	Manager   ChannelManager
 	LiveCheck LivenessChecker
 
+	// ownDeadline is this node's session_deadline, captured at Register() (the
+	// same value persisted to the nodes table). The claim cycle reads it to
+	// self-drain during the pre-deadline migration window so it doesn't
+	// re-claim channels the deadline-migration cycle is moving away. Zero means
+	// the node has no deadline (permanent node) and never self-drains.
+	ownDeadline time.Time
+
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 	started  bool
@@ -356,6 +363,17 @@ func (c *Coordinator) Register() {
 		}
 	}
 
+	// Capture the deadline once at registration — the claim cycle's self-drain
+	// reads it to pause new claims while migration is moving our channels away.
+	deadline := computeSessionDeadline()
+	c.mu.Lock()
+	if deadline != nil {
+		c.ownDeadline = *deadline
+	} else {
+		c.ownDeadline = time.Time{}
+	}
+	c.mu.Unlock()
+
 	node := &database.Node{
 		NodeID:          c.NodeID,
 		Hostname:        host,
@@ -364,7 +382,7 @@ func (c *Coordinator) Register() {
 		Status:          "online",
 		CurrentLoad:     0,
 		WebURL:          webURL,
-		SessionDeadline: computeSessionDeadline(),
+		SessionDeadline: deadline,
 	}
 
 	if err := c.Client.UpsertNode(node); err != nil {
@@ -372,6 +390,26 @@ func (c *Coordinator) Register() {
 	} else {
 		log.Printf("[coordinator] registered as node %q on %s", c.NodeID, host)
 	}
+}
+
+// ownDeadlineImminent reports whether this node's own session_deadline is
+// imminent: within the deadline-migration window but not yet passed. While
+// imminent, the deadline-migration cycle is reassigning this node's channels
+// to other nodes, so the claim cycle pauses to avoid re-claiming them
+// (claim→migrate→reclaim ping-pong). Once the deadline has PASSED the node is
+// no longer imminent: migration skips past deadlines (see
+// GetNodesWithImminentDeadline), so a node that outlives its deadline — e.g. a
+// session restart that never fired — resumes claiming and keeps recording
+// instead of being drained forever.
+func (c *Coordinator) ownDeadlineImminent() bool {
+	c.mu.Lock()
+	d := c.ownDeadline
+	c.mu.Unlock()
+	if d.IsZero() {
+		return false
+	}
+	remaining := time.Until(d)
+	return remaining > 0 && remaining <= deadlineMigrationWindow
 }
 
 // StartDraining sets the node status to "draining" so other nodes know not to
