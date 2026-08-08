@@ -61,12 +61,12 @@ func TestCreateChannelFromAssignmentResumesPausedChannel(t *testing.T) {
 	server.Manager = m
 	server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/", CFChannelThreshold: 5}
 
-	// A paused channel object already in the local map (e.g. left over from a
-	// session boundary that paused everything before the re-claim).
+	// A paused channel object already in the local map, paused automatically
+	// by a session boundary (e.g. left over before the re-claim).
 	conf := &entity.ChannelConfig{Username: "paused_user", Site: "chaturbate"}
 	conf.Sanitize()
 	ch := channel.New(conf)
-	ch.Config.IsPaused.Store(true)
+	ch.PauseWithReason(entity.PauseReasonBoundary)
 	m.Channels.Store(conf.Username, ch)
 
 	ca := &database.ChannelAssignment{
@@ -113,5 +113,81 @@ func TestCreateChannelFromAssignmentResumesPausedChannel(t *testing.T) {
 	}
 	if !foundRecovery {
 		t.Fatalf("expected a browser-visible stuck-pause recovery log line, got: %v", chAfter.ExportInfo().Logs)
+	}
+}
+
+// TestCreateChannelFromAssignmentLeavesManualPause verifies the claim/reconcile
+// path NEVER overrides a user's explicit UI pause: a channel paused with a
+// MANUAL reason stays paused even when it is re-claimed from an assignment.
+func TestCreateChannelFromAssignmentLeavesManualPause(t *testing.T) {
+	oldMgr, oldCfg := server.Manager, server.Config
+	defer func() { server.Manager, server.Config = oldMgr, oldCfg }()
+
+	m, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	server.Manager = m
+	server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/", CFChannelThreshold: 5}
+
+	conf := &entity.ChannelConfig{Username: "manual_user", Site: "chaturbate"}
+	conf.Sanitize()
+	ch := channel.New(conf)
+	ch.PauseWithReason(entity.PauseReasonManual)
+	m.Channels.Store(conf.Username, ch)
+
+	ca := &database.ChannelAssignment{
+		Username:   "manual_user",
+		Site:       "chaturbate",
+		Status:     "claimed",
+		Framerate:  60,
+		Resolution: 1080,
+	}
+
+	if err := m.CreateChannelFromAssignment(ca); err != nil {
+		t.Fatalf("CreateChannelFromAssignment: %v", err)
+	}
+
+	got, _ := m.Channels.Load("manual_user")
+	if !got.(*channel.Channel).Config.IsPaused.Load() {
+		t.Fatal("CreateChannelFromAssignment must NOT resume a manually paused channel")
+	}
+	if got.(*channel.Channel).PauseReason() != entity.PauseReasonManual {
+		t.Fatalf("manual pause reason lost after re-claim: got %q", got.(*channel.Channel).PauseReason())
+	}
+}
+
+// TestResumeAllChannelsSkipsManualPause verifies the session restart resumes
+// automatic (boundary) pauses but leaves channels the user explicitly paused.
+func TestResumeAllChannelsSkipsManualPause(t *testing.T) {
+	oldMgr, oldCfg := server.Manager, server.Config
+	defer func() { server.Manager, server.Config = oldMgr, oldCfg }()
+
+	m, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	server.Manager = m
+	server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/", CFChannelThreshold: 5}
+
+	mk := func(name string, reason entity.PauseReason) {
+		conf := &entity.ChannelConfig{Username: name, Site: "chaturbate"}
+		conf.Sanitize()
+		ch := channel.New(conf)
+		ch.PauseWithReason(reason)
+		m.Channels.Store(name, ch)
+	}
+	mk("manual_user", entity.PauseReasonManual)
+	mk("boundary_user", entity.PauseReasonBoundary)
+
+	m.ResumeAllChannels()
+
+	manual, _ := m.Channels.Load("manual_user")
+	if !manual.(*channel.Channel).Config.IsPaused.Load() {
+		t.Fatal("ResumeAllChannels must leave a manually paused channel paused")
+	}
+	boundary, _ := m.Channels.Load("boundary_user")
+	if boundary.(*channel.Channel).Config.IsPaused.Load() {
+		t.Fatal("ResumeAllChannels must resume an automatic (boundary) pause")
 	}
 }

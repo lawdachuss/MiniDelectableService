@@ -52,6 +52,14 @@ type Channel struct {
 
 	stateMu sync.Mutex // protects IsOnline, IsConnecting, RoomStatus, metadata fields
 
+	// pauseReasonMu guards pauseReason — why the channel is paused (manual,
+	// session-boundary, or handoff). A manual (user) pause is sticky: automatic
+	// re-pauses never overwrite it, so automatic resume paths (session
+	// boundary restart, claim/reconcile) can tell a user pause apart and leave
+	// it alone instead of fighting it.
+	pauseReasonMu sync.Mutex
+	pauseReason   string
+
 	RoomTitle        string   // captured from API, persisted even when offline
 	Tags             []string // captured from API at recording start
 	Viewers          int      // captured from API at recording start
@@ -345,6 +353,7 @@ func (ch *Channel) exportInfo(includeLogs bool) *entity.ChannelInfo {
 		IsOnline:             isOnline,
 		IsConnecting:         isConnecting,
 		IsPaused:             ch.Config.IsPaused.Load(),
+		PauseReason:          string(ch.PauseReason()),
 		IsCompressing:        atomic.LoadInt32(&ch.CompressingCount) > 0,
 		AutoResumedFromPause: ch.autoResumedFromPause.Load(),
 		RoomStatus:           roomStatus,
@@ -380,8 +389,48 @@ func (ch *Channel) MarkAutoResumedFromPause() {
 	ch.autoResumedFromPause.Store(true)
 }
 
-// Pause pauses the channel and cancels the context.
+// PauseReason returns why the channel is paused (empty when not paused, or
+// when the reason is unknown/legacy — e.g. a channel paused before pause
+// reasons were tracked, which automatic resume treats as recoverable).
+func (ch *Channel) PauseReason() entity.PauseReason {
+	ch.pauseReasonMu.Lock()
+	defer ch.pauseReasonMu.Unlock()
+	return entity.PauseReason(ch.pauseReason)
+}
+
+// setPauseReason records why the channel is being paused. A manual (user)
+// pause is sticky: automatic re-pauses (session boundary, handoff) never
+// overwrite it, so the user's intent survives session cycles and automatic
+// resume paths can detect it.
+func (ch *Channel) setPauseReason(reason entity.PauseReason) {
+	ch.pauseReasonMu.Lock()
+	defer ch.pauseReasonMu.Unlock()
+	if ch.pauseReason == string(entity.PauseReasonManual) && reason != entity.PauseReasonManual {
+		return // user pause is sticky — never downgrade it to an automatic pause
+	}
+	ch.pauseReason = string(reason)
+}
+
+// clearPauseReason resets the recorded pause reason once the channel is no
+// longer paused.
+func (ch *Channel) clearPauseReason() {
+	ch.pauseReasonMu.Lock()
+	ch.pauseReason = ""
+	ch.pauseReasonMu.Unlock()
+}
+
+// Pause pauses the channel and cancels the context, recording the pause as a
+// manual (user-initiated) pause.
 func (ch *Channel) Pause() {
+	ch.PauseWithReason(entity.PauseReasonManual)
+}
+
+// PauseWithReason pauses the channel and records WHY it was paused. Automatic
+// callers (session boundary, handoff) pass their reason so resume paths can
+// auto-recover automatic pauses while leaving manual user pauses alone.
+func (ch *Channel) PauseWithReason(reason entity.PauseReason) {
+	ch.setPauseReason(reason)
+
 	// Stop the monitoring loop. `context.Canceled` → `ch.Monitor()` →
 	// `onRetry` → `ch.UpdateOnlineStatus(false)`.
 	ch.monitorMu.Lock()
@@ -393,7 +442,7 @@ func (ch *Channel) Pause() {
 	ch.CancelFunc()
 	ch.cancelMu.Unlock()
 	ch.Update()
-	ch.Info("channel paused")
+	ch.Info("channel paused (%s)", reason)
 
 	// Finalize any in-progress files immediately so they can be uploaded
 	// and removed when `DeleteLocalAfterUpload` is enabled.
@@ -417,11 +466,13 @@ func (ch *Channel) Cancel() {
 	ch.cancelMu.Unlock()
 }
 
-// Stop stops the channel and cancels the context.
+// Stop stops the channel and cancels the context. The pause reason is recorded
+// as "handoff" (the channel is being torn down for reassignment or deletion).
 func (ch *Channel) Stop() {
 	ch.monitorMu.Lock()
 	ch.monitorRestartRequested = false
 	ch.Config.IsPaused.Store(true)
+	ch.setPauseReason(entity.PauseReasonHandoff)
 	ch.monitorMu.Unlock()
 
 	ch.cancelMu.Lock()
@@ -455,6 +506,7 @@ func (ch *Channel) Resume(_ int) {
 	ch.PauseCancelFunc()
 	ch.cancelMu.Unlock()
 	ch.Config.IsPaused.Store(false)
+	ch.clearPauseReason()
 
 	ch.Update()
 	ch.Info("channel resumed")
@@ -642,6 +694,7 @@ func (ch *Channel) finishMonitor() {
 // monitorMu must already be held by the caller.
 func (ch *Channel) startMonitorLocked() uint64 {
 	ch.Config.IsPaused.Store(false)
+	ch.clearPauseReason()
 	ch.monitorRunning = true
 	ch.monitorRestartRequested = false
 	ch.monitorDone = make(chan struct{})

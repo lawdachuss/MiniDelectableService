@@ -97,6 +97,7 @@ type poolAPIEntry struct {
 	Site         string `json:"site"`
 	AssignedNode string `json:"assigned_node"`
 	Paused       bool   `json:"paused"`
+	PauseReason  string `json:"pause_reason"`
 	Uploading    bool   `json:"uploading"`
 	Pending      bool   `json:"pending"`
 }
@@ -142,6 +143,9 @@ func (c *Coordinator) runStuckPauseCheckWith(ctx context.Context, nodes []databa
 			}
 			if e.Uploading || e.Pending {
 				continue // legitimately processing uploads, not stuck
+			}
+			if e.PauseReason == "manual" {
+				continue // user explicitly paused — intentional, never "stuck"
 			}
 			observed[n.NodeID+"/"+e.Site+"/"+e.Username] = true
 		}

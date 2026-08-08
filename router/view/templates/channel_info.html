@@ -82,7 +82,7 @@
         Reconnecting
       </span>
       {{ else if .IsPaused }}
-      <span class="inline-flex items-center gap-1 px-2 py-0.5 text-[9px] font-bold rounded-full uppercase badge-paused">
+      <span class="inline-flex items-center gap-1 px-2 py-0.5 text-[9px] font-bold rounded-full uppercase badge-paused"{{ if .PauseReason }} title="Paused — {{ .PauseReason }}"{{ end }}>
         <svg class="w-2.5 h-2.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
           <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
         </svg>

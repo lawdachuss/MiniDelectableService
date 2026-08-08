@@ -277,7 +277,7 @@ func TestPoolJSONIncludesPausedFlags(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	server.Config = &entity.Config{}
 	setStubManager(t, &stubManager{channels: []*entity.ChannelInfo{
-		{Username: "bob", Site: "stripchat", IsPaused: true},
+		{Username: "bob", Site: "stripchat", IsPaused: true, PauseReason: "manual"},
 		{Username: "alice", Site: "chaturbate", IsOnline: true, UploadStatus: "uploading (1/2 hosts)"},
 	}})
 
@@ -291,17 +291,21 @@ func TestPoolJSONIncludesPausedFlags(t *testing.T) {
 		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	for _, want := range []string{`"paused"`, `"uploading"`, `"pending"`} {
+	for _, want := range []string{`"paused"`, `"pause_reason"`, `"uploading"`, `"pending"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("pool JSON missing flag %s; body: %s", want, body)
 		}
 	}
-	// bob is paused and idle; alice is recording with an active upload.
+	// bob is paused and idle (manual reason); alice is recording with an
+	// active upload.
 	if !strings.Contains(body, `"paused":true`) {
 		t.Fatalf("expected paused:true for the paused channel; body: %s", body)
 	}
 	if !strings.Contains(body, `"paused":false`) {
 		t.Fatalf("expected paused:false for the recording channel; body: %s", body)
+	}
+	if !strings.Contains(body, `"pause_reason":"manual"`) {
+		t.Fatalf("expected pause_reason manual for the paused channel; body: %s", body)
 	}
 	if !strings.Contains(body, `"uploading":true`) {
 		t.Fatalf("expected uploading:true for the uploading channel; body: %s", body)

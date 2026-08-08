@@ -50,6 +50,8 @@ func TestStuckPauseCheckDetectsAndNotifies(t *testing.T) {
 			// this one belongs to node-b, so when node-a's pool is read it must
 			// NOT be attributed to node-a (it IS stuck on node-b).
 			`{"username":"other","site":"stripchat","assigned_node":"node-b","status":"claimed","paused":true,"uploading":false,"pending":false}`,
+			// Manually paused by the user → intentional, never flagged as stuck.
+			`{"username":"manual_pause","site":"chaturbate","assigned_node":"node-a","status":"claimed","paused":true,"uploading":false,"pending":false,"pause_reason":"manual"}`,
 			// Not paused at all → skipped.
 			`{"username":"active","site":"chaturbate","assigned_node":"node-a","status":"recording","paused":false,"uploading":false,"pending":false}`,
 		))
@@ -85,9 +87,9 @@ func TestStuckPauseCheckDetectsAndNotifies(t *testing.T) {
 	if got := c.stuckPauseSeen["node-b/stripchat/other"]; got != 1 {
 		t.Fatalf("other seen count = %d, want 1", got)
 	}
-	// busy/queued/active must never be tracked; stuck1 must only be attributed
-	// to node-a (its owner), never node-b.
-	for _, k := range []string{"node-a/chaturbate/busy", "node-a/chaturbate/queued", "node-a/chaturbate/active", "node-b/chaturbate/stuck1"} {
+	// busy/queued/active/manual_pause must never be tracked; stuck1 must only
+	// be attributed to node-a (its owner), never node-b.
+	for _, k := range []string{"node-a/chaturbate/busy", "node-a/chaturbate/queued", "node-a/chaturbate/active", "node-a/chaturbate/manual_pause", "node-b/chaturbate/stuck1"} {
 		if _, ok := c.stuckPauseSeen[k]; ok {
 			t.Fatalf("unexpected stuck-pause tracking for %q: %v", k, c.stuckPauseSeen)
 		}

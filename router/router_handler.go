@@ -1540,10 +1540,11 @@ type PoolEntry struct {
 	// the channel is actively processing uploads. The fleet stuck-pause
 	// monitor reads these flags from each node's /api/pool to detect
 	// paused-but-still-assigned channels (excluding legitimate pauses during
-	// the session processing phase).
-	Paused    bool `json:"paused"`
-	Uploading bool `json:"uploading"`
-	Pending   bool `json:"pending"`
+	// the session processing phase and manual user pauses).
+	Paused      bool   `json:"paused"`
+	PauseReason string `json:"pause_reason"` // why paused: manual / session-boundary / handoff (empty = unknown)
+	Uploading   bool   `json:"uploading"`
+	Pending     bool   `json:"pending"`
 }
 
 // PoolData represents the data structure for the pool editor page.
@@ -1610,6 +1611,7 @@ func poolEntryLocalState(e *PoolEntry, info map[string]*entity.ChannelInfo, pend
 		return false
 	}
 	e.Paused = ch.IsPaused
+	e.PauseReason = ch.PauseReason
 	e.Uploading = ch.UploadStatus != "" || ch.IsCompressing
 	e.Pending = pending[e.Username]
 	return true

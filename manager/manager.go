@@ -410,9 +410,14 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 	// already exists locally it may be PAUSED (left over from a session
 	// boundary, a UI pause, or an interrupted Stop during a handoff) — silently
 	// returning would leave it paused forever with nothing ever reactivating
-	// it. So resume a paused instance instead of skipping it.
+	// it. So resume a paused instance instead of skipping it — UNLESS the user
+	// explicitly paused it: a manual pause reason is never overridden here.
 	if existing, loaded := m.Channels.LoadOrStore(conf.Username, channel.New(conf)); loaded {
 		if ch, ok := existing.(*channel.Channel); ok && ch.Config.IsPaused.Load() {
+			if ch.PauseReason() == entity.PauseReasonManual {
+				ch.Info("channel manually paused — leaving paused (not overriding user pause)")
+				return nil
+			}
 			ch.PipelineQueue.ResumePending()
 			ch.MarkAutoResumedFromPause()
 			ch.Resume(0)
@@ -690,11 +695,18 @@ func (m *Manager) CancelAllChannels() {
 	})
 }
 
-// ResumeAllChannels resumes every channel in the map.  Skips any
-// channel whose ch.done is already closed (permanently stopped).
+// ResumeAllChannels resumes every channel in the map (skipping any whose
+// ch.done is already closed), EXCEPT channels the user explicitly paused — the
+// manual pause reason is sticky across session boundaries, so the automatic
+// session restart never overrides a user's pause.
 func (m *Manager) ResumeAllChannels() {
 	m.Channels.Range(func(key, value any) bool {
-		value.(*channel.Channel).Resume(0)
+		ch := value.(*channel.Channel)
+		if ch.PauseReason() == entity.PauseReasonManual {
+			ch.Info("channel manually paused — leaving paused at session boundary")
+			return true
+		}
+		ch.Resume(0)
 		return true
 	})
 }
@@ -793,8 +805,11 @@ func (m *Manager) StopWithProcessingQueue(workers int) {
 			ch.ProcessPending()
 
 			// Pause the channel so it moves to the "Paused" section in the UI
-			// and logs reflect the completed state.
-			ch.Pause()
+			// and logs reflect the completed state. Recorded as a session
+			// boundary pause so the session restart and claim/reconcile loops
+			// can auto-resume it — and so a channel the USER paused stays
+			// paused (its manual reason is sticky).
+			ch.PauseWithReason(entity.PauseReasonBoundary)
 			ch.Info("channel paused — ready for next session")
 		}(ch)
 	}
@@ -929,13 +944,16 @@ func (m *Manager) channelCount() int {
 	return count
 }
 
-// PauseChannel pauses the channel and persists the state.
+// PauseChannel pauses the channel and persists the state. The pause is
+// recorded as MANUAL — automatic resume paths (session boundary restart,
+// claim/reconcile) detect this reason and leave the channel paused, never
+// fighting the user's explicit pause.
 func (m *Manager) PauseChannel(username string) error {
 	thing, ok := m.Channels.Load(username)
 	if !ok {
 		return nil
 	}
-	thing.(*channel.Channel).Pause()
+	thing.(*channel.Channel).PauseWithReason(entity.PauseReasonManual)
 	m.debouncedSave()
 	return nil
 }

@@ -76,6 +76,17 @@ func (c *ChannelConfig) Sanitize() {
 	}
 }
 
+// PauseReason identifies why a channel is paused, so automatic resume paths
+// (session boundary, claim/reconcile) can auto-recover automatic pauses
+// without overriding the user's explicit UI pause.
+type PauseReason string
+
+const (
+	PauseReasonManual    PauseReason = "manual"           // user clicked Pause in the web UI
+	PauseReasonBoundary  PauseReason = "session-boundary" // session stop / processing phase
+	PauseReasonHandoff   PauseReason = "handoff"          // channel being moved to another node
+)
+
 // ChannelInfo represents the information about a channel,
 // mostly used for the template rendering.
 type ChannelInfo struct {
@@ -84,6 +95,10 @@ type ChannelInfo struct {
 	IsPaused       bool
 	IsCompressing  bool
 	RoomStatus     string // public, private, group, away, offline, hidden
+	// PauseReason explains WHY a paused channel is paused (empty when not
+	// paused or the reason is unknown/legacy). "manual" pauses are sticky and
+	// are never auto-resumed or flagged as stuck.
+	PauseReason string
 	// AutoResumedFromPause is true when the channel was automatically resumed
 	// from a stuck paused-but-still-assigned state (the claim cycle found it
 	// paused while the DB still assigned it to this node). The node web UI
