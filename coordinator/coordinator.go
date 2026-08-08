@@ -206,6 +206,12 @@ func detectTailscaleIP() string {
 	return ip
 }
 
+// ChannelPause identifies one locally paused channel.
+type ChannelPause struct {
+	Username string
+	Site     string
+}
+
 // ChannelManager is the interface the coordinator uses to create/release channels.
 // Implemented by manager.Manager in pooled mode.
 type ChannelManager interface {
@@ -213,6 +219,12 @@ type ChannelManager interface {
 	RemoveChannelForReassignment(username string) error
 	GetLocalChannels() []string
 	HasPendingSegments(username string) bool
+
+	// ManualPausedChannels returns the channels the USER explicitly paused
+	// (pause reason = manual). Automatic paths must never fight these: they
+	// are kept assigned to this node across session boundaries and never
+	// auto-resumed, released, or flagged as stuck.
+	ManualPausedChannels() []ChannelPause
 }
 
 // LivenessChecker is the interface for checking if a channel is currently live.

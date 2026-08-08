@@ -485,17 +485,45 @@ func (m *Manager) HasPendingSegments(username string) bool {
 	return false
 }
 
+// ManualPausedChannels implements coordinator.ChannelManager: returns the
+// channels the user explicitly paused (pause reason = manual), so the
+// coordinator can re-claim them for this node at session boundaries and keep
+// automatic paths (live-check release, watchdog, resume) from ever fighting
+// the user's pause.
+func (m *Manager) ManualPausedChannels() []coordinator.ChannelPause {
+	var out []coordinator.ChannelPause
+	m.Channels.Range(func(key, value any) bool {
+		ch := value.(*channel.Channel)
+		if ch.PauseReason() == entity.PauseReasonManual {
+			out = append(out, coordinator.ChannelPause{Username: ch.Config.Username, Site: ch.Config.Site})
+		}
+		return true
+	})
+	return out
+}
+
 // RemoveChannelForReassignment implements coordinator.ChannelManager.
 // Removes a channel from this node when it's been reassigned to another node.
+// A channel the user explicitly paused is NEVER discarded here — the
+// session-boundary rebalance releases every assignment and this would otherwise
+// destroy the paused object and let it be recreated recording (or claimed by
+// another node), overriding the user's pause. Manual-paused channels stay
+// parked+paused locally until the user resumes or removes them.
 func (m *Manager) RemoveChannelForReassignment(username string) error {
 	thing, ok := m.Channels.Load(username)
 	if !ok {
 		return nil
 	}
 
+	ch := thing.(*channel.Channel)
+	if ch.PauseReason() == entity.PauseReasonManual {
+		ch.Info("channel manually paused — keeping it (not removing for reassignment)")
+		return nil
+	}
+
 	m.Channels.Delete(username)
 	go func() {
-		thing.(*channel.Channel).Stop()
+		ch.Stop()
 	}()
 	return nil
 }

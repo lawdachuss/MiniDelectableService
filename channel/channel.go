@@ -442,7 +442,10 @@ func (ch *Channel) PauseWithReason(reason entity.PauseReason) {
 	ch.CancelFunc()
 	ch.cancelMu.Unlock()
 	ch.Update()
-	ch.Info("channel paused (%s)", reason)
+	// Log the EFFECTIVE reason — for a manually-paused channel re-paused by an
+	// automatic boundary, the sticky rule keeps "manual" and that is what the
+	// log should say.
+	ch.Info("channel paused (%s)", ch.PauseReason())
 
 	// Finalize any in-progress files immediately so they can be uploaded
 	// and removed when `DeleteLocalAfterUpload` is enabled.

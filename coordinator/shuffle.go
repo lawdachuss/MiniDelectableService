@@ -335,6 +335,19 @@ func (c *Coordinator) runDeadlineMigrationCycleWith(db dbShuffler) {
 		loadMap[n.NodeID] = n.CurrentLoad
 	}
 
+	// Channels the user explicitly paused on THIS node are exempt from its own
+	// deadline drain: handing a manual pause to another node would recreate it
+	// there as a fresh recording channel, overriding the user's pause. (Manual
+	// pauses on OTHER imminent nodes can't be detected here — the pause reason
+	// is runtime-only, not persisted — so those still migrate; the session-
+	// boundary re-claim is the cross-node protection.)
+	manualSet := map[string]bool{}
+	if c.Manager != nil {
+		for _, mc := range c.Manager.ManualPausedChannels() {
+			manualSet[mc.Site+"/"+mc.Username] = true
+		}
+	}
+
 	for _, imm := range imminent {
 		// Never drain a node whose deadline has already passed: it is still
 		// alive and heartbeating (its session restart simply hasn't fired), so
@@ -355,6 +368,12 @@ func (c *Coordinator) runDeadlineMigrationCycleWith(db dbShuffler) {
 			continue
 		}
 		for _, ca := range assignments {
+			// Only this node's own migration skips manual pauses (see comment
+			// above — the manual set is local knowledge).
+			if imm.NodeID == c.NodeID && manualSet[ca.Site+"/"+ca.Username] {
+				log.Printf("[coordinator] deadline migration: skipping manual-paused %s/%s (user pause preserved)", ca.Site, ca.Username)
+				continue
+			}
 			target := leastLoaded(candidates, loadMap)
 			if target.NodeID == imm.NodeID {
 				continue

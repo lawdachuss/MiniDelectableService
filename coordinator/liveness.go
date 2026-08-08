@@ -109,6 +109,17 @@ func (c *Coordinator) runLiveCheck() {
 	// per-channel IsLive check. Pairs are (username, site) because the
 	// channel_assignments primary key is composite — a username alone can exist
 	// on both sites and must not be toggled together.
+
+	// Channels the user explicitly paused must never be released back to the
+	// pool (another node could claim and record them, fighting the user's
+	// pause). Build a site/username set once.
+	manualSet := map[string]bool{}
+	if c.Manager != nil {
+		for _, mc := range c.Manager.ManualPausedChannels() {
+			manualSet[mc.Site+"/"+mc.Username] = true
+		}
+	}
+
 	var livePairs [][2]string
 	for _, ca := range assignments {
 		isLive := affiliateLive[ca.Username]
@@ -135,6 +146,9 @@ func (c *Coordinator) runLiveCheck() {
 			// channel be claimed by any node when it comes back online; keeping
 			// it assigned in "recording" state (skipped by
 			// ReleaseExcessOfflineChannels) would pin it to this node forever.
+			if manualSet[ca.Site+"/"+ca.Username] {
+				continue // user-paused channel — keep it parked on this node
+			}
 			if err := c.Client.ReleaseChannel(ca.Username, ca.Site); err != nil {
 				log.Printf("[coordinator] live check: release offline error for %s: %v", ca.Username, err)
 			} else {

@@ -80,11 +80,27 @@ func (c *Coordinator) ReleaseChannel(username, site string) {
 	}
 }
 
+// dbClaimCycle is the subset of *database.Client used by the claim cycle,
+// expressed as an interface so the cycle can be unit-tested with a mock.
+type dbClaimCycle interface {
+	RepairOrphanedAssignments() (int, error)
+	GetAssignmentStats() (*database.AssignmentStats, error)
+	GetNodeAssignments(nodeID string) ([]database.ChannelAssignment, error)
+	ClaimOfflineChannels(nodeID string, limit int) ([]database.ChannelAssignment, error)
+	ClaimLiveChannels(nodeID string, limit int) ([]database.ChannelAssignment, error)
+	ReleaseExcessOfflineChannels(nodeID string, limit int) ([]database.ChannelAssignment, error)
+	ClaimSpecificChannel(username, site, nodeID string) (bool, error)
+}
+
 // runClaimCycle executes one iteration of the fair-share claiming algorithm.
 // Claims channels if this node has less than its fair share, releases channels
 // if it has more than its fair share (only when multiple nodes are alive).
 // Skips entirely when draining (graceful shutdown in progress).
 func (c *Coordinator) runClaimCycle() {
+	c.runClaimCycleWith(c.Client)
+}
+
+func (c *Coordinator) runClaimCycleWith(db dbClaimCycle) {
 	// Don't claim new channels during draining — the node is shutting down
 	// and new channels would just need to be released immediately.
 	c.mu.Lock()
@@ -118,7 +134,7 @@ func (c *Coordinator) runClaimCycle() {
 	}
 	// Self-heal: repair rows stuck with assigned_node set but status=unassigned.
 	// These rows are invisible to both claim and release, causing a deadlock.
-	if repaired, err := c.Client.RepairOrphanedAssignments(); err != nil {
+	if repaired, err := db.RepairOrphanedAssignments(); err != nil {
 		log.Printf("[coordinator] claim cycle: repair orphaned error: %v", err)
 	} else if repaired > 0 {
 		log.Printf("[coordinator] repaired %d orphaned assignment(s) (assigned_node set but status=unassigned)", repaired)
@@ -127,7 +143,13 @@ func (c *Coordinator) runClaimCycle() {
 	// Reconcile database assignments with local manager channels.
 	// This ensures we stop any channel that got reassigned away (e.g. by reaper)
 	// and start any channel assigned to us that we missed or failed to start.
-	dbAssignments, err := c.Client.GetNodeAssignments(c.NodeID)
+	//
+	// Capture the user-paused channels up front — the excess-offline release
+	// below is a raw DB operation that can sweep a manual pause back into the
+	// pool; we re-claim those immediately so automatic load rebalancing never
+	// hands a user's pause to another node (which would record over it).
+	manualPaused := c.Manager.ManualPausedChannels()
+	dbAssignments, err := db.GetNodeAssignments(c.NodeID)
 	if err != nil {
 		log.Printf("[coordinator] claim cycle: get node assignments error: %v", err)
 		return
@@ -167,7 +189,7 @@ func (c *Coordinator) runClaimCycle() {
 		}
 	}
 
-	stats, err := c.Client.GetAssignmentStats()
+	stats, err := db.GetAssignmentStats()
 	if err != nil {
 		log.Printf("[coordinator] claim cycle: get stats error: %v", err)
 		return
@@ -210,10 +232,15 @@ func (c *Coordinator) runClaimCycle() {
 	myOfflineCount := myLoad - myLiveCount
 
 	// Release excess OFFLINE channels if we have more offline than allowed.
-	// Live+recording channels are NEVER released here.
+	// Live+recording channels are NEVER released here. The release itself is a
+	// raw DB sweep (ReleaseExcessOfflineChannels has no notion of local state),
+	// so a user-paused channel in "claimed" state could be swept back into the
+	// pool — re-claim those immediately (best-effort: another node's staggered
+	// claim could win the narrow window, in which case the release log below
+	// shows the channel leaving and the re-claim log shows the failure).
 	if myOfflineCount > maxOfflineAllowed && totalNodes > 1 {
 		excess := myOfflineCount - maxOfflineAllowed
-		released, err := c.Client.ReleaseExcessOfflineChannels(c.NodeID, excess)
+		released, err := db.ReleaseExcessOfflineChannels(c.NodeID, excess)
 		if err != nil {
 			log.Printf("[coordinator] claim cycle: release excess error: %v", err)
 			return
@@ -221,6 +248,9 @@ func (c *Coordinator) runClaimCycle() {
 		if len(released) > 0 {
 			log.Printf("[coordinator] released %d excess offline channel(s) (offline: %d -> %d, live: %d, fairShare: %d, totalPool: %d)",
 				len(released), myOfflineCount, myOfflineCount-len(released), myLiveCount, fairShare, totalPool)
+			// Re-claim any user-paused channels caught in the sweep before they
+			// can be claimed by another node and recorded over the user's pause.
+			c.reclaimManualPausedChannelsWith(db, manualPaused)
 			for _, ca := range released {
 				if c.Manager != nil {
 					c.Manager.RemoveChannelForReassignment(ca.Username)
@@ -237,7 +267,7 @@ func (c *Coordinator) runClaimCycle() {
 	// sweep the live channels that should be spread across nodes.
 	if myOfflineCount < maxOfflineAllowed {
 		budget := maxOfflineAllowed - myOfflineCount
-		claimed, err := c.Client.ClaimOfflineChannels(c.NodeID, budget)
+		claimed, err := db.ClaimOfflineChannels(c.NodeID, budget)
 		if err != nil {
 			log.Printf("[coordinator] claim cycle: claim offline error (is database/migrate-combined.sql applied?): %v", err)
 			return
@@ -264,7 +294,7 @@ func (c *Coordinator) runClaimCycle() {
 	// claims nothing new. Claiming live can push a node slightly over its total
 	// fair share; the excess-offline release above rebalances it next cycle.
 	if liveBudget := liveClaimBudget(myLiveCount, stats.TotalLiveChannels, totalNodes); liveBudget > 0 {
-		claimed, err := c.Client.ClaimLiveChannels(c.NodeID, liveBudget)
+		claimed, err := db.ClaimLiveChannels(c.NodeID, liveBudget)
 		if err != nil {
 			log.Printf("[coordinator] claim cycle: claim live error (is database/migrate-combined.sql applied?): %v", err)
 			return
@@ -296,18 +326,60 @@ func (c *Coordinator) runClaimCycle() {
 // evenly across all nodes. All nodes hit the session boundary at roughly the
 // same time (same SESSION_DURATION), so each releases its channels and then
 // each node claims a random fair share.
+//
+// Channels the user explicitly paused (pause reason = manual) are EXEMPT: they
+// are re-claimed for this node immediately after the release so the rebalance
+// never hands them to another node or lets an automatic resume fight the user's
+// pause. They stay paused + assigned until the user resumes or removes them.
 func (c *Coordinator) RebalanceAtSessionBoundary() {
 	if !c.IsPooled() || c.Client == nil {
 		return
 	}
 	log.Printf("[coordinator] session boundary — releasing %s assignments and rebalancing", c.NodeID)
 
+	// Capture the user-paused channels BEFORE the release wipes every row.
+	var manual []ChannelPause
+	if c.Manager != nil {
+		manual = c.Manager.ManualPausedChannels()
+	}
+
 	if err := c.Client.ReleaseNodeChannels(c.NodeID); err != nil {
 		log.Printf("[coordinator] rebalance: release error: %v", err)
 		return
 	}
+
+	// Re-claim the manual-paused channels for this node so they keep a DB
+	// assignment (and stay parked+paused locally) through the rebalance.
+	c.reclaimManualPausedChannelsWith(c.Client, manual)
+
 	log.Printf("[coordinator] rebalance: assignments released, running fresh claim cycle")
 	c.runClaimCycle()
+}
+
+// manualReclaimer is the subset of *database.Client used to re-claim
+// user-paused channels after the boundary release.
+type manualReclaimer interface {
+	ClaimSpecificChannel(username, site, nodeID string) (bool, error)
+}
+
+// reclaimManualPausedChannelsWith re-claims the user-paused channels for this
+// node after the boundary release, so they keep a DB assignment and stay
+// parked+paused locally. Returns the number successfully re-claimed.
+func (c *Coordinator) reclaimManualPausedChannelsWith(client manualReclaimer, manual []ChannelPause) int {
+	reclaimed := 0
+	for _, mc := range manual {
+		claimed, err := client.ClaimSpecificChannel(mc.Username, mc.Site, c.NodeID)
+		if err != nil {
+			log.Printf("[coordinator] rebalance: re-claim manual pause %s/%s: %v", mc.Site, mc.Username, err)
+			continue
+		}
+		if claimed {
+			reclaimed++
+		} else {
+			log.Printf("[coordinator] rebalance: manual-paused channel %s/%s was claimed by another node first", mc.Site, mc.Username)
+		}
+	}
+	return reclaimed
 }
 
 // CreateChannelAssignment creates a channel_assignments row for a new channel.

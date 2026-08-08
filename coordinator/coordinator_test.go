@@ -25,6 +25,8 @@ type mockClient struct {
 	imminentNodes     []database.Node
 	assignmentsByNode map[string][]database.ChannelAssignment
 	reassignCalls     []reassignCall
+	specificClaims    []reassignCall
+	releasedExcess    []database.ChannelAssignment
 }
 
 type reassignCall struct {
@@ -60,9 +62,27 @@ func (m *mockClient) RepairOrphanedAssignments() (int, error) {
 	return 0, nil
 }
 
+func (m *mockClient) ClaimSpecificChannel(username, site, nodeID string) (bool, error) {
+	m.specificClaims = append(m.specificClaims, reassignCall{username, site, "", nodeID})
+	return true, nil
+}
+
+func (m *mockClient) ClaimOfflineChannels(nodeID string, limit int) ([]database.ChannelAssignment, error) {
+	return nil, nil
+}
+
+func (m *mockClient) ClaimLiveChannels(nodeID string, limit int) ([]database.ChannelAssignment, error) {
+	return nil, nil
+}
+
+func (m *mockClient) ReleaseExcessOfflineChannels(nodeID string, limit int) ([]database.ChannelAssignment, error) {
+	return m.releasedExcess, nil
+}
+
 type mockChannelManager struct {
-	created []*database.ChannelAssignment
-	removed []string
+	created      []*database.ChannelAssignment
+	removed      []string
+	manualPaused []ChannelPause
 }
 
 func (m *mockChannelManager) CreateChannelFromAssignment(ca *database.ChannelAssignment) error {
@@ -71,6 +91,13 @@ func (m *mockChannelManager) CreateChannelFromAssignment(ca *database.ChannelAss
 }
 
 func (m *mockChannelManager) RemoveChannelForReassignment(username string) error {
+	// Mirror the guard in manager.Manager: a channel the user explicitly
+	// paused is never discarded here — it stays parked+paused locally.
+	for _, mc := range m.manualPaused {
+		if mc.Username == username {
+			return nil
+		}
+	}
 	m.removed = append(m.removed, username)
 	return nil
 }
@@ -85,6 +112,10 @@ func (m *mockChannelManager) GetLocalChannels() []string {
 
 func (m *mockChannelManager) HasPendingSegments(username string) bool {
 	return false
+}
+
+func (m *mockChannelManager) ManualPausedChannels() []ChannelPause {
+	return m.manualPaused
 }
 
 // ============================================================================
@@ -677,6 +708,121 @@ func TestRunDeadlineMigrationCycleSkipsPastDeadline(t *testing.T) {
 
 	if len(mock.reassignCalls) != 0 {
 		t.Fatalf("expected 0 reassigns for past/nil deadlines, got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
+	}
+}
+
+// TestRebalanceReclaimsManualPauses verifies the session-boundary rebalance
+// re-claims channels the user explicitly paused after every assignment is
+// released, so they keep a DB claim on this node and stay parked+paused
+// locally instead of being grabbed by another node and recording again.
+func TestRebalanceReclaimsManualPauses(t *testing.T) {
+	mock := &mockClient{}
+	mgr := &mockChannelManager{
+		manualPaused: []ChannelPause{
+			{Username: "manual_user", Site: "chaturbate"},
+			{Username: "manual_two", Site: "stripchat"},
+		},
+	}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
+
+	if got := c.reclaimManualPausedChannelsWith(mock, mgr.manualPaused); got != 2 {
+		t.Fatalf("reclaimed = %d, want 2", got)
+	}
+	if len(mock.specificClaims) != 2 {
+		t.Fatalf("specific claims = %+v, want 2", mock.specificClaims)
+	}
+	for _, call := range mock.specificClaims {
+		if call.toNode != "node-a" {
+			t.Fatalf("re-claim target = %q, want node-a (%+v)", call.toNode, call)
+		}
+	}
+}
+
+// TestRunClaimCycleReclaimsManualPausedAfterExcessRelease verifies that when
+// the claim cycle's excess-offline sweep (a raw DB release that has no notion
+// of local state) catches a user-paused channel, the channel is immediately
+// re-claimed for this node and its local object is NOT removed — the automatic
+// load rebalance never hands a manual pause back to the pool, where another
+// node would claim it and record over the user's pause.
+func TestRunClaimCycleReclaimsManualPausedAfterExcessRelease(t *testing.T) {
+	mock := &mockClient{
+		stats: &database.AssignmentStats{
+			TotalPoolChannels: 4,
+			TotalAliveNodes:   2,
+			TotalLiveChannels: 0,
+		},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			"node-a": {
+				{Username: "manual_user", Site: "chaturbate", Status: "claimed", IsLive: false},
+				{Username: "off1", Site: "chaturbate", Status: "claimed", IsLive: false},
+				{Username: "off2", Site: "stripchat", Status: "claimed", IsLive: false},
+			},
+		},
+		releasedExcess: []database.ChannelAssignment{
+			{Username: "manual_user", Site: "chaturbate", Status: "claimed", IsLive: false},
+		},
+	}
+	mgr := &mockChannelManager{
+		manualPaused: []ChannelPause{
+			{Username: "manual_user", Site: "chaturbate"},
+		},
+	}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
+
+	c.runClaimCycleWith(mock)
+
+	// fairShare=ceil(4/2)=2, myOfflineCount=3 > 2 → excess=1 → the mock returns
+	// manual_user as released. The manual pause must be re-claimed for node-a.
+	if len(mock.specificClaims) != 1 {
+		t.Fatalf("expected 1 re-claim, got %d: %+v", len(mock.specificClaims), mock.specificClaims)
+	}
+	call := mock.specificClaims[0]
+	if call.username != "manual_user" || call.toNode != "node-a" {
+		t.Fatalf("unexpected re-claim call: %+v", call)
+	}
+	// And the local parked channel must NOT have been removed (the guard in
+	// RemoveChannelForReassignment keeps manual-paused channels).
+	if len(mgr.removed) != 0 {
+		t.Fatalf("manual-paused channel should not be removed, got %v", mgr.removed)
+	}
+}
+
+// TestRunDeadlineMigrationSkipsManualPaused verifies that a channel the user
+// explicitly paused on this node is exempt from this node's own deadline drain:
+// migrating it would hand it to another node, which would recreate it as a
+// fresh recording channel and record over the user's pause.
+func TestRunDeadlineMigrationSkipsManualPaused(t *testing.T) {
+	mock := &mockClient{
+		imminentNodes: []database.Node{
+			{NodeID: "node-a", SessionDeadline: timePtr(time.Now().Add(5 * time.Minute))},
+		},
+		aliveNodes: []database.Node{
+			{NodeID: "node-a", CurrentLoad: 5},
+			{NodeID: "node-b", CurrentLoad: 0},
+		},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			"node-a": {
+				{Username: "manual_user", Site: "chaturbate", Status: "claimed", IsLive: false},
+				{Username: "off1", Site: "chaturbate", Status: "claimed", IsLive: false},
+			},
+		},
+	}
+	mgr := &mockChannelManager{
+		manualPaused: []ChannelPause{
+			{Username: "manual_user", Site: "chaturbate"},
+		},
+	}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
+
+	c.runDeadlineMigrationCycleWith(mock)
+
+	// off1 migrates to node-b; the manual-paused channel stays on node-a.
+	if len(mock.reassignCalls) != 1 {
+		t.Fatalf("expected 1 reassign, got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
+	}
+	call := mock.reassignCalls[0]
+	if call.username != "off1" || call.toNode != "node-b" {
+		t.Fatalf("unexpected reassign call: %+v", call)
 	}
 }
 
