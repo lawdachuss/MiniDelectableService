@@ -248,9 +248,21 @@ func (c *Coordinator) runClaimCycleWith(db dbClaimCycle) {
 		if len(released) > 0 {
 			log.Printf("[coordinator] released %d excess offline channel(s) (offline: %d -> %d, live: %d, fairShare: %d, totalPool: %d)",
 				len(released), myOfflineCount, myOfflineCount-len(released), myLiveCount, fairShare, totalPool)
-			// Re-claim any user-paused channels caught in the sweep before they
-			// can be claimed by another node and recorded over the user's pause.
-			c.reclaimManualPausedChannelsWith(db, manualPaused)
+			// Re-claim ONLY the user-paused channels actually caught in the
+			// sweep. Re-claiming the full manual list would fire ClaimSpecific-
+			// Channel on still-assigned channels and log bogus "claimed by
+			// another node first" warnings for pauses that were never released.
+			releasedSet := make(map[string]bool, len(released))
+			for _, ca := range released {
+				releasedSet[ca.Username] = true
+			}
+			var swept []ChannelPause
+			for _, mc := range manualPaused {
+				if releasedSet[mc.Username] {
+					swept = append(swept, mc)
+				}
+			}
+			c.reclaimManualPausedChannelsWith(db, swept)
 			for _, ca := range released {
 				if c.Manager != nil {
 					c.Manager.RemoveChannelForReassignment(ca.Username)

@@ -765,6 +765,7 @@ func TestRunClaimCycleReclaimsManualPausedAfterExcessRelease(t *testing.T) {
 	mgr := &mockChannelManager{
 		manualPaused: []ChannelPause{
 			{Username: "manual_user", Site: "chaturbate"},
+			{Username: "manual_two", Site: "stripchat"}, // NOT swept — must not be re-claimed
 		},
 	}
 	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
@@ -772,15 +773,16 @@ func TestRunClaimCycleReclaimsManualPausedAfterExcessRelease(t *testing.T) {
 	c.runClaimCycleWith(mock)
 
 	// fairShare=ceil(4/2)=2, myOfflineCount=3 > 2 → excess=1 → the mock returns
-	// manual_user as released. The manual pause must be re-claimed for node-a.
+	// manual_user as released. Only the SWEPT manual pause is re-claimed (a
+	// still-assigned manual channel must not trigger a bogus re-claim).
 	if len(mock.specificClaims) != 1 {
-		t.Fatalf("expected 1 re-claim, got %d: %+v", len(mock.specificClaims), mock.specificClaims)
+		t.Fatalf("expected exactly 1 re-claim (only the swept channel), got %d: %+v", len(mock.specificClaims), mock.specificClaims)
 	}
 	call := mock.specificClaims[0]
 	if call.username != "manual_user" || call.toNode != "node-a" {
 		t.Fatalf("unexpected re-claim call: %+v", call)
 	}
-	// And the local parked channel must NOT have been removed (the guard in
+	// And no local parked channel may be removed (the guard in
 	// RemoveChannelForReassignment keeps manual-paused channels).
 	if len(mgr.removed) != 0 {
 		t.Fatalf("manual-paused channel should not be removed, got %v", mgr.removed)
