@@ -41,10 +41,12 @@ type persistedSettings struct {
 func SaveSettings() error {
 	ConfigMu.RLock()
 	cookies := persistedSettings{
-		Cookies:     Config.Cookies,
-		SessionID:   Config.SessionID,
-		Csrftoken:   Config.Csrftoken,
-		CfClearance: Config.CfClearance,
+		// Sanitize on save so previously-quoted browser-pasted values never
+		// get re-persisted (keeps the stored blob well-formed for all nodes).
+		Cookies:     entity.SanitizeCookieString(Config.Cookies),
+		SessionID:   entity.SanitizeCookieValue(Config.SessionID),
+		Csrftoken:   entity.SanitizeCookieValue(Config.Csrftoken),
+		CfClearance: entity.SanitizeCookieValue(Config.CfClearance),
 		UserAgent:   Config.UserAgent,
 	}
 	creds := persistedSettings{
@@ -150,7 +152,9 @@ func LoadSettings() error {
 
 	ConfigMu.Lock()
 	if s.Cookies != "" {
-		Config.Cookies = s.Cookies
+		// Strip quotes/invalid bytes (browser-pasted cookie strings often
+		// wrap values in quotes, which Cloudflare rejects in the header).
+		Config.Cookies = entity.SanitizeCookieString(s.Cookies)
 	}
 	if s.SessionID != "" {
 		Config.SessionID = s.SessionID
@@ -186,7 +190,7 @@ func extractCookie(cookieStr, name string) string {
 	for _, pair := range strings.Split(cookieStr, ";") {
 		parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
 		if len(parts) == 2 && strings.TrimSpace(parts[0]) == name {
-			return strings.TrimSpace(parts[1])
+			return entity.SanitizeCookieValue(strings.TrimSpace(parts[1]))
 		}
 	}
 	return ""

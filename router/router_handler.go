@@ -365,7 +365,9 @@ func UpdateConfig(c *gin.Context) {
 
 	server.ConfigMu.Lock()
 	if req.Cookies != "" {
-		server.Config.Cookies = req.Cookies
+		// Sanitize browser-pasted cookie strings (DevTools exports often
+		// wrap values in quotes, which Cloudflare rejects in the header).
+		server.Config.Cookies = entity.SanitizeCookieString(req.Cookies)
 		// Parse individual fields from the raw cookie string
 		if server.Config.CfClearance == "" {
 			server.Config.CfClearance = extractCookieValue(server.Config.Cookies, "cf_clearance")
@@ -384,7 +386,7 @@ func UpdateConfig(c *gin.Context) {
 		server.Config.Csrftoken = req.Csrftoken
 	}
 	if req.CfClearance != "" {
-		server.Config.CfClearance = req.CfClearance
+		server.Config.CfClearance = entity.SanitizeCookieValue(req.CfClearance)
 	}
 	if req.UserAgent != "" {
 		server.Config.UserAgent = strings.TrimSpace(strings.Map(func(r rune) rune {
@@ -446,7 +448,7 @@ func extractCookieValue(cookieStr, name string) string {
 	for _, pair := range strings.Split(cookieStr, ";") {
 		parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
 		if len(parts) == 2 && strings.TrimSpace(parts[0]) == name {
-			return strings.TrimSpace(parts[1])
+			return entity.SanitizeCookieValue(strings.TrimSpace(parts[1]))
 		}
 	}
 	return ""

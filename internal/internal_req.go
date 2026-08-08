@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/server"
 )
 
@@ -350,6 +351,9 @@ type mediaFlagKey struct{}
 type mediaRefererKey struct{}
 
 // ParseCookies converts a cookie string into a map.
+// Values are sanitized (quotes, semicolons, backslashes and control bytes
+// removed) so a browser-pasted cookie string with quoted values can never
+// produce a malformed Cookie header that Cloudflare rejects.
 func ParseCookies(cookieStr string) map[string]string {
 	cookies := make(map[string]string)
 	pairs := strings.Split(cookieStr, ";")
@@ -362,7 +366,7 @@ func ParseCookies(cookieStr string) map[string]string {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
 			// Store cookie name and value in the map
-			cookies[key] = value
+			cookies[key] = entity.SanitizeCookieValue(value)
 		}
 	}
 	return cookies
