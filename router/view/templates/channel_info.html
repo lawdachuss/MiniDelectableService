@@ -68,6 +68,12 @@
         Encoding
       </span>
       {{ end }}
+      {{ if .AutoResumedFromPause }}
+      <span class="inline-flex items-center gap-1 px-2 py-0.5 text-[9px] font-bold rounded-full uppercase tracking-wider shrink-0" style="background:rgba(45,212,191,0.1);border:1px solid rgba(45,212,191,0.3);color:#2dd4bf" title="Channel was paused but still assigned — automatically resumed (stuck-pause recovery)">
+        <svg class="w-2.5 h-2.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        Auto-Resumed
+      </span>
+      {{ end }}
       {{ if and .IsOnline (not .IsPaused) }}
       <span class="inline-flex items-center gap-1 px-2 py-0.5 text-[9px] font-bold rounded-full uppercase tracking-wider badge-recording">Recording</span>
       {{ else if .IsConnecting }}

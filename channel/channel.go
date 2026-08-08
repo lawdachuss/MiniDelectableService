@@ -44,6 +44,12 @@ type Channel struct {
 
 	CompressingCount int32 // atomic: number of active compression goroutines
 
+	// autoResumedFromPause is set when the channel was automatically resumed
+	// from a stuck paused-but-still-assigned state (manager's
+	// CreateChannelFromAssignment). ExportInfo surfaces it as a UI badge so the
+	// node web UI makes the recovery visible.
+	autoResumedFromPause atomic.Bool
+
 	stateMu sync.Mutex // protects IsOnline, IsConnecting, RoomStatus, metadata fields
 
 	RoomTitle        string   // captured from API, persisted even when offline
@@ -336,11 +342,12 @@ func (ch *Channel) exportInfo(includeLogs bool) *entity.ChannelInfo {
 	}
 
 	return &entity.ChannelInfo{
-		IsOnline:         isOnline,
-		IsConnecting:     isConnecting,
-		IsPaused:         ch.Config.IsPaused.Load(),
-		IsCompressing:    atomic.LoadInt32(&ch.CompressingCount) > 0,
-		RoomStatus:       roomStatus,
+		IsOnline:             isOnline,
+		IsConnecting:         isConnecting,
+		IsPaused:             ch.Config.IsPaused.Load(),
+		IsCompressing:        atomic.LoadInt32(&ch.CompressingCount) > 0,
+		AutoResumedFromPause: ch.autoResumedFromPause.Load(),
+		RoomStatus:           roomStatus,
 		Username:         ch.Config.Username,
 		Site:             siteName,
 		SiteDomain:       siteDomain,
@@ -363,6 +370,14 @@ func (ch *Channel) exportInfo(includeLogs bool) *entity.ChannelInfo {
 		NumViewers:       viewers,
 		SummaryCardImage: summaryCardImage,
 	}
+}
+
+// MarkAutoResumedFromPause records that this channel was automatically resumed
+// from a stuck paused-but-still-assigned state. The flag is sticky for the
+// channel's lifetime (until it is re-created after a release/re-claim) and
+// shows as an "Auto-Resumed" badge in the web UI.
+func (ch *Channel) MarkAutoResumedFromPause() {
+	ch.autoResumedFromPause.Store(true)
 }
 
 // Pause pauses the channel and cancels the context.

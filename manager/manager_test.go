@@ -2,7 +2,9 @@ package manager
 
 import (
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/teacat/chaturbate-dvr/channel"
 	"github.com/teacat/chaturbate-dvr/database"
@@ -85,5 +87,31 @@ func TestCreateChannelFromAssignmentResumesPausedChannel(t *testing.T) {
 	}
 	if got.(*channel.Channel).Config.IsPaused.Load() {
 		t.Fatal("CreateChannelFromAssignment should resume a paused-but-still-assigned channel")
+	}
+	// The resume must be visible in the node web UI: the channel is marked
+	// AutoResumedFromPause (drives the badge) and the browser log carries the
+	// recovery line.
+	if !got.(*channel.Channel).ExportInfo().AutoResumedFromPause {
+		t.Fatal("auto-resumed channel should be marked AutoResumedFromPause for the UI badge")
+	}
+	// The browser log is written by the channel's async Publisher goroutine,
+	// so poll briefly for the recovery line instead of asserting synchronously.
+	chAfter := got.(*channel.Channel)
+	var foundRecovery bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, l := range chAfter.ExportInfo().Logs {
+			if strings.Contains(l, "stuck-pause recovery") {
+				foundRecovery = true
+				break
+			}
+		}
+		if foundRecovery {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !foundRecovery {
+		t.Fatalf("expected a browser-visible stuck-pause recovery log line, got: %v", chAfter.ExportInfo().Logs)
 	}
 }

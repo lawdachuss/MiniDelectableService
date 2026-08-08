@@ -84,6 +84,11 @@ type ChannelInfo struct {
 	IsPaused       bool
 	IsCompressing  bool
 	RoomStatus     string // public, private, group, away, offline, hidden
+	// AutoResumedFromPause is true when the channel was automatically resumed
+	// from a stuck paused-but-still-assigned state (the claim cycle found it
+	// paused while the DB still assigned it to this node). The node web UI
+	// shows a badge so the recovery is visible.
+	AutoResumedFromPause bool
 	Username       string
 	Site           string // "chaturbate" or "stripchat"
 	SiteDomain     string // domain for channel link, e.g. "https://www.cb.xxx/"

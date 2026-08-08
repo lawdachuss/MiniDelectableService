@@ -211,6 +211,45 @@ func TestOfflineNodeLoadCellHidden(t *testing.T) {
 	}))
 }
 
+// TestChannelInfoTemplateShowsAutoResumedBadge verifies the channel card
+// renders the "Auto-Resumed" badge only when the channel was automatically
+// resumed from a stuck paused-but-still-assigned state — the UI marker for the
+// stuck-pause recovery path in manager.CreateChannelFromAssignment.
+func TestChannelInfoTemplateShowsAutoResumedBadge(t *testing.T) {
+	templ := loadAllTemplates(t)
+	render := func(info *entity.ChannelInfo) string {
+		t.Helper()
+		var buf bytes.Buffer
+		if err := templ.ExecuteTemplate(&buf, "channel_info", info); err != nil {
+			t.Fatalf("render channel_info: %v", err)
+		}
+		return buf.String()
+	}
+
+	out := render(&entity.ChannelInfo{
+		Username:             "stuck_user",
+		Site:                 "chaturbate",
+		SiteDomain:           "https://www.cb.xxx/",
+		IsOnline:             true,
+		AutoResumedFromPause: true,
+		GlobalConfig:         &entity.Config{},
+	})
+	if !strings.Contains(out, "Auto-Resumed") {
+		t.Fatalf("channel_info render missing Auto-Resumed badge: %s", out)
+	}
+
+	normal := render(&entity.ChannelInfo{
+		Username:     "normal_user",
+		Site:         "chaturbate",
+		SiteDomain:   "https://www.cb.xxx/",
+		IsOnline:     true,
+		GlobalConfig: &entity.Config{},
+	})
+	if strings.Contains(normal, "Auto-Resumed") {
+		t.Fatal("channel_info render must not show Auto-Resumed badge for a normal channel")
+	}
+}
+
 func TestPoolTemplateRendersCompletely(t *testing.T) {
 	renderTemplate(t, "pool.html", &PoolData{
 		Assignments: []PoolEntry{

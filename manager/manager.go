@@ -36,11 +36,12 @@ type renderCacheEntry struct {
 // field displayed in the channel_info template changes. This is used
 // to skip redundant template renders + SSE pushes.
 func channelInfoFingerprint(info *entity.ChannelInfo) string {
-	return fmt.Sprintf("%t|%t|%t|%t|%s|%s|%s|%s|%s|%s|%.0f|%s",
+	return fmt.Sprintf("%t|%t|%t|%t|%t|%s|%s|%s|%s|%s|%s|%.0f|%s",
 		info.IsOnline,
 		info.IsConnecting,
 		info.IsPaused,
 		info.IsCompressing,
+		info.AutoResumedFromPause,
 		info.RoomStatus,
 		info.Duration,
 		info.Filesize,
@@ -413,8 +414,11 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 	if existing, loaded := m.Channels.LoadOrStore(conf.Username, channel.New(conf)); loaded {
 		if ch, ok := existing.(*channel.Channel); ok && ch.Config.IsPaused.Load() {
 			ch.PipelineQueue.ResumePending()
+			ch.MarkAutoResumedFromPause()
 			ch.Resume(0)
-			fmt.Printf("[manager] resumed paused channel from assignment: %s/%s\n", ca.Site, ca.Username)
+			// Browser-visible log (SSE) + stdout so the node web UI shows why
+			// this channel came back from a stuck-paused state.
+			ch.Info("channel was paused but still assigned — automatically resumed (stuck-pause recovery)")
 		}
 		return nil
 	}
