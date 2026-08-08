@@ -15,6 +15,7 @@ const (
 	KeyCFGlobal     = "cf_global"
 	KeyDiskWarning  = "disk_warning:%s"  // % path
 	KeyDiskCritical = "disk_critical:%s" // % path
+	KeyStuckPause   = "stuck_pause"      // fleet-wide paused-but-still-assigned channels
 )
 
 // Default is the package-level notifier singleton.

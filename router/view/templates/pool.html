@@ -416,6 +416,7 @@
                              {{ else if eq .Status "recording" }}<span class="badge badge-live"><span class="badge-dot"></span>Recording</span>
                              {{ else if eq .Status "paused" }}<span class="badge badge-paused"><span class="badge-dot"></span>Paused</span>
                              {{ else }}<span class="badge badge-unassigned"><span class="badge-dot"></span>Unassigned</span>{{ end }}
+                             {{ if and .Paused (ne .Status "paused") }}<span class="badge badge-paused" title="Paused locally but still assigned — not recording"><span class="badge-dot"></span>Paused</span>{{ end }}
                         </td>
                         <td>
                             {{ if .IsLive }}<span class="badge badge-live"><span class="badge-dot"></span>Live</span>
@@ -499,6 +500,9 @@ function loadPoolData() {
                                a.status === 'recording' ? '<span class="badge badge-live"><span class="badge-dot"></span>Recording</span>' :
                                a.status === 'paused' ? '<span class="badge badge-paused"><span class="badge-dot"></span>Paused</span>' :
                                '<span class="badge badge-unassigned"><span class="badge-dot"></span>Unassigned</span>';
+            if (a.paused && a.status !== 'paused') {
+                statusBadge += '<span class="badge badge-paused" title="Paused locally but still assigned — not recording"><span class="badge-dot"></span>Paused</span>';
+            }
             
             var liveBadge = a.is_live ? '<span class="badge badge-live"><span class="badge-dot"></span>Live</span>' :
                            '<span class="badge badge-offline"><span class="badge-dot"></span>Offline</span>';

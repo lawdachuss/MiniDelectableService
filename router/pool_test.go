@@ -270,6 +270,44 @@ func TestPoolJSONUsesSnakeCaseKeys(t *testing.T) {
 	}
 }
 
+// TestPoolJSONIncludesPausedFlags verifies /api/pool carries the local
+// paused/uploading/pending state that the fleet stuck-pause monitor reads from
+// each node's pool API to flag paused-but-still-assigned channels.
+func TestPoolJSONIncludesPausedFlags(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	server.Config = &entity.Config{}
+	setStubManager(t, &stubManager{channels: []*entity.ChannelInfo{
+		{Username: "bob", Site: "stripchat", IsPaused: true},
+		{Username: "alice", Site: "chaturbate", IsOnline: true, UploadStatus: "uploading (1/2 hosts)"},
+	}})
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/pool", nil)
+
+	GetPoolJSON(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"paused"`, `"uploading"`, `"pending"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("pool JSON missing flag %s; body: %s", want, body)
+		}
+	}
+	// bob is paused and idle; alice is recording with an active upload.
+	if !strings.Contains(body, `"paused":true`) {
+		t.Fatalf("expected paused:true for the paused channel; body: %s", body)
+	}
+	if !strings.Contains(body, `"paused":false`) {
+		t.Fatalf("expected paused:false for the recording channel; body: %s", body)
+	}
+	if !strings.Contains(body, `"uploading":true`) {
+		t.Fatalf("expected uploading:true for the uploading channel; body: %s", body)
+	}
+}
+
 // TestPoolPageRendersLocalChannels verifies the pool page renders configured
 // channels in isolated mode instead of showing an empty page.
 func TestPoolPageRendersLocalChannels(t *testing.T) {

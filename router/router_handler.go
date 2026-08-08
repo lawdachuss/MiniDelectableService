@@ -1533,6 +1533,17 @@ type PoolEntry struct {
 	Framerate    int    `json:"framerate"`
 	AssignedAt   string `json:"assigned_at"`
 	Source       string `json:"source"` // "pool" (channel_assignments) or "local" (configured channels)
+
+	// Local runtime state — only populated for channels owned by THIS node
+	// (pooled mode) or all channels (isolated mode). Paused means the channel
+	// is paused locally while still assigned in the DB; Uploading/Pending mean
+	// the channel is actively processing uploads. The fleet stuck-pause
+	// monitor reads these flags from each node's /api/pool to detect
+	// paused-but-still-assigned channels (excluding legitimate pauses during
+	// the session processing phase).
+	Paused    bool `json:"paused"`
+	Uploading bool `json:"uploading"`
+	Pending   bool `json:"pending"`
 }
 
 // PoolData represents the data structure for the pool editor page.
@@ -1545,9 +1556,44 @@ type PoolData struct {
 // mode (CHANNEL_POOL_MODE=pooled) the channel_assignments table is the source
 // of truth; in isolated mode the locally configured channels (server.Manager)
 // are shown so the page is never empty when channels exist.
+// localChannelState snapshots the runtime state (paused / uploading / pending)
+// of this node's local channels, keyed by username. The flags feed the pool
+// API so the fleet stuck-pause monitor can see each node's local pause state
+// through its /api/pool endpoint. Uploading/Pending exclude channels that are
+// paused only while the session processing phase muxes/uploads their files.
+func localChannelState() (map[string]*entity.ChannelInfo, map[string]bool) {
+	info := map[string]*entity.ChannelInfo{}
+	pending := map[string]bool{}
+	if server.Manager == nil {
+		return info, pending
+	}
+	for _, ch := range server.Manager.ChannelInfo() {
+		info[ch.Username] = ch
+	}
+	for _, p := range server.Manager.UploadEntries().Pending {
+		pending[p.Channel] = true
+	}
+	return info, pending
+}
+
+// poolEntryLocalState fills the paused/uploading/pending flags of a PoolEntry
+// from local channel state. Returns true when local state was found.
+func poolEntryLocalState(e *PoolEntry, info map[string]*entity.ChannelInfo, pending map[string]bool) bool {
+	ch, ok := info[e.Username]
+	if !ok {
+		return false
+	}
+	e.Paused = ch.IsPaused
+	e.Uploading = ch.UploadStatus != "" || ch.IsCompressing
+	e.Pending = pending[e.Username]
+	return true
+}
+
 func poolEntries() ([]PoolEntry, string) {
 	mode := server.ChannelPoolMode()
 	var entries []PoolEntry
+
+	localInfo, localPending := localChannelState()
 
 	if server.IsPooledMode() {
 		client := server.GetDBClient()
@@ -1560,7 +1606,7 @@ func poolEntries() ([]PoolEntry, string) {
 			return nil, mode
 		}
 		for _, a := range assignments {
-			entries = append(entries, PoolEntry{
+			e := PoolEntry{
 				Username:     a.Username,
 				Site:         a.Site,
 				AssignedNode: a.AssignedNode,
@@ -1570,7 +1616,13 @@ func poolEntries() ([]PoolEntry, string) {
 				Framerate:    a.Framerate,
 				AssignedAt:   a.AssignedAt,
 				Source:       "pool",
-			})
+			}
+			// Paused state is only meaningful on the node that owns the
+			// assignment — another node's /api/pool must not claim to know it.
+			if a.AssignedNode == server.NodeID() {
+				poolEntryLocalState(&e, localInfo, localPending)
+			}
+			entries = append(entries, e)
 		}
 		return entries, mode
 	}
@@ -1587,13 +1639,15 @@ func poolEntries() ([]PoolEntry, string) {
 			case ch.IsConnecting:
 				status = "connecting"
 			}
-			entries = append(entries, PoolEntry{
+			e := PoolEntry{
 				Username:   ch.Username,
 				Site:       ch.Site,
 				Status:     status,
 				IsLive:     ch.IsOnline,
 				Source:     "local",
-			})
+			}
+			poolEntryLocalState(&e, localInfo, localPending)
+			entries = append(entries, e)
 		}
 	}
 	return entries, mode

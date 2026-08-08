@@ -170,6 +170,7 @@ func (c *Coordinator) startHealthCheckLoop(ctx context.Context) {
 			c.checkCycleHealth("offline-shuffle", &c.cycleGuardShuffle)
 			c.checkCycleHealth("deadline-migration", &c.cycleGuardDeadline)
 			c.checkCycleHealth("reconcile", &c.cycleGuardReconcile)
+			c.checkCycleHealth("stuck-pause", &c.cycleGuardStuckPause)
 		}
 		}
 	}()
@@ -253,17 +254,27 @@ type Coordinator struct {
 	cycleGuardShuffle       cycleGuard
 	cycleGuardDeadline      cycleGuard
 	cycleGuardReconcile     cycleGuard
+	cycleGuardStuckPause    cycleGuard
+
+	// stuckPauseSeen tracks consecutive observations of a paused-but-still-
+	// assigned channel (key nodeID/site/username → count). A channel must be
+	// observed across stuckPauseConfirmCycles consecutive checks before it is
+	// considered genuinely stuck and a notification fires, so transient
+	// session-boundary pauses never alert.
+	stuckPauseSeen map[string]int
+	stuckPauseMu   sync.Mutex
 }
 
 // New creates a new Coordinator. If CHANNEL_POOL_MODE=pooled, Start() must
 // be called to begin background goroutines.
 func New(client *database.Client, mgr ChannelManager) *Coordinator {
 	return &Coordinator{
-		NodeID:  detectNodeID(),
-		Mode:    channelPoolMode(),
-		Client:  client,
-		Manager: mgr,
-		stopCh:  make(chan struct{}),
+		NodeID:         detectNodeID(),
+		Mode:           channelPoolMode(),
+		Client:         client,
+		Manager:        mgr,
+		stopCh:         make(chan struct{}),
+		stuckPauseSeen: make(map[string]int),
 	}
 }
 
@@ -293,6 +304,7 @@ func (c *Coordinator) Start(ctx context.Context) {
 	c.StartOfflineShuffleLoop(ctx)
 	c.StartDeadlineMigrationLoop(ctx)
 	c.StartReconcileLoop(ctx)
+	c.StartStuckPauseMonitorLoop(ctx)
 
 	// Start the health check watchdog that detects stalled cycles
 	c.startHealthCheckLoop(ctx)
