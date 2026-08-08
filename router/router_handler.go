@@ -1556,11 +1556,34 @@ type PoolData struct {
 // mode (CHANNEL_POOL_MODE=pooled) the channel_assignments table is the source
 // of truth; in isolated mode the locally configured channels (server.Manager)
 // are shown so the page is never empty when channels exist.
+// hasOnDiskPending reports whether username has files waiting in the on-disk
+// .pending queue (segments the pipeline has not finished muxing/uploading).
+// Mirrors manager.HasPendingSegments' directory semantics so the pool API and
+// the shuffle guard agree on what counts as pending work.
+func hasOnDiskPending(username string) bool {
+	dir := "videos"
+	if server.Config != nil && server.Config.OutputDir != "" {
+		dir = server.Config.OutputDir
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".pending", username))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 // localChannelState snapshots the runtime state (paused / uploading / pending)
 // of this node's local channels, keyed by username. The flags feed the pool
 // API so the fleet stuck-pause monitor can see each node's local pause state
 // through its /api/pool endpoint. Uploading/Pending exclude channels that are
-// paused only while the session processing phase muxes/uploads their files.
+// paused only while the session processing phase muxes/uploads their files —
+// a channel with active upload work, queued pipeline work, or on-disk .pending
+// segments is mid-processing, never "stuck".
 func localChannelState() (map[string]*entity.ChannelInfo, map[string]bool) {
 	info := map[string]*entity.ChannelInfo{}
 	pending := map[string]bool{}
@@ -1569,6 +1592,9 @@ func localChannelState() (map[string]*entity.ChannelInfo, map[string]bool) {
 	}
 	for _, ch := range server.Manager.ChannelInfo() {
 		info[ch.Username] = ch
+		if hasOnDiskPending(ch.Username) {
+			pending[ch.Username] = true
+		}
 	}
 	for _, p := range server.Manager.UploadEntries().Pending {
 		pending[p.Channel] = true

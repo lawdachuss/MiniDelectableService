@@ -96,14 +96,12 @@ type poolAPIEntry struct {
 	Username     string `json:"username"`
 	Site         string `json:"site"`
 	AssignedNode string `json:"assigned_node"`
-	Status       string `json:"status"`
 	Paused       bool   `json:"paused"`
 	Uploading    bool   `json:"uploading"`
 	Pending      bool   `json:"pending"`
 }
 
 type poolAPIResponse struct {
-	Mode        string         `json:"mode"`
 	Assignments []poolAPIEntry `json:"assignments"`
 }
 
