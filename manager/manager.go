@@ -404,9 +404,19 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 	conf := coordinator.ConfigFromAssignment(ca)
 	conf.Sanitize()
 
-	// Check for duplicate
-	if _, loaded := m.Channels.LoadOrStore(conf.Username, channel.New(conf)); loaded {
-		return nil // already exists
+	// Check for duplicate. The DB assignment is the source of truth in pooled
+	// mode: a channel assigned to this node must be RUNNING. If the channel
+	// already exists locally it may be PAUSED (left over from a session
+	// boundary, a UI pause, or an interrupted Stop during a handoff) — silently
+	// returning would leave it paused forever with nothing ever reactivating
+	// it. So resume a paused instance instead of skipping it.
+	if existing, loaded := m.Channels.LoadOrStore(conf.Username, channel.New(conf)); loaded {
+		if ch, ok := existing.(*channel.Channel); ok && ch.Config.IsPaused.Load() {
+			ch.PipelineQueue.ResumePending()
+			ch.Resume(0)
+			fmt.Printf("[manager] resumed paused channel from assignment: %s/%s\n", ca.Site, ca.Username)
+		}
+		return nil
 	}
 
 	// Load the stored channel and start it
