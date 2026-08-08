@@ -114,6 +114,14 @@ type Manager struct {
 	cfMu            sync.Mutex
 	cfBlocked       map[string]struct{}
 	cfGlobalNotified bool
+
+	// cfRefreshFn is the registered cookie re-mint function (runs the cookie
+	// scripts + reloads cookies from Supabase). Fired by RequestCookieRefresh
+	// when the node is Cloudflare-starved, rate-limited by cfRefreshLast so a
+	// persistent block can't trigger a refresh storm.
+	cfRefreshFn   func()
+	cfRefreshMu   sync.Mutex
+	cfRefreshLast time.Time
 }
 
 // TriggerSessionStop signals the session loop to stop recording now and
@@ -516,6 +524,14 @@ func (m *Manager) RemoveChannelForReassignment(username string) error {
 	}
 
 	ch := thing.(*channel.Channel)
+	// Clear the channel's Cloudflare-block state once it is no longer actively
+	// monitoring on this node. Without this, a CF-starved shed would leave its
+	// (stopped) channels in the cfBlocked map forever — they never make another
+	// request to trigger ResetCFBlock — so CFBlockedCount() stayed above the
+	// starved threshold and the node never recovered (permanent starvation
+	// until restart).
+	m.ResetCFBlock(username)
+
 	if ch.PauseReason() == entity.PauseReasonManual {
 		ch.Info("channel manually paused — keeping it (not removing for reassignment)")
 		return nil
@@ -628,6 +644,7 @@ func (m *Manager) StopChannel(username string) error {
 	// Step 1: remove from memory so subsequent requests are immediate no-ops
 	// and the UI reflects the deletion on the next GET /.
 	m.Channels.Delete(username)
+	m.ResetCFBlock(username) // a deleted channel is no longer this node's problem
 
 	// Step 2: in pooled mode, release the assignment first
 	if server.IsPooledMode() && m.Coordinator != nil {
@@ -1124,12 +1141,29 @@ func (m *Manager) ReportCFBlock(username string) {
 	if fire {
 		m.cfGlobalNotified = true
 	}
+	starved := count >= m.cfStarvedThreshold()
 	m.cfMu.Unlock()
 
 	if fire {
 		notifier.Notify(notifier.KeyCFGlobal, "⚠️ Cloudflare Block Detected",
 			fmt.Sprintf("%d channels are currently blocked by Cloudflare", count))
 	}
+
+	// When enough channels are blocked at once the node's IP is almost
+	// certainly flagged — kick off a cookie re-mint (rate-limited) so the
+	// fleet recovers without a restart.
+	if starved {
+		m.RequestCookieRefresh()
+	}
+}
+
+// cfStarvedThreshold returns how many simultaneously-blocked channels mark
+// this node as Cloudflare-starved (default 5, configurable).
+func (m *Manager) cfStarvedThreshold() int {
+	if server.Config != nil && server.Config.CFStarvedThreshold > 0 {
+		return server.Config.CFStarvedThreshold
+	}
+	return 5
 }
 
 // ResetCFBlock marks a channel as no longer blocked by Cloudflare, re-arming
@@ -1141,6 +1175,53 @@ func (m *Manager) ResetCFBlock(username string) {
 		m.cfGlobalNotified = false
 	}
 	m.cfMu.Unlock()
+}
+
+// SetCookieRefreshFunc registers the function that re-mints this node's
+// cookies (refresh scripts + Supabase reload). Called by main.go at startup.
+func (m *Manager) SetCookieRefreshFunc(fn func()) {
+	m.cfRefreshMu.Lock()
+	m.cfRefreshFn = fn
+	m.cfRefreshMu.Unlock()
+}
+
+// CFBlockedCount returns the number of channels currently in a
+// Cloudflare-blocked state (their last response was a CF challenge).
+func (m *Manager) CFBlockedCount() int {
+	m.cfMu.Lock()
+	defer m.cfMu.Unlock()
+	return len(m.cfBlocked)
+}
+
+// RequestCookieRefresh triggers a cookie re-mint at most once every
+// CFRefreshMin minutes. It is async (fire-and-forget) so the claim cycle and
+// monitor loops never block on the browser-based grabber. After the refresh
+// runs, the live config is reloaded from Supabase so running channels
+// immediately use the fresh cookie set on their next probe.
+func (m *Manager) RequestCookieRefresh() {
+	m.cfRefreshMu.Lock()
+	minBetween := 10
+	if server.Config != nil && server.Config.CFRefreshMin > 0 {
+		minBetween = server.Config.CFRefreshMin
+	}
+	if m.cfRefreshFn == nil || time.Since(m.cfRefreshLast) < time.Duration(minBetween)*time.Minute {
+		m.cfRefreshMu.Unlock()
+		return
+	}
+	m.cfRefreshLast = time.Now()
+	fn := m.cfRefreshFn
+	m.cfRefreshMu.Unlock()
+
+	log.Printf("[manager] %d channel(s) Cloudflare-blocked — triggering cookie refresh (rate-limited to every %d min)",
+		m.CFBlockedCount(), minBetween)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[manager] PANIC in cookie refresh: %v", r)
+			}
+		}()
+		fn()
+	}()
 }
 
 func (m *Manager) PublishLog(username, line string) {

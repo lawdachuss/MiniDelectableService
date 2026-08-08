@@ -10,6 +10,7 @@ import (
 
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
+	"github.com/teacat/chaturbate-dvr/server"
 )
 
 // StartClaimLoop periodically claims channels for this node based on fair-share.
@@ -231,6 +232,32 @@ func (c *Coordinator) runClaimCycleWith(db dbClaimCycle) {
 	}
 	myOfflineCount := myLoad - myLiveCount
 
+	// Cloudflare-starved shedding: when enough channels are simultaneously
+	// blocked the node's IP is flagged and NONE of its channels can record.
+	// Keeping them assigned only hoards the pool — the claim cycle would keep
+	// re-claiming them while healthy nodes get nothing to record (seen in the
+	// wild: a fully-blocked node holding ~200 claims that its healthy peers
+	// could have recorded). Shed all but a small probe set (kept assigned so
+	// recovery is detected: the probe channels keep retrying and succeed as
+	// soon as cookies are re-minted), stop claiming entirely, and kick off the
+	// rate-limited cookie refresh.
+	if c.Manager != nil && c.Manager.CFBlockedCount() >= cfStarvedThreshold() {
+		const probeSet = 3
+		if myOfflineCount > probeSet {
+			excess := myOfflineCount - probeSet
+			released, err := db.ReleaseExcessOfflineChannels(c.NodeID, excess)
+			if err != nil {
+				log.Printf("[coordinator] claim cycle: CF-starved release error: %v", err)
+				return
+			}
+			log.Printf("[coordinator] claim cycle: CF-starved (%d blocked) — shed %d offline channel(s) to the pool (keeping %d probe(s); live: %d, fairShare: %d, totalPool: %d)",
+				c.Manager.CFBlockedCount(), len(released), probeSet, myLiveCount, fairShare, totalPool)
+			c.handleReleasedExcess(db, released, manualPaused)
+		}
+		c.Manager.RequestCookieRefresh()
+		return // no claiming while starved
+	}
+
 	// Release excess OFFLINE channels if we have more offline than allowed.
 	// Live+recording channels are NEVER released here. The release itself is a
 	// raw DB sweep (ReleaseExcessOfflineChannels has no notion of local state),
@@ -248,26 +275,7 @@ func (c *Coordinator) runClaimCycleWith(db dbClaimCycle) {
 		if len(released) > 0 {
 			log.Printf("[coordinator] released %d excess offline channel(s) (offline: %d -> %d, live: %d, fairShare: %d, totalPool: %d)",
 				len(released), myOfflineCount, myOfflineCount-len(released), myLiveCount, fairShare, totalPool)
-			// Re-claim ONLY the user-paused channels actually caught in the
-			// sweep. Re-claiming the full manual list would fire ClaimSpecific-
-			// Channel on still-assigned channels and log bogus "claimed by
-			// another node first" warnings for pauses that were never released.
-			releasedSet := make(map[string]bool, len(released))
-			for _, ca := range released {
-				releasedSet[ca.Username] = true
-			}
-			var swept []ChannelPause
-			for _, mc := range manualPaused {
-				if releasedSet[mc.Username] {
-					swept = append(swept, mc)
-				}
-			}
-			c.reclaimManualPausedChannelsWith(db, swept)
-			for _, ca := range released {
-				if c.Manager != nil {
-					c.Manager.RemoveChannelForReassignment(ca.Username)
-				}
-			}
+			c.handleReleasedExcess(db, released, manualPaused)
 		}
 		return // let next cycle do the claiming to avoid races
 	}
@@ -372,6 +380,43 @@ func (c *Coordinator) RebalanceAtSessionBoundary() {
 // user-paused channels after the boundary release.
 type manualReclaimer interface {
 	ClaimSpecificChannel(username, site, nodeID string) (bool, error)
+}
+
+// cfStarvedThreshold returns how many simultaneously blocked channels mark
+// this node as Cloudflare-starved (CF_STARVED_THRESHOLD env, default 5).
+func cfStarvedThreshold() int {
+	if server.Config != nil && server.Config.CFStarvedThreshold > 0 {
+		return server.Config.CFStarvedThreshold
+	}
+	return 5
+}
+
+// handleReleasedExcess re-claims ONLY the user-paused channels actually caught
+// in a release sweep and removes the released channels from the local manager
+// so their monitors stop (they are no longer assigned to this node).
+// Re-claiming the full manual list would fire ClaimSpecificChannel on
+// still-assigned channels and log bogus "claimed by another node first"
+// warnings for pauses that were never released.
+func (c *Coordinator) handleReleasedExcess(db dbClaimCycle, released []database.ChannelAssignment, manualPaused []ChannelPause) {
+	if len(released) == 0 {
+		return
+	}
+	releasedSet := make(map[string]bool, len(released))
+	for _, ca := range released {
+		releasedSet[ca.Username] = true
+	}
+	var swept []ChannelPause
+	for _, mc := range manualPaused {
+		if releasedSet[mc.Username] {
+			swept = append(swept, mc)
+		}
+	}
+	c.reclaimManualPausedChannelsWith(db, swept)
+	for _, ca := range released {
+		if c.Manager != nil {
+			c.Manager.RemoveChannelForReassignment(ca.Username)
+		}
+	}
 }
 
 // reclaimManualPausedChannelsWith re-claims the user-paused channels for this

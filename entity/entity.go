@@ -260,6 +260,20 @@ type Config struct {
 	NotifyCooldownHours int // hours between repeated alerts of the same type; default 4
 	NotifyStreamOnline  bool
 
+	// CFRetryMinutes is how long a Cloudflare-blocked channel waits before
+	// retrying (default 5). Retrying every minute across hundreds of blocked
+	// channels hammers Cloudflare and keeps the block alive; a longer backoff
+	// gives the automatic cookie refresh time to mint a fresh cf_clearance.
+	CFRetryMinutes int
+	// CFStarvedThreshold is how many channels must be simultaneously
+	// Cloudflare-blocked before the node is considered CF-starved: it stops
+	// claiming new channels, sheds its excess claims back to the pool (so
+	// healthy nodes can record them), and triggers a cookie re-mint.
+	CFStarvedThreshold int
+	// CFRefreshMin is the minimum minutes between automatic cookie refresh
+	// attempts triggered by persistent Cloudflare blocks (default 10).
+	CFRefreshMin int
+
 	SessionDuration       string        // recording session length (e.g. "5h20m0s"); empty = disabled (continuous recording)
 	SessionDurationParsed time.Duration // parsed from SessionDuration; 0 = disabled
 

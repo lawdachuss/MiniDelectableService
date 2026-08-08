@@ -111,13 +111,14 @@ func PostChaturbateAPI(ctx context.Context, username string) (string, error) {
 
 		bodyStr = string(body)
 
-		if resp.StatusCode == 403 {
+		if resp.StatusCode == 403 || IsCloudflareChallenge(resp.StatusCode, bodyStr) {
 			// A 403 can be either an expected private show OR a Cloudflare
-			// challenge (site-wide block). The GET path detects the challenge
-			// via the body; the POST path must do the same so a real block
-			// still feeds the breaker/rate limiter. Private shows are expected
-			// per-channel states and must NOT trip the global breaker.
-			if strings.Contains(bodyStr, "Just a moment...") {
+			// challenge (site-wide block). Use the shared challenge detector
+			// so 403-with-markers, 429 rate-limit pages, and 410 all feed the
+			// breaker/rate limiter and back the channel off with the long CF
+			// retry — while markerless 403s stay an expected per-channel
+			// private-show state that must NOT trip the global breaker.
+			if IsCloudflareChallenge(resp.StatusCode, bodyStr) {
 				ReportChaturbateFailure()
 				return retry.Unrecoverable(ErrCloudflareBlocked)
 			}

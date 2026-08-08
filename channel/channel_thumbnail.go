@@ -159,36 +159,50 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			seekPos = fmt.Sprintf("%.2f", dur*0.1)
 		}
 
-		config.AcquireFFmpeg()
-		defer config.ReleaseFFmpeg()
-		err := config.FFmpegCommandContext(thumbCtx,
-			"-y",
-			"-ss", seekPos,
-			"-i", videoPath,
-			"-vframes", "1",
-			"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
-				thumbWidth, thumbHeight, thumbWidth, thumbHeight),
-			"-c:v", "mjpeg",
-			"-q:v", "5",
-			thumbJPG,
-		).Run()
-
-		if err != nil {
-			// Fast seek failed; retry with slow seek (-ss after -i).
-			// This handles certain codecs/formats where fast seek causes
-			// ffmpeg to crash (exit 0xffffffea on Windows).
-			errFn("thumb: fast seek failed for %s: %v, retrying with slow seek", baseName, err)
-			err = config.FFmpegCommandContext(thumbCtx,
-				"-y",
-				"-i", videoPath,
-				"-ss", seekPos,
+		// generateThumb extracts the single thumbnail frame (slow=true uses
+		// slow seek for codecs where fast seek crashes ffmpeg).
+		generateThumb := func(slow bool) error {
+			args := []string{"-y"}
+			if slow {
+				args = append(args, "-i", videoPath, "-ss", seekPos)
+			} else {
+				args = append(args, "-ss", seekPos, "-i", videoPath)
+			}
+			args = append(args,
 				"-vframes", "1",
 				"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
 					thumbWidth, thumbHeight, thumbWidth, thumbHeight),
 				"-c:v", "mjpeg",
 				"-q:v", "5",
 				thumbJPG,
-			).Run()
+			)
+			return config.FFmpegCommandContext(thumbCtx, args...).Run()
+		}
+
+		config.AcquireFFmpeg()
+		defer config.ReleaseFFmpeg()
+		err := generateThumb(false)
+
+		if err != nil {
+			// Fast seek failed; retry with slow seek (-ss after -i).
+			// This handles certain codecs/formats where fast seek causes
+			// ffmpeg to crash (exit 0xffffffea on Windows).
+			errFn("thumb: fast seek failed for %s: %v, retrying with slow seek", baseName, err)
+			err = generateThumb(true)
+		}
+
+		// The freshly-written .thumb.jpg can be briefly invisible to os.Stat
+		// (Windows AV scanners) OR deleted by a concurrent flow processing the
+		// same video (a second pipeline's DeleteSidecarFiles). Either way a
+		// missing file at upload time showed up as "pixhost: stat file". Poll
+		// briefly, then regenerate (a single-frame extract is fast) before
+		// uploading.
+		if err == nil && !fileExists(thumbJPG) {
+			errFn("thumb: %s missing after generation — regenerating", filepath.Base(thumbJPG))
+			err = generateThumb(true)
+		}
+		if err == nil && !fileExists(thumbJPG) {
+			err = fmt.Errorf("thumbnail file %s never appeared", filepath.Base(thumbJPG))
 		}
 
 		if err != nil {
@@ -244,17 +258,34 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			spriteCols, spriteRows,
 		)
 
+		// generateSprite renders the contact sheet (slow seek is not needed
+		// here — the fps filter reads sequentially).
+		generateSprite := func() error {
+			return config.FFmpegCommandContext(spriteCtx,
+				"-y",
+				"-i", videoPath,
+				"-vf", vf,
+				"-frames:v", "1",
+				"-c:v", "mjpeg",
+				"-q:v", "5",
+				spriteJPG,
+			).Run()
+		}
+
 		config.AcquireFFmpeg()
 		defer config.ReleaseFFmpeg()
-		err := config.FFmpegCommandContext(spriteCtx,
-			"-y",
-			"-i", videoPath,
-			"-vf", vf,
-			"-frames:v", "1",
-			"-c:v", "mjpeg",
-			"-q:v", "5",
-			spriteJPG,
-		).Run()
+		err := generateSprite()
+
+		// Same missing-file-at-upload-time race as the thumbnail: a concurrent
+		// flow can DeleteSidecarFiles on this video while we're between ffmpeg
+		// and the upload. Poll + regenerate before uploading.
+		if err == nil && !fileExists(spriteJPG) {
+			errFn("sprite: %s missing after generation — regenerating", filepath.Base(spriteJPG))
+			err = generateSprite()
+		}
+		if err == nil && !fileExists(spriteJPG) {
+			err = fmt.Errorf("sprite file %s never appeared", filepath.Base(spriteJPG))
+		}
 
 		if err != nil {
 			errFn("sprite: failed for %s: %v", baseName, err)

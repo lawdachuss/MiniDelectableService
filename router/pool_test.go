@@ -55,7 +55,10 @@ func (s *stubManager) WaitForUploads()   {}
 func (s *stubManager) StopAllChannels()  {}
 func (s *stubManager) WaitForAllChannels() {
 }
-func (s *stubManager) StopWatcher() {}
+func (s *stubManager) StopWatcher()               {}
+func (s *stubManager) CFBlockedCount() int        { return 0 }
+func (s *stubManager) RequestCookieRefresh()      {}
+func (s *stubManager) SetCookieRefreshFunc(func()) {}
 func (s *stubManager) StartSession(duration time.Duration) {
 }
 func (s *stubManager) StopSession() {}

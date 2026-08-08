@@ -161,6 +161,23 @@ func runCookieScript(py string, pyArgs []string, name string) {
 	fmt.Printf("🍪 %s completed in %v\n", name, time.Since(start).Round(time.Millisecond))
 }
 
+// autoRefreshCookiesAndReload re-mints this node's cookies (the same scripts
+// that run at startup) and then reloads the persisted cookies from Supabase
+// into the live config, so running channels immediately use the fresh set.
+// It is registered on the manager and fired (rate-limited) when the node is
+// detected as Cloudflare-starved. Best-effort: failures only log.
+func autoRefreshCookiesAndReload() {
+	fmt.Println("[cf-recovery] persistent Cloudflare blocks detected — refreshing cookies")
+	refreshCookies()
+	if server.Config != nil && server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+		if err := server.LoadSettings(); err != nil {
+			fmt.Printf("[cf-recovery] reload cookies after refresh: %v\n", err)
+		} else {
+			fmt.Println("[cf-recovery] cookies reloaded from Supabase — channels will re-probe")
+		}
+	}
+}
+
 func main() {
 	loadDotEnv(".env")
 	// package init() ran before .env was loaded, so re-derive the cached node
@@ -505,6 +522,24 @@ func main() {
 				Value:   3,
 			},
 			&cli.IntFlag{
+				Name:    "cf-retry-minutes",
+				Usage:   "How long a Cloudflare-blocked channel waits before retrying (default 5 min; reduces hammering and gives cookie refresh time to work)",
+				EnvVars: []string{"CF_RETRY_MINUTES"},
+				Value:   5,
+			},
+			&cli.IntFlag{
+				Name:    "cf-starved-threshold",
+				Usage:   "Channels blocked simultaneously before the node sheds its claims to the pool and re-mints cookies (default 5)",
+				EnvVars: []string{"CF_STARVED_THRESHOLD"},
+				Value:   5,
+			},
+			&cli.IntFlag{
+				Name:    "cf-refresh-min",
+				Usage:   "Minimum minutes between automatic cookie refresh attempts after persistent Cloudflare blocks (default 10)",
+				EnvVars: []string{"CF_REFRESH_MIN"},
+				Value:   10,
+			},
+			&cli.IntFlag{
 				Name:    "notify-cooldown-hours",
 				Usage:   "Hours between repeated notifications of the same type (default 4)",
 				EnvVars: []string{"NOTIFY_COOLDOWN_HOURS"},
@@ -623,6 +658,10 @@ func start(c *cli.Context) error {
 		return fmt.Errorf("new manager: %w", err)
 	}
 	fmt.Printf("[startup] manager created in %v\n", time.Since(started).Round(time.Millisecond))
+
+	// Wire the auto cookie refresh (re-mint + reload) so a node that goes
+	// Cloudflare-starved mid-session can recover without a restart.
+	server.Manager.SetCookieRefreshFunc(autoRefreshCookiesAndReload)
 
 	// Reconcile the session length before the coordinator registers its
 	// session_deadline: local SESSION_DURATION wins, else the central Supabase

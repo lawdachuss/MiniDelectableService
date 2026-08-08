@@ -473,6 +473,9 @@ func New(c *cli.Context) (*entity.Config, error) {
 		DiscordWebhookURL:  c.String("discord-webhook-url"),
 		CFChannelThreshold: c.Int("cf-channel-threshold"),
 		CFGlobalThreshold:  c.Int("cf-global-threshold"),
+		CFRetryMinutes:     c.Int("cf-retry-minutes"),
+		CFStarvedThreshold: c.Int("cf-starved-threshold"),
+		CFRefreshMin:       c.Int("cf-refresh-min"),
 		NotifyCooldownHours: c.Int("notify-cooldown-hours"),
 		NotifyStreamOnline: c.Bool("notify-stream-online"),
 	}

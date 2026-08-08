@@ -35,6 +35,20 @@ func pendingMu(username string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
+var mergeDirMu sync.Map // map[string]*sync.Mutex, keyed by channel username
+
+// mergeMu returns the per-channel mutex that serializes pending-segment merges.
+// handleMinDurationAndMerge and processAllPendingSegments can otherwise merge
+// the SAME segments concurrently (channel rotation vs. the startup orphan
+// scan), and both would renameOverwriting the shared stable "merged-*" name —
+// deleting the file out from under the other's upload ("could not hash" /
+// "0/5 successful"). Holding this lock for the whole merge lets both flows
+// upload from the clean stable name instead of a unique scratch path.
+func mergeMu(username string) *sync.Mutex {
+	v, _ := mergeDirMu.LoadOrStore(username, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 type Pattern struct {
 	Username string
 	Sequence int
@@ -892,22 +906,22 @@ func CleanupOrphanedFiles() {
 					return
 				}
 
-			if MaybeDeferToPending(info.path) {
+				if MaybeDeferToPending(info.path) {
+					_ = stem
+					return
+				}
+				// Never race another flow that owns this file right now (an active
+				// channel pipeline or the OutputDir watcher).  Their in-flight
+				// marker is cleared when they finish; the periodic scan (or the
+				// manual rescan) picks the file back up afterwards.
+				if IsUploadInFlight(info.path) {
+					return
+				}
+				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
+				UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
+				DeleteSidecarFiles(info.path)
 				_ = stem
-				return
-			}
-			// Never race another flow that owns this file right now (an active
-			// channel pipeline or the OutputDir watcher).  Their in-flight
-			// marker is cleared when they finish; the periodic scan (or the
-			// manual rescan) picks the file back up afterwards.
-			if IsUploadInFlight(info.path) {
-				return
-			}
-			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
-			UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
-			DeleteSidecarFiles(info.path)
-			_ = stem
-		}()
+			}()
 		}
 
 		// Process orphaned split A/V pairs (mux them first, then upload)
@@ -1245,6 +1259,15 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 	}
 
 	filename := filepath.Base(filePath)
+
+	// Safety net: if the file vanished since the caller generated thumbnails
+	// (e.g. a concurrent flow finalized/removed it), uploading it would only
+	// thrash every host for 3 attempts. Bail out — the next scan or merge
+	// re-creates it.
+	if _, err := os.Stat(filePath); err != nil {
+		recoveryLogf(filename, "file vanished before upload (%v) — skipping; will be retried", err)
+		return false
+	}
 
 	recoveryLogf(filename, "uploading %s", filename)
 
@@ -1744,6 +1767,16 @@ func mergeVideos(inputs []string, outputPath string) error {
 // should proceed with its normal upload logic (only when the feature is
 // disabled or the video meets the threshold with no pending segments).
 func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
+	// Serialize this channel's merges against processAllPendingSegments (which
+	// runs at startup/periodic orphan cleanup) so the shared stable merged-*
+	// name can never be renamed out from under a concurrent upload. The unique
+	// scratch name alone was not enough: two flows merging the SAME segments
+	// both renameOverwriting the stable path, deleting the file between the
+	// hash and the upload ("could not hash" / "0/5 successful").
+	mmu := mergeMu(ch.Config.Username)
+	mmu.Lock()
+	defer mmu.Unlock()
+
 	mu := pendingMu(ch.Config.Username)
 	mu.Lock()
 
@@ -1904,18 +1937,18 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			ch.Error("min-duration: merge failed: %v — segments remain pending for next recording", mErr)
 			return true
 		}
-		// Finalize to the stable name (best-effort; the scratch path is also valid).
-		stablePath := filepath.Join(pendingDir, stableName)
-		if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
-			mergedPath = stablePath
-		}
 		mu.Lock()
 
 		mergedDur, mErr := VideoDurationSeconds(mergedPath)
 		if mErr != nil {
-			// Keep the merged result pending rather than risking an upload of
-			// unconfirmed duration — the min-duration guarantee must never be
-			// violated just because probing failed.
+			// Keep the merged result pending under the stable name (best-effort)
+			// rather than risking an upload of unconfirmed duration — the
+			// min-duration guarantee must never be violated just because
+			// probing failed.
+			stablePath := filepath.Join(pendingDir, stableName)
+			if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
+				mergedPath = stablePath
+			}
 			ch.Warn("min-duration: could not probe merged result (%v) — keeping pending", mErr)
 			for _, s := range mergeInputs {
 				os.Remove(s)
@@ -1931,12 +1964,28 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			ch.Info("min-duration: merged %d segments = %.1fs (>= %ds) — uploading", len(mergeInputs), mergedDur, minDur)
 			mu.Unlock()
 
+			// Rename the unique scratch output to the STABLE merged-* name and
+			// upload from there, so the archive keeps a clean
+			// "<user>_YYYY-MM-DD_....mp4" filename and username extraction stays
+			// correct. Safe because mergeMu serializes this channel's merges —
+			// no concurrent flow can renameOverwrite the stable path out from
+			// under this upload. (The scratch name is still used for the ffmpeg
+			// encode so the output never collides with a "merged-*" input.)
+			stablePath := filepath.Join(pendingDir, stableName)
+			if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
+				mergedPath = stablePath
+			}
 			if ch.Config.Compress {
 				ch.CompressFile(mergedPath)
 			} else {
 				ch.MoveToOutputDir(mergedPath)
 			}
 		} else {
+			// Keep pending under the stable name so the next merge dedupes it.
+			stablePath := filepath.Join(pendingDir, stableName)
+			if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
+				mergedPath = stablePath
+			}
 			ch.Info("min-duration: merged %d segments = %.1fs (< %ds) — still pending", len(mergeInputs), mergedDur, minDur)
 			for _, s := range mergeInputs {
 				os.Remove(s)
@@ -1955,11 +2004,6 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 // This is called during startup orphan cleanup so short segments from a previous
 // run don't stay pending forever when no new recording arrives.
 func processAllPendingSegments() {
-	minDur := 0
-	if server.Config != nil {
-		minDur = server.Config.MinDurationBeforeUpload
-	}
-
 	dirs := []string{"videos"}
 	if server.Config != nil && server.Config.OutputDir != "" && server.Config.OutputDir != "videos" {
 		dirs = append(dirs, server.Config.OutputDir)
@@ -1974,123 +2018,170 @@ func processAllPendingSegments() {
 			if !ud.IsDir() {
 				continue
 			}
-			username := ud.Name()
-			mu := pendingMu(username)
-
-			mu.Lock()
-			segments := collectPendingSegmentsInDir(filepath.Join(pendingRoot, username))
-			if len(segments) < 1 {
-				mu.Unlock()
-				continue
-			}
-
-			// Quarantine corrupt segments so they can never poison a merge.
-			segments, quarantined := quarantineInvalidSegments(username, segments)
-			if quarantined > 0 {
-				recoveryLogf(filepath.Join(pendingRoot, username), "quarantined %d corrupt pending segment(s) for %s", quarantined, username)
-			}
-			if len(segments) < 1 {
-				mu.Unlock()
-				continue
-			}
-
-			// If min-duration is disabled, upload everything directly (legacy behavior).
-			if minDur <= 0 {
-				for _, s := range segments {
-					recoveryLogf(s, "recovery: uploading pending segment %s", filepath.Base(s))
-					mu.Unlock()
-					thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(s)
-					UploadOrphanedFile(s, thumbURL, spriteURL, previewURL)
-					_ = os.Remove(s)
-					mu.Lock()
-				}
-				_ = os.Remove(pendingSegmentsDir(username))
-				mu.Unlock()
-				continue
-			}
-
-			// Min-duration is enabled — merge segments and only upload if threshold met.
-			segCopy := make([]string, len(segments))
-			copy(segCopy, segments)
-			mu.Unlock()
-
-			// A single remaining segment can still be uploaded if it alone meets
-			// the threshold (e.g. all other segments were quarantined as corrupt).
-			if len(segCopy) == 1 {
-				singleDur, dErr := VideoDurationSeconds(segCopy[0])
-				if dErr == nil && singleDur >= float64(minDur) {
-					recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (>= %ds) — uploading", singleDur, minDur)
-					thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(segCopy[0])
-					UploadOrphanedFile(segCopy[0], thumbURL, spriteURL, previewURL)
-					_ = os.Remove(segCopy[0])
-				} else {
-					if dErr != nil {
-						recoveryLogf(segCopy[0], "recovery: could not probe single pending segment (%v) — keeping pending", dErr)
-					} else {
-						recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (< %ds) — keeping pending", singleDur, minDur)
-					}
-				}
-				continue
-			}
-
-			pendingDir := pendingSegmentsDir(username)
-			stableName := mergedPendingName(segments)
-			// Write to a unique scratch name first so the output can never
-			// collide with an existing "merged-*" input, then finalize.
-			mergedPath := filepath.Join(pendingDir, fmt.Sprintf(".merging-%d-%s", time.Now().UnixNano(), stableName))
-			recoveryLogf(segments[0], "recovery: merging %d pending segments for %s", len(segments), username)
-			if err := mergeVideos(segCopy, mergedPath); err != nil {
-				os.Remove(mergedPath)
-				recoveryLogf(segments[0], "recovery: merge failed for %s: %v — leaving segments pending", username, err)
-				continue
-			}
-			// Finalize to the stable name (best-effort; the scratch path is also valid).
-			if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr == nil {
-				mergedPath = filepath.Join(pendingDir, stableName)
-			}
-
-			mergedDur, durErr := VideoDurationSeconds(mergedPath)
-			if durErr != nil || mergedDur < float64(minDur) {
-				if durErr != nil {
-					recoveryLogf(mergedPath, "recovery: could not probe merged duration (%v) — keeping pending", durErr)
-				} else {
-					recoveryLogf(mergedPath, "recovery: merged = %.1fs (< %ds) — keeping pending", mergedDur, minDur)
-				}
-				mu.Lock()
-				for _, s := range segCopy {
-					os.Remove(s)
-				}
-				mu.Unlock()
-				continue
-			}
-
-			var totalInputDur float64
-			for _, s := range segCopy {
-				if d, e := VideoDurationSeconds(s); e == nil {
-					totalInputDur += d
-				}
-			}
-			if totalInputDur > 0 && mergedDur < totalInputDur*0.5 {
-				recoveryLogf(mergedPath, "recovery: merged output %.1fs is <50%% of total input %.1fs — streams may be incompatible, keeping pending",
-					mergedDur, totalInputDur)
-				mu.Lock()
-				for _, s := range segCopy {
-					os.Remove(s)
-				}
-				mu.Unlock()
-				continue
-			}
-
-			mu.Lock()
-			for _, s := range segCopy {
-				os.Remove(s)
-			}
-			mu.Unlock()
-			recoveryLogf(mergedPath, "recovery: merged = %.1fs (>= %ds) — uploading", mergedDur, minDur)
-			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(mergedPath)
-			UploadOrphanedFile(mergedPath, thumbURL, spriteURL, previewURL)
-			_ = os.Remove(mergedPath)
+			processPendingUserSegments(ud.Name())
 		}
+	}
+}
+
+// processPendingUserSegments processes one user's .pending directory: it
+// quarantines corrupt segments, merges the rest (when min-duration is enabled),
+// and uploads anything that meets the threshold. It takes the per-user mergeMu
+// so it can never run concurrently with handleMinDurationAndMerge on the same
+// segments — that concurrency previously let both flows renameOverwriting the
+// shared stable merged-* name out from under each other's upload.
+func processPendingUserSegments(username string) {
+	mmu := mergeMu(username)
+	mmu.Lock()
+	defer mmu.Unlock()
+
+	minDur := 0
+	if server.Config != nil {
+		minDur = server.Config.MinDurationBeforeUpload
+	}
+
+	mu := pendingMu(username)
+
+	mu.Lock()
+	segments := collectPendingSegmentsInDir(pendingSegmentsDir(username))
+	if len(segments) < 1 {
+		mu.Unlock()
+		return
+	}
+
+	// Quarantine corrupt segments so they can never poison a merge.
+	segments, quarantined := quarantineInvalidSegments(username, segments)
+	if quarantined > 0 {
+		recoveryLogf(pendingSegmentsDir(username), "quarantined %d corrupt pending segment(s) for %s", quarantined, username)
+	}
+	if len(segments) < 1 {
+		mu.Unlock()
+		return
+	}
+
+	// If min-duration is disabled, upload everything directly (legacy behavior).
+	if minDur <= 0 {
+		for _, s := range segments {
+			if IsUploadInFlight(s) {
+				continue // the pipeline owns this file right now
+			}
+			recoveryLogf(s, "recovery: uploading pending segment %s", filepath.Base(s))
+			mu.Unlock()
+			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(s)
+			// Keep the segment on failure: UploadOrphanedFile already removes the
+			// local copy on success (when DeleteLocalAfterUpload is set); a failed
+			// upload must leave the file in .pending for the next retry instead of
+			// discarding content that was never uploaded.
+			if UploadOrphanedFile(s, thumbURL, spriteURL, previewURL) {
+				_ = os.Remove(s)
+			}
+			mu.Lock()
+		}
+		_ = os.Remove(pendingSegmentsDir(username))
+		mu.Unlock()
+		return
+	}
+
+	// Min-duration is enabled — merge segments and only upload if threshold met.
+	segCopy := make([]string, len(segments))
+	copy(segCopy, segments)
+	mu.Unlock()
+
+	// A single remaining segment can still be uploaded if it alone meets
+	// the threshold (e.g. all other segments were quarantined as corrupt).
+	if len(segCopy) == 1 {
+		if !IsUploadInFlight(segCopy[0]) {
+			singleDur, dErr := VideoDurationSeconds(segCopy[0])
+			if dErr == nil && singleDur >= float64(minDur) {
+				recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (>= %ds) — uploading", singleDur, minDur)
+				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(segCopy[0])
+				// Keep on failure so the next scan can retry (see above).
+				if UploadOrphanedFile(segCopy[0], thumbURL, spriteURL, previewURL) {
+					_ = os.Remove(segCopy[0])
+				}
+			} else {
+				if dErr != nil {
+					recoveryLogf(segCopy[0], "recovery: could not probe single pending segment (%v) — keeping pending", dErr)
+				} else {
+					recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (< %ds) — keeping pending", singleDur, minDur)
+				}
+			}
+		}
+		return
+	}
+
+	pendingDir := pendingSegmentsDir(username)
+	stableName := mergedPendingName(segments)
+	// Write to a unique scratch name first so the output can never
+	// collide with an existing "merged-*" input, then finalize.
+	mergedPath := filepath.Join(pendingDir, fmt.Sprintf(".merging-%d-%s", time.Now().UnixNano(), stableName))
+	recoveryLogf(segments[0], "recovery: merging %d pending segments for %s", len(segments), username)
+	if err := mergeVideos(segCopy, mergedPath); err != nil {
+		os.Remove(mergedPath)
+		recoveryLogf(segments[0], "recovery: merge failed for %s: %v — leaving segments pending", username, err)
+		return
+	}
+
+	mergedDur, durErr := VideoDurationSeconds(mergedPath)
+	if durErr != nil || mergedDur < float64(minDur) {
+		// Keep pending under the stable name so the next merge dedupes it.
+		if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr == nil {
+			mergedPath = filepath.Join(pendingDir, stableName)
+		}
+		if durErr != nil {
+			recoveryLogf(mergedPath, "recovery: could not probe merged duration (%v) — keeping pending", durErr)
+		} else {
+			recoveryLogf(mergedPath, "recovery: merged = %.1fs (< %ds) — keeping pending", mergedDur, minDur)
+		}
+		mu.Lock()
+		for _, s := range segCopy {
+			os.Remove(s)
+		}
+		mu.Unlock()
+		return
+	}
+
+	var totalInputDur float64
+	for _, s := range segCopy {
+		if d, e := VideoDurationSeconds(s); e == nil {
+			totalInputDur += d
+		}
+	}
+	if totalInputDur > 0 && mergedDur < totalInputDur*0.5 {
+		// Keep pending under the stable name too.
+		if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr == nil {
+			mergedPath = filepath.Join(pendingDir, stableName)
+		}
+		recoveryLogf(mergedPath, "recovery: merged output %.1fs is <50%% of total input %.1fs — streams may be incompatible, keeping pending",
+			mergedDur, totalInputDur)
+		mu.Lock()
+		for _, s := range segCopy {
+			os.Remove(s)
+		}
+		mu.Unlock()
+		return
+	}
+
+	mu.Lock()
+	for _, s := range segCopy {
+		os.Remove(s)
+	}
+	mu.Unlock()
+	recoveryLogf(mergedPath, "recovery: merged = %.1fs (>= %ds) — uploading", mergedDur, minDur)
+	// Rename the unique scratch output to the STABLE merged-* name and
+	// upload from there so the archive keeps a clean filename and correct
+	// username (see handleMinDurationAndMerge). mergeMu guarantees no
+	// concurrent merge can renameOverwrite it out from under this upload.
+	stablePath := filepath.Join(pendingDir, stableName)
+	if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
+		mergedPath = stablePath
+	}
+	thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(mergedPath)
+	// Keep the merged file on failure: UploadOrphanedFile removes the local
+	// copy itself on success; a failed upload must leave the stable merged-*
+	// file in .pending so the next scan merges/retries it instead of discarding
+	// content that never reached any host.
+	if UploadOrphanedFile(mergedPath, thumbURL, spriteURL, previewURL) {
+		_ = os.Remove(mergedPath)
 	}
 }
 

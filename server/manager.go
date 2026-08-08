@@ -34,4 +34,16 @@ type IManager interface {
 	UploadEntries() *entity.UploadsResponse
 	ReportCFBlock(username string)
 	ResetCFBlock(username string)
+
+	// CFBlockedCount returns how many channels are currently in a
+	// Cloudflare-blocked state (used by the claim cycle to detect a starved
+	// node).
+	CFBlockedCount() int
+	// RequestCookieRefresh triggers a rate-limited cookie re-mint (scripts +
+	// Supabase reload) so a Cloudflare-starved node can recover without a
+	// restart.
+	RequestCookieRefresh()
+	// SetCookieRefreshFunc registers the function that re-mints this node's
+	// cookies; called by main.go at startup.
+	SetCookieRefreshFunc(fn func())
 }

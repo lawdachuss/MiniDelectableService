@@ -116,6 +116,19 @@ func (ch *Channel) Monitor(runID uint64) {
 			}
 		}
 		delayFn := func(_ uint, err error, _ *retry.Config) time.Duration {
+			// Cloudflare-blocked channels back off much longer than the normal
+			// interval: with hundreds of blocked channels a 1-minute retry
+			// floods Cloudflare and keeps the block alive, while the node-level
+			// cookie refresh needs minutes to mint a fresh cf_clearance anyway.
+			if errors.Is(err, internal.ErrCloudflareBlocked) {
+				mins := server.Config.CFRetryMinutes
+				if mins <= 0 {
+					mins = 5
+				}
+				base := time.Duration(mins) * time.Minute
+				jitter := time.Duration(rand.Int63n(int64(base/5))) - base/10 // ±10% of base
+				return base + jitter
+			}
 			if isExpectedOffline(err) {
 				base := time.Duration(server.Config.Interval) * time.Minute
 				jitter := time.Duration(rand.Int63n(int64(base/5))) - base/10 // ±10% of interval

@@ -87,6 +87,17 @@ func (fw *FileWatcher) addDir(dir string) error {
 	})
 }
 
+// isPendingPath returns true when any path component is the ".pending"
+// directory (short-video segments awaiting merge).
+func isPendingPath(path string) bool {
+	for _, comp := range strings.Split(path, string(os.PathSeparator)) {
+		if comp == ".pending" {
+			return true
+		}
+	}
+	return false
+}
+
 // videoExt returns true if the extension is a known video extension.
 func videoExt(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
@@ -200,6 +211,15 @@ func (fw *FileWatcher) processFile(filePath string) {
 	fw.mu.Unlock()
 
 	base := filepath.Base(filePath)
+
+	// Files under .pending/<user>/ belong to the min-duration merge system
+	// (merged-* results and .merging-* scratch files). The merge flow owns
+	// their full lifecycle (merge → probe → upload → remove); a watcher
+	// racing it was deleting merged files mid-upload, causing "could not hash"
+	// and "0/5 successful" upload failures. Never touch them here.
+	if isPendingPath(filePath) {
+		return
+	}
 
 	// File might have been deleted since the event
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {

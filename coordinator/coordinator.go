@@ -225,6 +225,17 @@ type ChannelManager interface {
 	// are kept assigned to this node across session boundaries and never
 	// auto-resumed, released, or flagged as stuck.
 	ManualPausedChannels() []ChannelPause
+
+	// CFBlockedCount returns how many channels are currently in a
+	// Cloudflare-blocked state. The claim cycle uses it to detect a
+	// Cloudflare-starved node (IP flagged) and shed its claims to the pool
+	// so healthy nodes can record the channels instead of the starved node
+	// hoarding them while retrying forever.
+	CFBlockedCount() int
+
+	// RequestCookieRefresh triggers a rate-limited cookie re-mint (scripts +
+	// Supabase reload) so a CF-starved node can recover without a restart.
+	RequestCookieRefresh()
 }
 
 // LivenessChecker is the interface for checking if a channel is currently live.

@@ -83,12 +83,19 @@ type mockChannelManager struct {
 	created      []*database.ChannelAssignment
 	removed      []string
 	manualPaused []ChannelPause
+	cfBlocked    int
 }
 
 func (m *mockChannelManager) CreateChannelFromAssignment(ca *database.ChannelAssignment) error {
 	m.created = append(m.created, ca)
 	return nil
 }
+
+func (m *mockChannelManager) CFBlockedCount() int {
+	return m.cfBlocked
+}
+
+func (m *mockChannelManager) RequestCookieRefresh() {} // no-op in tests
 
 func (m *mockChannelManager) RemoveChannelForReassignment(username string) error {
 	// Mirror the guard in manager.Manager: a channel the user explicitly
@@ -786,6 +793,52 @@ func TestRunClaimCycleReclaimsManualPausedAfterExcessRelease(t *testing.T) {
 	// RemoveChannelForReassignment keeps manual-paused channels).
 	if len(mgr.removed) != 0 {
 		t.Fatalf("manual-paused channel should not be removed, got %v", mgr.removed)
+	}
+}
+
+// TestRunClaimCycleStarvedSheds verifies the Cloudflare-starved shed: when
+// enough channels are simultaneously blocked (IP flagged, nothing can record),
+// the claim cycle releases all but a small probe set back to the pool and does
+// NOT claim anything, so healthy nodes can record the channels the starved
+// node was hoarding while retrying every minute.
+func TestRunClaimCycleStarvedSheds(t *testing.T) {
+	a := func(u string) database.ChannelAssignment {
+		return database.ChannelAssignment{Username: u, Site: "chaturbate", Status: "claimed", IsLive: false}
+	}
+	released := []database.ChannelAssignment{a("off1"), a("off2"), a("off3")}
+	mock := &mockClient{
+		stats: &database.AssignmentStats{
+			TotalPoolChannels: 12,
+			TotalAliveNodes:   2,
+			TotalLiveChannels: 0,
+		},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			"node-a": {a("off1"), a("off2"), a("off3"), a("off4"), a("off5"), a("off6")},
+		},
+		releasedExcess: released,
+	}
+	mgr := &mockChannelManager{cfBlocked: 6}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
+
+	c.runClaimCycleWith(mock)
+
+	// 6 offline, probe set 3 → 3 shed. Without the starved branch this cycle
+	// would be a no-op (myOfflineCount == maxOfflineAllowed, no claims) — the
+	// removals prove the starved shed ran.
+	if len(mgr.removed) != 3 {
+		t.Fatalf("expected 3 shed channels removed locally, got %v", mgr.removed)
+	}
+	for _, u := range []string{"off1", "off2", "off3"} {
+		found := false
+		for _, r := range mgr.removed {
+			if r == u {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected %s among removed, got %v", u, mgr.removed)
+		}
 	}
 }
 

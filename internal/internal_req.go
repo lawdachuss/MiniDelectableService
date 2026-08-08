@@ -20,6 +20,42 @@ func sharedTransport() http.RoundTripper {
 	return getSharedTransport()
 }
 
+// IsCloudflareChallenge reports whether an HTTP response is a Cloudflare
+// challenge/block page rather than real content. It matches on the status
+// codes Cloudflare uses for challenge/rate-limit pages (403, 429, 503, 410)
+// AND on the body markers present in the challenge HTML. The body check is
+// intentionally broad: cb.xxx varies the exact title ("Just a moment…",
+// "Attention Required! | Cloudflare") and can return the challenge on any
+// status, so a single shared helper keeps the GET and POST paths in sync.
+func IsCloudflareChallenge(status int, body string) bool {
+	// 429 (rate limited) and 503 always mean "upstream rejecting us right
+	// now" — treating them as a block backs the channel off instead of
+	// hammering the API with per-second retries (seen fleet-wide on cb.xxx
+	// serving "Just a moment…" pages at HTTP 429/410 to an over-claiming node).
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status == http.StatusGone {
+		return true
+	}
+	snippet := body
+	if len(snippet) > 4096 {
+		snippet = snippet[:4096]
+	}
+	lower := strings.ToLower(snippet)
+	// Body markers are Cloudflare-specific challenge HTML.
+	if strings.Contains(lower, "just a moment") ||
+		strings.Contains(lower, "attention required") ||
+		strings.Contains(lower, "cf-chl") ||
+		strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "cf-chl-box") ||
+		strings.Contains(lower, "enable javascript") {
+		return true
+	}
+	// A bare 403 is ambiguous: cb.xxx returns it for private shows too, which
+	// are an expected per-channel state. Only classify a 403 as a challenge
+	// when the body already matched a Cloudflare marker above (handled) — a
+	// markerless 403 stays a private show.
+	return false
+}
+
 // WaitForChaturbateRateLimit blocks until a rate-limit slot is available.
 // Call this before every Chaturbate API request to avoid triggering
 // Cloudflare's DDoS protection when many channels reconnect simultaneously.
@@ -167,8 +203,8 @@ func (h *Req) GetBytes(ctx context.Context, url string) ([]byte, error) {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	// Check for Cloudflare protection
-	if strings.Contains(string(b), "<title>Just a moment...</title>") {
+	// Check for Cloudflare protection (challenge page or 403/429/503 status)
+	if IsCloudflareChallenge(resp.StatusCode, string(b)) {
 		return nil, ErrCloudflareBlocked
 	}
 
@@ -245,8 +281,8 @@ func (h *Req) GetBytesWithTimeout(ctx context.Context, url string, timeout time.
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	// Check for Cloudflare protection
-	if strings.Contains(string(b), "<title>Just a moment...</title>") {
+	// Check for Cloudflare protection (challenge page or 403/429/503 status)
+	if IsCloudflareChallenge(resp.StatusCode, string(b)) {
 		return nil, ErrCloudflareBlocked
 	}
 
