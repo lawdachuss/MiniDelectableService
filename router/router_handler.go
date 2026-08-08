@@ -1098,6 +1098,12 @@ func scanOrphanFiles() []orphanEntry {
 			if strings.Contains(name, ".video.") || strings.Contains(name, ".audio.") || strings.Contains(name, ".muxed.") {
 				continue
 			}
+			// Never force-upload ffmpeg finalizer scratch files — a crash
+			// mid-finalize leaves a partial "<base>.finalizing.mp4" behind
+			// that probes as corrupt and must never reach the hosts.
+			if channel.IsFinalizingTemp(name) || strings.Contains(name, ".deleting.") {
+				continue
+			}
 			if uploaded[name] {
 				continue // not orphaned — already uploaded
 			}

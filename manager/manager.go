@@ -80,6 +80,16 @@ type Manager struct {
 	logRateLimit   map[string]time.Time
 	logRateLimitMu sync.Mutex
 
+	// thumbThrottle spaces out thumbnail regeneration so a mass backfill
+	// (fresh node, wiped preview_images, host-outage recovery) can't exceed
+	// the image hosts' rate limits, and skips files attempted recently so a
+	// permanently-broken recording isn't re-hammered on every scan.
+	// thumbScanning guards against the startup scan and the periodic ticker
+	// overlapping (both would pass the cooldown check before either records).
+	thumbThrottle   map[string]time.Time
+	thumbThrottleMu sync.Mutex
+	thumbScanning   bool
+
 	// renderCache caches the last-rendered channel_info HTML per
 	// channel.  Publish() skips the SSE push when the fingerprint
 	// is unchanged, which eliminates redundant template execution
@@ -173,11 +183,12 @@ func New() (*Manager, error) {
 	updateStream.AutoReplay = false
 
 	return &Manager{
-		SSE:          server,
-		logRateLimit: make(map[string]time.Time),
-		renderCache:  make(map[string]*renderCacheEntry),
-		WatcherDone:  make(chan struct{}),
-		cfBlocked:    make(map[string]struct{}),
+		SSE:           server,
+		logRateLimit:  make(map[string]time.Time),
+		thumbThrottle: make(map[string]time.Time),
+		renderCache:   make(map[string]*renderCacheEntry),
+		WatcherDone:   make(chan struct{}),
+		cfBlocked:     make(map[string]struct{}),
 	}, nil
 }
 
@@ -493,6 +504,20 @@ func (m *Manager) HasPendingSegments(username string) bool {
 	return false
 }
 
+// ChannelMinDurationBeforeUpload implements server.IManager.  It returns the
+// live channel's per-channel min-duration-before-upload setting, so the
+// orphan/pending flows gate with the same threshold the channel flow uses
+// (a channel configured with 1200s in the pool stays gated even when the
+// node's global MIN_DURATION_BEFORE_UPLOAD env var is unset).
+func (m *Manager) ChannelMinDurationBeforeUpload(username string) int {
+	if v, ok := m.Channels.Load(username); ok {
+		if ch, ok := v.(*channel.Channel); ok {
+			return ch.Config.MinDurationBeforeUpload
+		}
+	}
+	return 0
+}
+
 // ManualPausedChannels implements coordinator.ChannelManager: returns the
 // channels the user explicitly paused (pause reason = manual), so the
 // coordinator can re-claim them for this node at session boundaries and keep
@@ -544,9 +569,36 @@ func (m *Manager) RemoveChannelForReassignment(username string) error {
 	return nil
 }
 
+const (
+	// thumbBackfillSpacing is the delay between consecutive thumbnail
+	// regenerations inside one scan.  Image hosts (ImgBB ≈50 uploads/h/key,
+	// Pixhost/Catbox with burst limits) rate-limit bulk uploads; spacing a
+	// mass backfill turns a storm into a trickle.
+	thumbBackfillSpacing = 2 * time.Second
+	// thumbRetryCooldown skips files attempted within this window.  A
+	// permanently-broken recording would otherwise be re-hammered (3 hosts ×
+	// 3 attempts) on every startup and periodic scan.
+	thumbRetryCooldown = 45 * time.Minute
+)
+
 // ScanThumbnails walks the videos directory and generates thumbnails for any
 // video file that is missing preview URLs in Supabase.
 func (m *Manager) ScanThumbnails() {
+	// Re-entrancy guard: a slow backfill (2s/file) must never overlap with a
+	// later startup or periodic scan — both would regenerate the same files.
+	m.thumbThrottleMu.Lock()
+	if m.thumbScanning {
+		m.thumbThrottleMu.Unlock()
+		return
+	}
+	m.thumbScanning = true
+	m.thumbThrottleMu.Unlock()
+	defer func() {
+		m.thumbThrottleMu.Lock()
+		m.thumbScanning = false
+		m.thumbThrottleMu.Unlock()
+	}()
+
 	// .ts is included so legacy HLS recordings (finalize-mode=none) also get
 	// thumbnail backfill; with remux enabled the finalized files are .mp4.
 	videoExts := map[string]bool{".mp4": true, ".mkv": true, ".ts": true}
@@ -568,6 +620,13 @@ func (m *Manager) ScanThumbnails() {
 			if strings.HasSuffix(info.Name(), ".video.mp4") || strings.HasSuffix(info.Name(), ".audio.mp4") {
 				return nil
 			}
+			// Skip ffmpeg finalizer scratch files — a crash mid-finalize leaves
+			// a partial "<base>.finalizing.mp4" that cannot produce a valid
+			// preview/sprite (the "complex filter failed" failures) and must
+			// not be re-hammered on every scan.
+			if channel.IsFinalizingTemp(info.Name()) || strings.Contains(info.Name(), ".deleting.") {
+				return nil
+			}
 			// Skip files a pipeline is currently processing — it generates its
 			// own thumbnails.  Racing it would collide on the shared sidecar
 			// filenames and could cause spurious thumbnail failures.
@@ -579,12 +638,30 @@ func (m *Manager) ScanThumbnails() {
 			if thumbURL != "" && spriteURL != "" && previewURL != "" {
 				return nil
 			}
+			// Skip files attempted within the cooldown window — a broken file
+			// is not re-hammered on every scan, and overlapping directories
+			// (e.g. videos/ == OutputDir) never double-generate.
+			m.thumbThrottleMu.Lock()
+			last, seen := m.thumbThrottle[path]
+			m.thumbThrottleMu.Unlock()
+			if seen && time.Since(last) < thumbRetryCooldown {
+				return nil
+			}
 			newThumb, newSprite, newPreview := channel.GenerateThumbnailForFile(path)
+			// Record the attempt regardless of outcome so failures cool down
+			// too instead of burning host attempts on every single scan.
+			m.thumbThrottleMu.Lock()
+			m.thumbThrottle[path] = time.Now()
+			m.thumbThrottleMu.Unlock()
 			if newThumb != "" || newSprite != "" || newPreview != "" {
 				if err := server.SavePreviewLinks(info.Name(), newThumb, newSprite, newPreview); err != nil {
 					log.Printf("[thumb] failed to save preview links for %s: %v", info.Name(), err)
 				}
 			}
+			// Space regenerations so a mass backfill cannot exceed the image
+			// hosts' rate limits (the fleet-wide "imgbb: rate limit reached"
+			// failures).
+			time.Sleep(thumbBackfillSpacing)
 			return nil
 		})
 	}

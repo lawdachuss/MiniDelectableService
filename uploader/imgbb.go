@@ -15,6 +15,35 @@ import (
 
 const imgbbAPIURL = "https://api.imgbb.com/1/upload"
 
+// imgbbGlobal throttling: ImgBB's free tier rate-limits bursts (~1 upload/s
+// per key, ~50/h per key).  During a host outage (e.g. Catbox 520) or a mass
+// thumbnail backfill, every preview falls back to ImgBB; an unthrottled burst
+// exhausts the key ring in seconds (the fleet-wide "imgbb: HTTP 400: rate
+// limit reached" failures).  Spacing calls process-wide turns the burst into
+// a steady trickle that stays within quota.
+var (
+	imgbbMu         sync.Mutex
+	imgbbLastUpload time.Time
+)
+
+// imgbbMinInterval is the minimum spacing between ImgBB API calls.  With a
+// 6-key ring and ~50 uploads/h per key the aggregate quota is ~300/h, so 1s
+// spacing (3600/h ceiling) still exceeds quota during an outage — the uploads
+// then fail fast and are retried later by the throttled ScanThumbnails pass.
+// The point is to stop the second-long burst that burns every key at once.
+const imgbbMinInterval = time.Second
+
+// throttleImgBB sleeps until imgbbMinInterval has elapsed since the previous
+// ImgBB API call, then records the call time.  Safe for concurrent callers.
+func throttleImgBB() {
+	imgbbMu.Lock()
+	defer imgbbMu.Unlock()
+	if d := imgbbMinInterval - time.Since(imgbbLastUpload); d > 0 {
+		time.Sleep(d)
+	}
+	imgbbLastUpload = time.Now()
+}
+
 type imgbbResponse struct {
 	Data struct {
 		URL string `json:"url"`
@@ -109,6 +138,9 @@ func (u *ImgBBUploader) Upload(filePath string) (string, error) {
 	attempts := u.keys.count()
 	var lastErr error
 	for i := 0; i < attempts; i++ {
+		// Space API calls process-wide so a burst can't exhaust every key
+		// in a single tick (see throttleImgBB).
+		throttleImgBB()
 		key := u.keys.current()
 		form := url.Values{
 			"key":   {key},

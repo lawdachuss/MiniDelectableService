@@ -59,6 +59,9 @@ func (s *stubManager) StopWatcher()               {}
 func (s *stubManager) CFBlockedCount() int        { return 0 }
 func (s *stubManager) RequestCookieRefresh()      {}
 func (s *stubManager) SetCookieRefreshFunc(func()) {}
+func (s *stubManager) ChannelMinDurationBeforeUpload(username string) int {
+	return 0
+}
 func (s *stubManager) StartSession(duration time.Duration) {
 }
 func (s *stubManager) StopSession() {}

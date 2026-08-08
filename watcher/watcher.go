@@ -106,7 +106,9 @@ func videoExt(name string) bool {
 
 // isSidecar returns true if the filename appears to be a sidecar/preview file.
 // Note: .video.muxed.mp4 is the final muxed output (not a sidecar), while
-// .video.mp4 and .audio.mp4 are raw A/V track files (sidecars).
+// .video.mp4 and .audio.mp4 are raw A/V track files (sidecars).  Finalizer
+// scratch files ("<base>.finalizing.<ext>") and deletion-in-progress
+// leftovers ("<base>.deleting.N") are also never real videos.
 func isSidecar(name string) bool {
 	return strings.HasSuffix(name, ".thumb.webp") ||
 		strings.HasSuffix(name, ".thumb.jpg") ||
@@ -117,7 +119,9 @@ func isSidecar(name string) bool {
 		strings.HasSuffix(name, ".thumb") ||
 		strings.HasSuffix(name, ".sprite") ||
 		strings.HasSuffix(name, ".video.mp4") ||
-		strings.HasSuffix(name, ".audio.mp4")
+		strings.HasSuffix(name, ".audio.mp4") ||
+		channel.IsFinalizingTemp(name) ||
+		strings.Contains(name, ".deleting.")
 }
 
 // Start begins watching for new files. It blocks until the context is done.

@@ -39,6 +39,13 @@ type IManager interface {
 	// Cloudflare-blocked state (used by the claim cycle to detect a starved
 	// node).
 	CFBlockedCount() int
+	// ChannelMinDurationBeforeUpload returns the per-channel
+	// min-duration-before-upload setting for a live channel (0 when the
+	// channel is unknown or the feature is disabled for it).  Orphan and
+	// pending-segment flows use this so a channel configured with a 1200s
+	// threshold in the pool is gated even when the node's global
+	// MIN_DURATION_BEFORE_UPLOAD env var is unset.
+	ChannelMinDurationBeforeUpload(username string) int
 	// RequestCookieRefresh triggers a rate-limited cookie re-mint (scripts +
 	// Supabase reload) so a Cloudflare-starved node can recover without a
 	// restart.

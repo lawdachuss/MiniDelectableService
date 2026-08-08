@@ -770,23 +770,40 @@ func moveFile(src, dest string) error {
 
 // ─── Min-duration pending segments ─────────────────────────────────────────
 
+// resolveMinDurationBeforeUpload returns the effective min-duration-before-
+// upload threshold for a channel, mirroring handleMinDurationAndMerge:
+// the per-channel setting (pool DB / channels.json) wins, falling back to the
+// server-global flag.  Orphan and pending-segment flows MUST use the same
+// value the channel flow gates with — otherwise a channel configured with a
+// 1200s threshold in the pool would have its short segments parked by the
+// channel flow and then uploaded directly by the orphan/pending flows on any
+// node whose global MIN_DURATION_BEFORE_UPLOAD env var is unset.
+func resolveMinDurationBeforeUpload(username string) int {
+	if server.Manager != nil {
+		if v := server.Manager.ChannelMinDurationBeforeUpload(username); v > 0 {
+			return v
+		}
+	}
+	if server.Config != nil {
+		return server.Config.MinDurationBeforeUpload
+	}
+	return 0
+}
+
 // MaybeDeferToPending checks whether min-duration is enabled and, if so,
 // whether filePath is short enough to be deferred.  When the file should be
 // deferred (or on probe failure — we'd rather be safe) it is moved into
 // .pending/<user>/ and the function returns true so callers skip upload.
 func MaybeDeferToPending(filePath string) bool {
-	minDur := 0
-	if server.Config != nil {
-		minDur = server.Config.MinDurationBeforeUpload
-	}
-	if minDur <= 0 {
-		return false // feature disabled — upload directly
-	}
-
 	username := extractUsernameFromFilename(filepath.Base(filePath))
 	if username == "" {
 		// Can't determine the user; fall back to "unknown"
 		username = "unknown"
+	}
+
+	minDur := resolveMinDurationBeforeUpload(username)
+	if minDur <= 0 {
+		return false // feature disabled — upload directly
 	}
 
 	dur, err := VideoDurationSeconds(filePath)
@@ -841,6 +858,14 @@ func CleanupOrphanedFiles() {
 		if err != nil {
 			continue
 		}
+
+		// Remove ffmpeg finalizer scratch files ("<base>.finalizing.<ext>")
+		// left behind by a crash mid-finalize.  The original recording is
+		// still on disk — the finalizer only deletes it after a successful
+		// rename — so the partial scratch is pure garbage.  Only age them out
+		// past the finalize timeout (30 min): a live finalize may still be
+		// writing one.
+		removeStaleFinalizingScratch(dir)
 
 		// Classify files by type
 		type fileInfo struct {
@@ -1040,6 +1065,52 @@ func CleanupOrphanedFiles() {
 					os.Remove(path)
 				}
 				break
+			}
+		}
+	}
+}
+
+// removeStaleFinalizingScratch deletes transient scratch files whose mtime is
+// older than the finalize timeout:
+//   - ffmpeg finalizer scratch files ("<base>.finalizing.<ext>") — a crash
+//     mid-finalize (process kill, RDP node restart) leaves the partial scratch
+//     behind while the original recording is still present, so the scratch is
+//     pure garbage that must never be uploaded or thumbnailed;
+//   - deletion-in-progress leftovers ("<base>.deleting.N") from
+//     removeFileWithRetry's rename-then-delete strategy — a crash between the
+//     rename and the remove strands a dead copy of an already-uploaded file.
+//
+// The 35-minute age threshold is safe because ffmpeg writes the scratch file
+// continuously while it runs, keeping its mtime fresh — a scratch older than
+// ~35 minutes means ffmpeg has not written to it for that long, i.e. the
+// finalize is dead (the strict + rescue passes each have a 30-minute budget,
+// but an in-progress pass keeps the mtime current until its last write).
+// Even in the one adversarial case — a rescue pass waiting on the
+// process-wide FFmpegHeavy semaphore with a stale scratch — the rescue pass
+// itself calls os.Remove(tempOutput) before running, so ffmpeg simply
+// recreates the file; the original recording is never touched.
+func removeStaleFinalizingScratch(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	const maxAge = 35 * time.Minute
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !IsFinalizingTemp(name) && !strings.Contains(name, ".deleting.") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if time.Since(info.ModTime()) > maxAge {
+			path := filepath.Join(dir, e.Name())
+			if os.Remove(path) == nil {
+				log.Printf("[cleanup] removed stale scratch file %s", e.Name())
 			}
 		}
 	}
@@ -2034,10 +2105,7 @@ func processPendingUserSegments(username string) {
 	mmu.Lock()
 	defer mmu.Unlock()
 
-	minDur := 0
-	if server.Config != nil {
-		minDur = server.Config.MinDurationBeforeUpload
-	}
+	minDur := resolveMinDurationBeforeUpload(username)
 
 	mu := pendingMu(username)
 
@@ -2194,6 +2262,16 @@ func videoExt(name string) bool {
 // isSidecar returns true if the filename appears to be a sidecar/preview file.
 // Note: .video.muxed.mp4 is the final muxed output (not a sidecar), while
 // .video.mp4 and .audio.mp4 are raw A/V track files (sidecars).
+// IsFinalizingTemp reports whether name is an ffmpeg finalizer scratch file
+// ("<base>.finalizing.<ext>").  The finalizer writes to this temporary name
+// and only renames it to the final output on success; a crash mid-finalize
+// leaves a partial file behind that must never be uploaded, thumbnailed, or
+// merged into pending segments.  (ext alone is not enough — a "foo.finalizing.mp4"
+// has extension .mp4 and would otherwise be treated as a real video.)
+func IsFinalizingTemp(name string) bool {
+	return strings.Contains(name, ".finalizing")
+}
+
 func isSidecar(name string) bool {
 	return strings.HasSuffix(name, ".thumb.webp") ||
 		strings.HasSuffix(name, ".thumb.jpg") ||
@@ -2204,5 +2282,7 @@ func isSidecar(name string) bool {
 		strings.HasSuffix(name, ".thumb") ||
 		strings.HasSuffix(name, ".sprite") ||
 		strings.HasSuffix(name, ".video.mp4") ||
-		strings.HasSuffix(name, ".audio.mp4")
+		strings.HasSuffix(name, ".audio.mp4") ||
+		IsFinalizingTemp(name) ||
+		strings.Contains(name, ".deleting.")
 }
