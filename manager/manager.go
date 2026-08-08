@@ -417,7 +417,9 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 			ch.MarkAutoResumedFromPause()
 			ch.Resume(0)
 			// Browser-visible log (SSE) + stdout so the node web UI shows why
-			// this channel came back from a stuck-paused state.
+			// this channel came back from a stuck-paused state. Logged after
+			// Resume so the browser log reads in order: "channel resumed",
+			// then the recovery explanation.
 			ch.Info("channel was paused but still assigned — automatically resumed (stuck-pause recovery)")
 		}
 		return nil
