@@ -633,9 +633,18 @@ func (m *Manager) ScanThumbnails() {
 			if channel.IsUploadInFlight(path) {
 				return nil
 			}
-			// Only process files that are missing any preview URLs in Supabase
-			thumbURL, spriteURL, previewURL := server.LoadPreviewLinks(info.Name())
-			if thumbURL != "" && spriteURL != "" && previewURL != "" {
+			// Only regenerate when the THUMBNAIL — the asset actually shown on the
+			// video card — is missing.  Requiring all three pieces to be present
+			// made a preview-only failure (Catbox down, ImgBB rate-limited — the
+			// animated WEBP preview fails fleet-wide while thumb+sprite succeed)
+			// regenerate AND re-upload the working thumbnail and sprite to the
+			// image hosts on every 45-min cooldown window.  That self-inflicted
+			// loop is what burns Pixhost/ImgBB quota and causes the fleet-wide
+			// "rate limit reached" failures.  A missing sprite/preview is
+			// cosmetic and can never succeed while the host is down; a missing
+			// thumbnail is not.
+			thumbURL, _, _ := server.LoadPreviewLinks(info.Name())
+			if thumbURL != "" {
 				return nil
 			}
 			// Skip files attempted within the cooldown window — a broken file

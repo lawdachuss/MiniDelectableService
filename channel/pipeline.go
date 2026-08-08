@@ -170,9 +170,20 @@ func pipelineFromDBState(s *database.PipelineState) *Pipeline {
 	return p
 }
 
-// stageThumbnail generates thumbnails, sprite, preview and uploads to Pixhost.
-// Does NOT advance the pipeline stage — the caller (processPipeline) manages
-// stage transitions after both thumbnail and upload finish in parallel.
+// stageThumbnail generates thumbnails, sprite, preview and uploads to image
+// hosts, then persists the URLs to Supabase IMMEDIATELY.
+//
+// Persisting here (rather than only in stageSaveMetadata) is deliberate: the
+// thumbnail generation runs in parallel with the video upload, and the video
+// upload can take many minutes (multi-GB files, multiple hosts) or fail
+// entirely (all hosts down).  If the preview links were only saved after the
+// upload, a slow or failed upload would leave the recording with NO thumbnail
+// in the UI for a long time — or forever (a failed pipeline never reaches
+// stageSaveMetadata).  Saving as soon as generation finishes makes the
+// thumbnail appear the moment the ffmpeg work completes, independent of the
+// video upload.  stageSaveMetadata later re-saves (idempotent upsert by
+// filename), and the retry path's early-return below avoids re-generating
+// pieces that already succeeded.
 func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	if p.ThumbURL != "" && p.SpriteURL != "" && p.PreviewURL != "" {
 		return nil
@@ -189,6 +200,18 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	}
 	if p.PreviewURL == "" {
 		p.PreviewURL = previewURL
+	}
+
+	// Persist whatever succeeded right away — the thumbnail must not wait for
+	// the (slow or failing) video upload to complete.  Best-effort: if the DB
+	// write fails, stageSaveMetadata retries it and the throttled
+	// ScanThumbnails backfill is a final safety net.
+	if p.ThumbURL != "" || p.SpriteURL != "" || p.PreviewURL != "" {
+		if err := server.SavePreviewLinks(p.Filename, p.ThumbURL, p.SpriteURL, p.PreviewURL); err != nil {
+			ch.Warn("pipeline: could not save preview links early for %s: %v", p.Filename, err)
+		} else {
+			ch.Info("pipeline: saved preview links early for %s", p.Filename)
+		}
 	}
 	return nil
 }
@@ -425,10 +448,15 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 
 // stageSaveMetadata persists recording metadata and all links to Supabase.
 func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
-	// Retry thumbnail generation if any piece is still missing after the
-	// StageThumbnailUpload pass.  Filling in only the missing pieces keeps
-	// whatever partial success already happened.
-	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
+	// Retry thumbnail generation if the THUMBNAIL — the asset actually shown
+	// on the video card — is still missing.  Gate on the thumbnail only, NOT
+	// on the sprite/preview: the animated preview frequently fails (Catbox
+	// down, ImgBB rate-limited), and re-generating all three pieces for a
+	// file whose thumbnail already succeeded would re-upload the working
+	// thumbnail and sprite to the image hosts on every retry — exactly the
+	// host-hammering loop that causes the fleet-wide rate-limit failures.
+	// A missing sprite/preview is cosmetic; a missing thumbnail is not.
+	if p.ThumbURL == "" {
 		thumbURL, spriteURL, previewURL := ch.generateThumbnail(p.FilePath)
 		generated := false
 		if p.ThumbURL == "" && thumbURL != "" {
@@ -833,12 +861,20 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 			thumbErr = p.stageThumbnail(ch)
 		}()
 
-		// Start video upload in background (acquires UploadSem)
+		// Start video upload in background.
+		//
+		// UploadSem is NOT acquired here: stageUploadVideos runs its upload
+		// inside DoWithRetry(..., WithUploadSem()), and the retry manager
+		// worker acquires UploadSem right before executing the job.  An outer
+		// acquire here would hold a slot for the entire wait on the retry
+		// result channel while the worker waits for a DIFFERENT slot — with
+		// enough concurrent pipelines the semaphore saturates, every pipeline
+		// waits on its own held slot, the workers starve, and the whole node
+		// deadlocks at the thumbnail_upload stage (seen in production: all
+		// pipeline states frozen at thumbnail_upload with updated==created).
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			UploadSem <- struct{}{}
-			defer func() { <-UploadSem }()
 			defer func() {
 				if r := recover(); r != nil {
 					ch.Error("pipeline: upload goroutine panicked for %s: %v", filename, r)

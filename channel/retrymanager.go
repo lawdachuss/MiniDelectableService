@@ -34,7 +34,16 @@ const (
 	defaultMaxAttempts = 3
 	defaultBaseBackoff = 5 * time.Second
 	maxBackoff         = 10 * time.Minute
-	numWorkers         = 2
+	// numWorkers is how many retry jobs execute concurrently.  The global
+	// UploadSem (cap 100) and the per-host upload semaphores (cap 8/host) are
+	// the real throughput governors, so the worker pool must be large enough
+	// to actually saturate them — a 2-worker pool serialized every video
+	// upload on a node behind a massive backlog, which delayed stageSaveMetadata
+	// (and therefore thumbnail persistence) for hours while the queue drained.
+	// 8 workers fills the per-host caps (8 files × ~5 hosts each) without
+	// exceeding UploadSem; DoWithRetry callers still wait on their result
+	// channel, so jobs simply queue when the pool is busy.
+	numWorkers = 8
 )
 
 // NewRetryManager creates a new RetryManager.

@@ -58,6 +58,11 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       DATABASE_PASSWORD: ${{ secrets.DATABASE_PASSWORD }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      # Route Catbox image uploads through the Cloudflare Worker proxy. Without
+      # this the nodes hit Catbox directly from datacenter/VPS IPs and get
+      # HTTP 412 "Invalid uploader" blocks (the whole reason the proxy exists).
+      CATBOX_PROXY_URL: ${{ secrets.CATBOX_PROXY_URL }}
+      CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
 
     steps:
       - uses: actions/checkout@v4
