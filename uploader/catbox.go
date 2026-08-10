@@ -19,8 +19,9 @@ import (
 // When a CatboxProxyURL is configured, uploads are routed through
 // the proxy Cloudflare Worker instead of going directly to catbox.moe.
 type CatboxUploader struct {
-	client  *http.Client
-	proxyURL string
+	client    *http.Client
+	proxyURL  string
+	userHash  string
 }
 
 // NewCatboxUploader creates a new Catbox.moe uploader.
@@ -38,7 +39,7 @@ func NewCatboxUploader() *CatboxUploader {
 
 	proxyURL := ""
 	if server.Config != nil {
-		proxyURL = server.Config.CatboxProxyURL
+		proxyURL = strings.Trim(server.Config.CatboxProxyURL, `"`)
 	}
 
 	return &CatboxUploader{
@@ -47,6 +48,7 @@ func NewCatboxUploader() *CatboxUploader {
 			Transport: transport,
 		},
 		proxyURL: proxyURL,
+		userHash: os.Getenv("CATBOX_USERHASH"),
 	}
 }
 
@@ -104,6 +106,11 @@ func (u *CatboxUploader) uploadOnce(filePath string) (string, error) {
 
 	if err := mw.WriteField("reqtype", "fileupload"); err != nil {
 		return "", fmt.Errorf("catbox: write reqtype: %w", err)
+	}
+	if u.userHash != "" {
+		if err := mw.WriteField("userhash", u.userHash); err != nil {
+			return "", fmt.Errorf("catbox: write userhash: %w", err)
+		}
 	}
 	if _, err := mw.CreateFormFile("fileToUpload", filepath.Base(filePath)); err != nil {
 		return "", fmt.Errorf("catbox: create form file: %w", err)
