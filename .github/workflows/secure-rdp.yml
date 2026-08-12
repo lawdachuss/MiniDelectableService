@@ -26,9 +26,11 @@ permissions:
 
 env:
   GH_TOKEN: ${{ github.token }}
-  # Opt into Node 24 now (default since June 16, 2026) and keep the safety
-  # valve for any action that has not been rebuilt yet.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Node 24 is the Actions default since June 16, 2026. Keep the temporary
+  # escape hatch so any action that has not been rebuilt for Node 24 yet can
+  # still run on its old runtime. (FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 was
+  # removed: setting it AND the escape hatch together is flagged by GitHub as
+  # a configuration error, and forcing the default is redundant.)
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
 jobs:
