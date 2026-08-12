@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"log"
+	"os"
 	"time"
 )
 
@@ -13,10 +14,65 @@ import (
 // duplicate capture.
 const maxHeartbeatFailures = 4
 
+// heartbeatWatchdogStale is how long without a successful Supabase heartbeat
+// before the heartbeat watchdog declares the node hung. The heartbeat tick
+// goroutine can wedge (e.g. a pooled HTTP connection that never returns, a
+// deadlocked DB call, or a frozen goroutine) while the rest of the process —
+// recording, uploads, other Supabase saves — keeps working. In that state the
+// node's channels are still being recorded locally while the reaper on another
+// node marks it offline and reclaims them (duplicate capture), and
+// keep-alive.ps1's $dvr.HasExited restart never fires because the process is
+// still alive. 8 minutes is comfortably above the 4-failure fence (~2 min) and
+// the DB client's retry windows, and short enough that a hung node recovers
+// well before GitHub force-kills the run (~45+ min later, the observed
+// fleet-wide "sessions die ~4h into a 5h25m session" pattern).
+const heartbeatWatchdogStale = 8 * time.Minute
+
+// heartbeatFatalExit is overridable in tests so the watchdog's CI force-exit
+// can be asserted without terminating the test binary.
+var heartbeatFatalExit = os.Exit
+
+// heartbeatWatchdogCheck reports how long the node has gone without a
+// successful heartbeat when that exceeds heartbeatWatchdogStale, or 0 when the
+// node is healthy. A zero last-success time (never heartbeated yet, e.g. right
+// after boot), a draining node (graceful shutdown), and a FENCED node are
+// never flagged: a fence means heartbeats are failing with explicit errors
+// (DB/network outage) and the fence already handles recovery — force-exiting
+// every node on top of that would create a fleet-wide restart storm. The
+// watchdog targets the OTHER failure mode: heartbeats silently stopping with
+// no errors at all (a wedged tick, e.g. a blocked pooled connection), which
+// never trips the fence and which keep-alive's $dvr.HasExited can never see.
+func heartbeatWatchdogCheck(last time.Time, draining, fenced bool) time.Duration {
+	if last.IsZero() || draining || fenced {
+		return 0
+	}
+	stale := time.Since(last)
+	if stale < heartbeatWatchdogStale {
+		return 0
+	}
+	return stale
+}
+
+// heartbeatWatchdogAct reacts to a detected hang: on CI runners (GITHUB_RUN_ID
+// set) it force-exits so keep-alive.ps1 restarts the DVR with the remaining
+// session duration; permanent nodes only log (an operator monitors those).
+func (c *Coordinator) heartbeatWatchdogAct(stale time.Duration) {
+	if os.Getenv("GITHUB_RUN_ID") != "" {
+		log.Printf("[coordinator] HEARTBEAT WATCHDOG: no successful heartbeat for %v (> %v) — heartbeat tick wedged; force-exiting so keep-alive restarts the DVR",
+			stale.Round(time.Second), heartbeatWatchdogStale)
+		heartbeatFatalExit(1)
+	} else {
+		log.Printf("[coordinator] HEARTBEAT WATCHDOG: no successful heartbeat for %v (> %v) — heartbeat tick likely wedged (permanent node, not exiting)",
+			stale.Round(time.Second), heartbeatWatchdogStale)
+	}
+}
+
 // StartHeartbeatLoop periodically updates the node's last_heartbeat timestamp.
 // Runs every 30 seconds until the context is cancelled or Stop() is called.
 // If the heartbeat fails repeatedly it fences the node (stops local recording
 // and releases channels) to prevent duplicate recording during a partition.
+// Each successful heartbeat also records lastHeartbeatOK, which the heartbeat
+// watchdog (StartHeartbeatWatchdog) uses to detect a wedged tick.
 func (c *Coordinator) StartHeartbeatLoop(ctx context.Context) {
 	if !c.IsPooled() || c.Client == nil {
 		return
@@ -65,6 +121,9 @@ func (c *Coordinator) StartHeartbeatLoop(ctx context.Context) {
 					}
 
 					failures = 0
+					c.lastHeartbeatMu.Lock()
+					c.lastHeartbeatOK = time.Now()
+					c.lastHeartbeatMu.Unlock()
 					if c.isFenced() {
 						c.unfence()
 					} else {
@@ -76,6 +135,47 @@ func (c *Coordinator) StartHeartbeatLoop(ctx context.Context) {
 						}
 					}
 				}()
+			}
+		}
+	}()
+}
+
+// StartHeartbeatWatchdog runs in its OWN goroutine, independent of the
+// heartbeat tick, so a wedged tick (blocked HTTP call, deadlock) can never
+// block the watchdog. Every 60s it checks how long ago the last heartbeat
+// succeeded; if the node has been unable to heartbeat for > heartbeatWatchdogStale
+// while not draining, it force-exits (CI) so keep-alive.ps1 restarts the DVR
+// with the remaining session duration — turning the fleet-wide "hung DVR stays
+// dead for 45+ minutes" pattern into a sub-10-minute recovery.
+func (c *Coordinator) StartHeartbeatWatchdog(ctx context.Context) {
+	if !c.IsPooled() || c.Client == nil {
+		return
+	}
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.stopCh:
+				return
+			case <-ticker.C:
+				c.mu.Lock()
+				draining := c.draining
+				fenced := c.fenced
+				c.mu.Unlock()
+				c.lastHeartbeatMu.Lock()
+				last := c.lastHeartbeatOK
+				c.lastHeartbeatMu.Unlock()
+				if stale := heartbeatWatchdogCheck(last, draining, fenced); stale > 0 {
+					c.heartbeatWatchdogAct(stale)
+				}
 			}
 		}
 	}()

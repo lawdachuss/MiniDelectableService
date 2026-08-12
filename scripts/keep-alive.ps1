@@ -158,6 +158,41 @@ function Get-NodeId {
   }
   return $null
 }
+# Get-NodeHeartbeatAge returns the age in seconds of this node's last_heartbeat
+# in Supabase, or $null when Supabase is unreachable/credentials missing (the
+# watchdog must NOT act on an outage — a stale heartbeat is only actionable
+# when THIS script can still reach Supabase, proving the DB is up and only the
+# DVR's heartbeat path is wedged).
+function Get-NodeHeartbeatAge {
+  param($NodeId)
+  if ([string]::IsNullOrWhiteSpace($NodeId)) { return $null }
+  $sbUrl = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_URL)) { $env:SUPABASE_URL.Trim() } else { $null }
+  $sbKey = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_SERVICE_ROLE_KEY)) { $env:SUPABASE_SERVICE_ROLE_KEY.Trim() } else { $null }
+  if (-not $sbUrl -or -not $sbKey) {
+    $sb = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
+    if ($sb) {
+      if (-not $sbUrl -and ($sb -match '(?m)^SUPABASE_URL=(.+)$')) { $sbUrl = $matches[1].Trim() }
+      if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_SERVICE_ROLE_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
+      if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_API_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
+    }
+  }
+  if ([string]::IsNullOrWhiteSpace($sbUrl) -or [string]::IsNullOrWhiteSpace($sbKey)) { return $null }
+  if ($sbUrl -notmatch '^https?://') { $sbUrl = 'https://' + $sbUrl }
+  $sbUrl = $sbUrl.TrimEnd('/')
+  $apiUrl = "$sbUrl/rest/v1/nodes?select=last_heartbeat&node_id=eq.$NodeId&limit=1"
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  try {
+    $out = & "curl.exe" -s -m 12 -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" "$apiUrl" --noproxy "*" --tlsv1.2 --doh-url "https://cloudflare-dns.com/dns-query" 2>&1
+    $rows = $out | ConvertFrom-Json -ErrorAction Stop
+    if (-not $rows -or [string]::IsNullOrWhiteSpace($rows[0].last_heartbeat)) { return $null }
+    $hb = [DateTime]::Parse($rows[0].last_heartbeat).ToUniversalTime()
+    $age = ([DateTime]::UtcNow - $hb).TotalSeconds
+    if ($age -lt 0) { $age = 0 }
+    return [int]$age
+  } catch {
+    return $null
+  }
+}
 function Update-NodeWebUrl {
   param($nodeId, $url)
   if ([string]::IsNullOrWhiteSpace($nodeId)) { Write-Warning "(WARN) nodeId is empty - skipping web_url update"; return }
@@ -368,6 +403,13 @@ $targetDuration = 355 * 60
 
 $lastNotifyTime = 0
 $notifyCooldown = 300
+# Grace period after (re)starting the DVR before the heartbeat watchdog is
+# allowed to act. Right after a restart the Supabase last_heartbeat is still
+# the OLD process's (stale) value until the new DVR boots and beats, so the
+# watchdog must not kill a freshly-started DVR for a stale value it didn't
+# create yet.
+$script:lastDvrRestart = 0
+$script:heartbeatGraceSec = 240
 
 function Send-Notify {
   param($level, $msg)
@@ -390,6 +432,39 @@ while ($true) {
 
   # ═══ DVR health ═══
   if (-not $dvr) { Write-Warning "(WARN) DVR process not available"; continue }
+  # ═══ Heartbeat watchdog (hung-DVR recovery) ═══
+  # The Go DVR self-exits via its heartbeat watchdog when its heartbeat path
+  # wedges, but a FULLY frozen process (deadlocked goroutines) can't run that
+  # watchdog. Keep-alive can only see HasExited, so a hung-but-alive DVR used
+  # to stay dead until GitHub killed the run (~45 min later — the fleet-wide
+  # "sessions die ~4h into a 5h25m session" pattern). This probes Supabase
+  # directly: if the node's last_heartbeat is stale while the DVR process is
+  # still alive (and this script itself can reach Supabase, ruling out a
+  # network outage), kill and restart the DVR.
+  if ($dvr -and (-not $dvr.HasExited) -and $myNodeId) {
+    # Restart grace: a just-restarted DVR hasn't beaten yet, so its heartbeat
+    # would read stale even though it's healthy. Only act when the current
+    # DVR process has had time to boot and register.
+    $dvrAliveSec = 0
+    if ($script:lastDvrRestart -gt 0) { $dvrAliveSec = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $script:lastDvrRestart }
+    if ($dvrAliveSec -gt $script:heartbeatGraceSec) {
+      $hbAge = Get-NodeHeartbeatAge -NodeId $myNodeId
+      if ($hbAge -ne $null -and $hbAge -gt 600) {
+        Write-Host "(WATCHDOG) DVR alive but heartbeat stale ${hbAge}s — force-restarting"; $null = [System.Console]::Out.Flush()
+        $lastLogs = Get-Content "$repoDir\dvr-err.log" -Tail 10 -ErrorAction SilentlyContinue
+        Send-Notify "error" "DVR hung (heartbeat stale ${hbAge}s)`nLast stderr: $($lastLogs -join "`n")"
+        try { $dvr.Kill() } catch {}
+        try { $dvr.WaitForExit(10000) } catch {}
+        $env:SESSION_DURATION = "$([Math]::Max(1, [math]::Floor((5*3600+20*60 - $elapsed)/60)))m0s"
+        $dvrArgs = "--no-tunnel --output-dir `"$videosDir`" --refresh-cookies=false"
+        $script:lastDvrRestart = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $dvr = Start-Process -FilePath $dvrExe -ArgumentList $dvrArgs -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
+        Write-Host "(WATCHDOG) restarted DVR (PID $($dvr.Id))"; $null = [System.Console]::Out.Flush()
+        if ($lastLogs) { Write-Host "--- DVR stderr tail before restart ---"; $lastLogs | ForEach-Object { Write-Host "  $_" }; Write-Host "--- end ---" }
+      }
+    }
+  }
+
   if ($dvr.HasExited) {
     Write-Host "(WARN) DVR exited (code: $($dvr.ExitCode)) - restarting..."
     $lastLogs = Get-Content "$repoDir\dvr-err.log" -Tail 10 -ErrorAction SilentlyContinue
@@ -402,6 +477,7 @@ while ($true) {
     # timeout on cb.xxx's managed Turnstile from a datacenter IP). The first
     # launch still refreshes; only the restart path opts out.
     $dvrArgs = "--no-tunnel --output-dir `"$videosDir`" --refresh-cookies=false"
+    $script:lastDvrRestart = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $dvr = Start-Process -FilePath $dvrExe -ArgumentList $dvrArgs -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
   }
 

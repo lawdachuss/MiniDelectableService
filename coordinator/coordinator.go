@@ -260,6 +260,13 @@ type Coordinator struct {
 	// the node has no deadline (permanent node) and never self-drains.
 	ownDeadline time.Time
 
+	// lastHeartbeatOK is the wall-clock time of the last successful heartbeat,
+	// written by the heartbeat tick and read by StartHeartbeatWatchdog to
+	// detect a wedged/frozen heartbeat path (a hung DVR that keep-alive's
+	// $dvr.HasExited check can never see).
+	lastHeartbeatOK   time.Time
+	lastHeartbeatMu   sync.Mutex
+
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 	started  bool
@@ -321,6 +328,7 @@ func (c *Coordinator) Start(ctx context.Context) {
 	log.Printf("[coordinator] starting node %q in pooled mode", c.NodeID)
 	c.Register()
 	c.StartHeartbeatLoop(ctx)
+	c.StartHeartbeatWatchdog(ctx)
 	c.StartClaimLoop(ctx)
 	c.StartLiveCheckLoop(ctx)
 	c.StartReaperLoop(ctx)
