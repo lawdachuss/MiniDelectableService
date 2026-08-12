@@ -411,16 +411,24 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 
 		return fmt.Errorf("%d hosts still pending", len(hostsToTry))
 	}, WithUploadSem(), WithMaxAttempts(maxChannelUploadAttempts), WithBaseBackoff(channelUploadRetryDelay))
-	if err != nil {
-		return err
-	}
 
-	// Store results
+	// Persist links from every host that DID succeed, even if another host is
+	// down.  A single failing host (e.g. an expired API key returning 403)
+	// must not discard the successful uploads — that left recordings as bare
+	// rows with no embed URL and no upload_links.
 	for _, r := range success {
 		p.Links[r.Host] = r.DownloadLink
 		if p.EmbedURL == "" {
 			p.EmbedURL = embedURLFromLink(r.Host, r.DownloadLink)
 		}
+	}
+
+	if err != nil {
+		if len(p.Links) == 0 {
+			return err
+		}
+		ch.Warn("upload: %d/%d hosts succeeded for %s despite errors (%v) — persisting partial links",
+			len(p.Links), len(allHosts), filename, err)
 	}
 
 	if len(results) > 0 {

@@ -1439,12 +1439,10 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 
 		return fmt.Errorf("%d hosts still pending", len(hostsToTry))
 	}, WithUploadSem(), WithMaxAttempts(3), WithBaseBackoff(60*time.Second))
-	if err != nil {
-		recoveryLogf(filename, "[WARN] all upload attempts exhausted — file will be retried on next restart")
-		return false
-	}
 
-	// Build links map from all accumulated results
+	// Build links map from all accumulated results — even if one host is down,
+	// the hosts that DID receive the file must be persisted so the recording
+	// gets an embed URL and is playable.
 	links := map[string]string{}
 	var embedURL string
 	for _, r := range allResults {
@@ -1454,6 +1452,15 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 				embedURL = embedURLFromLink(r.Host, r.DownloadLink)
 			}
 		}
+	}
+
+	if err != nil {
+		if len(links) == 0 {
+			recoveryLogf(filename, "[WARN] all upload attempts exhausted — file will be retried on next restart")
+			return false
+		}
+		recoveryLogf(filename, "[WARN] %d/%d hosts succeeded despite errors (%v) — persisting partial links",
+			len(links), len(allHosts), err)
 	}
 
 	stat, _ := os.Stat(filePath)

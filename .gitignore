@@ -8,6 +8,9 @@ bin/
 # Local build output
 .build/
 
+# Cloudflare Workers build cache
+.wrangler/
+
 # Videos and recordings
 videos/*
 !videos/.gitkeep
