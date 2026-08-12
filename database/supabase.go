@@ -268,16 +268,22 @@ type ChannelProfile struct {
 }
 
 // SaveChannelProfile PATCHes the profile columns of the existing channels row
-// for the given username. Rows exist for every configured channel (created by
-// SaveChannelsToDB), so this only ever updates profile fields and never
-// inserts or clobbers recorder config columns. If no row matched (channel not
-// synced yet) it logs a warning instead of failing silently.
+// for the given username, and INSERTs a minimal row when none exists yet.
+//
+// Rows normally exist for every configured channel (created by
+// SaveChannelsToDB), so the PATCH only ever updates profile fields and never
+// clobbers recorder config columns. In distributed pool mode, however,
+// LoadPooledConfig never syncs the channels table — so a pooled channel has
+// no row and the old code dropped every scraped profile with a per-channel
+// warning. The fallback INSERT (upsert by username, with created_at — the one
+// NOT NULL column without a database default) keeps the profile data instead.
 func (c *Client) SaveChannelProfile(p *ChannelProfile) error {
 	p.ProfileScrapedAt = time.Now().UTC().Format(time.RFC3339)
 	path := "/channels?username=eq." + url.QueryEscape(p.Username)
 
 	// requestWithRetry sets Prefer: return=representation, so the response
-	// body lists the rows that were patched — 0 means the row is missing.
+	// body lists the rows that were patched — an empty list means no row
+	// matched yet.
 	resp, err := c.requestWithRetry("PATCH", path, p)
 	if err != nil {
 		return err
@@ -291,9 +297,36 @@ func (c *Client) SaveChannelProfile(p *ChannelProfile) error {
 
 	var patched []map[string]interface{}
 	_ = json.NewDecoder(resp.Body).Decode(&patched)
-	if len(patched) == 0 {
-		fmt.Printf("[WARN] SaveChannelProfile: no channels row for %q — profile not saved (run SaveChannelsToDB first)\n", p.Username)
+	if len(patched) > 0 {
+		return nil // row existed, profile columns updated in place
 	}
+
+	// No channels row yet (pooled mode) — create one. Every profile column is
+	// omitempty and every config column has a database default, so the only
+	// schema-required extra field is created_at (BIGINT NOT NULL, no default).
+	bodyBytes, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("marshal insert body: %w", err)
+	}
+	var insert map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &insert); err != nil {
+		return fmt.Errorf("unmarshal insert body: %w", err)
+	}
+	insert["created_at"] = time.Now().Unix()
+
+	// on_conflict=username makes a concurrent SaveChannelsToDB / another
+	// scrape safe: if the row appeared between our PATCH and this POST, the
+	// upsert just updates the profile columns again.
+	insertResp, err := c.requestWithRetry("POST", "/channels?on_conflict=username", insert)
+	if err != nil {
+		return err
+	}
+	defer insertResp.Body.Close()
+	if insertResp.StatusCode >= 400 {
+		b, _ := io.ReadAll(insertResp.Body)
+		return fmt.Errorf("insert returned %d: %s", insertResp.StatusCode, string(b))
+	}
+	fmt.Printf("[DEBUG] SaveChannelProfile(%q): inserted new channels row\n", p.Username)
 	return nil
 }
 
