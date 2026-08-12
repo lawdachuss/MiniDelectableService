@@ -6,12 +6,21 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 )
 
-const (
-	vidaraAPIBase = "https://api.vidara.so/v1"
-)
+// vidaraCodeRe is an allowlist for plausible Vidara file codes. Codes are
+// base62-ish alphanumeric and at least 6 chars, so a structural path segment
+// ("v", "e", "embed", "watch", ...) can never pass. This is strictly more
+// robust than enumerating known bad segments: a route Vidara adds tomorrow
+// (e.g. /play/CODE) still resolves to the real code because "play" fails the
+// pattern.
+var vidaraCodeRe = regexp.MustCompile(`^[A-Za-z0-9]{6,}$`)
+
+// vidaraAPIBase is a var (not const) so tests can point it at a fake server.
+var vidaraAPIBase = "https://api.vidara.so/v1"
 
 // VidaraUploader handles uploading files to vidara.so
 type VidaraUploader struct {
@@ -164,12 +173,58 @@ func (u *VidaraUploader) uploadFile(filePath string, progress ProgressFunc) (str
 		return "", fmt.Errorf("decode upload response: %w", err)
 	}
 
-	if uploadResp.URL == "" && uploadResp.Filecode == "" {
-		return "", fmt.Errorf("no file URL in response")
+	// The API has returned every one of these shapes at different times:
+	//   * {"filecode":"AbC123xY", "url":"https://vidara.so/v/AbC123xY"}  (docs)
+	//   * {"filecode":"AbC123xY", "url":"https://vidara.to/e/AbC123xY"}  (embed in url)
+	//   * {"filecode":"https://vidara.to/e/AbC123xY", "url":""}          (embed in filecode)
+	// So blindly returning uploadResp.URL (or prefixing vidara.so/v/ onto
+	// Filecode) produced mangled links like
+	// "https://vidara.so/v/https://vidara.to/e/CODE". Extract the trailing
+	// file code from whichever field carries it and build the canonical
+	// view link instead.
+	code := vidaraFileCode(uploadResp.Filecode)
+	if code == "" {
+		code = vidaraFileCode(uploadResp.URL)
 	}
-
+	if code != "" {
+		return "https://vidara.so/v/" + code, nil
+	}
 	if uploadResp.URL != "" {
 		return uploadResp.URL, nil
 	}
-	return fmt.Sprintf("https://vidara.so/v/%s", uploadResp.Filecode), nil
+	return "", fmt.Errorf("no file URL in response")
+}
+
+// vidaraFileCode extracts the trailing video file code from any Vidara API
+// value. The value may be a plain code ("AbC123xY"), a view link
+// ("https://vidara.so/v/AbC123xY"), or an embed link
+// ("https://vidara.to/e/AbC123xY") — everything after the last "/" is the
+// code. Returns "" for empty values or values whose last segment is not a
+// plausible code (contains ".", whitespace, or a query string), so a leaked
+// filename or a query-laden URL never becomes a code.
+func vidaraFileCode(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimRight(v, "/")
+	if v == "" {
+		return ""
+	}
+	// Strip query/fragment BEFORE taking the last path segment: a query can
+	// legally contain "/" (e.g. "/e/CODE?redirect=/x") and would otherwise
+	// be mistaken for a path separator.
+	if i := strings.IndexAny(v, "?#"); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.LastIndex(v, "/"); i >= 0 {
+		v = v[i+1:]
+	}
+	if !vidaraCodeRe.MatchString(v) {
+		return ""
+	}
+	// Belt-and-suspenders: a bare ".../download" would pass the allowlist
+	// pattern, so keep the explicit structural-segment reject too.
+	switch v {
+	case "v", "e", "embed", "watch", "d", "download", "file", "video":
+		return ""
+	}
+	return v
 }
