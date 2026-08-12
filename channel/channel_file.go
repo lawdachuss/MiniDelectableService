@@ -1496,12 +1496,15 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 	}
 
 	// Delete local file only once ALL hosts have the file safely, metadata
-	// is persisted, and at least one thumbnail was generated.  Keeping the
-	// file when thumbnails failed lets a later ScanThumbnails pass retry
-	// generation and fill in the missing URLs — the video itself is already
-	// safe on the hosts.
+	// is persisted, and the THUMBNAIL exists.  Gating on "any of the three
+	// assets" (the old check) let a file whose sprite uploaded but whose
+	// thumbnail failed be deleted — making the thumbnail un-recoverable
+	// forever, because ScanThumbnails needs the source video.  Keep the file
+	// whenever the thumbnail is missing so a later ScanThumbnails pass can
+	// retry generation and fill in the missing URL — the video itself is
+	// already safe on the hosts.
 	if cfg.DeleteLocalAfterUpload && len(uploader.GetSuccessfulUploads(allResults)) > 0 && dbSaved &&
-		(thumbURL != "" || spriteURL != "" || previewURL != "") {
+		thumbURL != "" {
 		DeleteSidecarFiles(filePath)
 		if err := removeFileWithRetry(filePath); err != nil {
 			recoveryLogf(filename, "could not remove local file: %v — will retry on next restart", err)

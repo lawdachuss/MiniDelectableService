@@ -562,13 +562,16 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 		return nil
 	}
 
-	// Keep the local file when no thumbnails were ever generated (the raw
-	// recording was unreadable enough that ffmpeg extraction failed).  The
-	// startup/periodic ScanThumbnails pass picks these files up and retries
-	// generation; deleting here would lose that chance forever, while the
-	// video itself is already safe in the cloud.
-	if p.ThumbURL == "" && p.SpriteURL == "" && p.PreviewURL == "" {
-		ch.Info("cleanup: keeping %s — thumbnails never generated (queued for thumbnail retry)", p.Filename)
+	// Keep the local file whenever the THUMBNAIL — the asset actually shown
+	// on the video card — is missing, even if the sprite and/or preview
+	// succeeded.  Gating on all three being empty (the old check) meant a
+	// file whose sprite uploaded but whose thumbnail failed was deleted, and
+	// the thumbnail became un-recoverable forever (ScanThumbnails needs the
+	// source video).  The startup/periodic ScanThumbnails pass picks these
+	// files up and retries generation; deleting here would lose that chance,
+	// while the video itself is already safe in the cloud.
+	if p.ThumbURL == "" {
+		ch.Info("cleanup: keeping %s — thumbnail missing (queued for thumbnail retry)", p.Filename)
 		return nil
 	}
 
