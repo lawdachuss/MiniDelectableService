@@ -30,6 +30,20 @@ func NewClient(url, apiKey string) *Client {
 	}
 }
 
+// releaseBatchSize caps how many usernames go into one PostgREST PATCH filter
+// URL. Supabase sits behind a proxy with an ~8KB URL limit (HTTP 414 "URI too
+// long"); a single PATCH carrying the whole excess list (~850 usernames in the
+// wild) was rejected every claim cycle, so an overloaded node could never shed
+// channels and the fair-share rebalancer deadlocked the pool (one node hoarding
+// ~900 channels while the rest of the fleet sat idle). 40 usernames is well
+// under 1KB even with long names.
+const releaseBatchSize = 40
+
+// livenessBatchSize caps how many (username, site) pairs go into one
+// SetChannelsLive/SetChannelsNotLive or= filter. Each escaped pair is ~45-55
+// chars, so 30 pairs stay far below the ~8KB URL limit.
+const livenessBatchSize = 30
+
 // ============================================================================
 // HTTP HELPERS
 // ============================================================================
@@ -1230,6 +1244,50 @@ func (c *Client) ReleaseNodeChannels(nodeID string) error {
 		})
 }
 
+// releaseChunked PATCHes the given usernames back to unassigned for this node
+// in small batches (releaseBatchSize per request). The release is idempotent —
+// a row already released simply matches nothing — so on a failed batch the
+// caller receives the rows released so far plus the error, and the next claim
+// cycle picks up the remainder. Without chunking, one giant username=in.(...)
+// filter exceeds the ~8KB proxy URL limit (HTTP 414) and the release fails
+// wholesale, which is what wedged the fleet's rebalancer.
+func (c *Client) releaseChunked(nodeID string, usernames []string) ([]ChannelAssignment, error) {
+	var released []ChannelAssignment
+	totalBatches := (len(usernames) + releaseBatchSize - 1) / releaseBatchSize
+	for start := 0; start < len(usernames); start += releaseBatchSize {
+		end := start + releaseBatchSize
+		if end > len(usernames) {
+			end = len(usernames)
+		}
+		batch := usernames[start:end]
+		batchNo := start/releaseBatchSize + 1
+
+		resp, err := c.requestWithRetry("PATCH",
+			fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&username=in.(%s)",
+				url.QueryEscape(nodeID), joinEscaped(batch)),
+			map[string]interface{}{
+				"assigned_node": nil,
+				"status":        "unassigned",
+			})
+		if err != nil {
+			return released, fmt.Errorf("release batch %d/%d: %w", batchNo, totalBatches, err)
+		}
+		if resp.StatusCode >= 400 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return released, fmt.Errorf("release batch %d/%d: HTTP %d: %s", batchNo, totalBatches, resp.StatusCode, string(bodyBytes))
+		}
+		var batchReleased []ChannelAssignment
+		decodeErr := json.NewDecoder(resp.Body).Decode(&batchReleased)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return released, fmt.Errorf("decode released batch %d/%d: %w", batchNo, totalBatches, decodeErr)
+		}
+		released = append(released, batchReleased...)
+	}
+	return released, nil
+}
+
 // ReleaseExcessChannels releases up to `limit` channels from this node back to unassigned.
 // Uses a two-step approach (GET usernames, then PATCH by username) because
 // PostgREST PATCH ignores the `limit` parameter.
@@ -1261,34 +1319,13 @@ func (c *Client) ReleaseExcessChannels(nodeID string, limit int) ([]ChannelAssig
 		return nil, nil
 	}
 
-	// Step 2: PATCH only those specific channels
+	// Step 2: PATCH only those specific channels, in small batches so the
+	// PostgREST filter URL can never blow past the ~8KB proxy limit (HTTP 414).
 	usernames := make([]string, len(target))
 	for i, ca := range target {
 		usernames[i] = ca.Username
 	}
-
-	resp, err := c.requestWithRetry("PATCH",
-		fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&username=in.(%s)",
-			url.QueryEscape(nodeID), joinEscaped(usernames)),
-		map[string]interface{}{
-			"assigned_node": nil,
-			"status":        "unassigned",
-		})
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var released []ChannelAssignment
-	if err := json.NewDecoder(resp.Body).Decode(&released); err != nil {
-		return nil, fmt.Errorf("decode released: %w", err)
-	}
-	return released, nil
+	return c.releaseChunked(nodeID, usernames)
 }
 
 // ReleaseExcessOfflineChannels releases up to `limit` OFFLINE channels from this
@@ -1319,29 +1356,7 @@ func (c *Client) ReleaseExcessOfflineChannels(nodeID string, limit int) ([]Chann
 	for i, ca := range offline {
 		usernames[i] = ca.Username
 	}
-
-	resp, err := c.requestWithRetry("PATCH",
-		fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&username=in.(%s)",
-			url.QueryEscape(nodeID), joinEscaped(usernames)),
-		map[string]interface{}{
-			"assigned_node": nil,
-			"status":        "unassigned",
-		})
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var released []ChannelAssignment
-	if err := json.NewDecoder(resp.Body).Decode(&released); err != nil {
-		return nil, fmt.Errorf("decode released: %w", err)
-	}
-	return released, nil
+	return c.releaseChunked(nodeID, usernames)
 }
 
 // ReleaseChannel releases a single channel back to the pool.
@@ -1560,34 +1575,62 @@ func compositeOrFilter(pairs [][2]string) string {
 
 // SetChannelsLive bulk-updates is_live=true for the given (username, site)
 // pairs.  Composite filters ensure a same-named channel on the other site is
-// never toggled.
+// never toggled.  The pair list is chunked because a single or=(...) filter
+// listing every live pair can exceed the ~8KB proxy URL limit (HTTP 414) — the
+// same failure mode that left is_live flags stale fleet-wide.
 func (c *Client) SetChannelsLive(pairs [][2]string) error {
 	if len(pairs) == 0 {
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	return c.patch(
-		fmt.Sprintf("/channel_assignments?%s&is_live=eq.false", compositeOrFilter(pairs)),
-		map[string]interface{}{
-			"is_live":         true,
-			"live_checked_at": now,
-		})
+	return c.setChannelsLiveChunked(pairs, now)
+}
+
+func (c *Client) setChannelsLiveChunked(pairs [][2]string, now string) error {
+	for start := 0; start < len(pairs); start += livenessBatchSize {
+		end := start + livenessBatchSize
+		if end > len(pairs) {
+			end = len(pairs)
+		}
+		chunk := pairs[start:end]
+		if err := c.patch(
+			fmt.Sprintf("/channel_assignments?%s&is_live=eq.false", compositeOrFilter(chunk)),
+			map[string]interface{}{
+				"is_live":         true,
+				"live_checked_at": now,
+			}); err != nil {
+			return fmt.Errorf("set live batch %d: %w", start/livenessBatchSize+1, err)
+		}
+	}
+	return nil
 }
 
 // SetChannelsNotLive bulk-updates is_live=false for every channel EXCEPT the
 // given (username, site) pairs.  An empty pair list marks the whole pool
 // not-live.
+//
+// The old implementation built a single PostgREST not.or(...) filter listing
+// every live pair — with hundreds of live channels that URL exceeds the ~8KB
+// proxy limit (HTTP 414), leaving stale is_live=true rows that make the whole
+// pool look live and stall claiming.  The exclusion filter cannot be chunked
+// safely (each chunk would clear the other chunks' live flags), so we invert
+// it: clear the entire pool with a tiny filter first, then re-mark the live
+// pairs in small chunks.  The transient all-not-live window is harmless —
+// is_live only biases fair-share claiming (claim RPCs require assigned_node IS
+// NULL, so assigned channels are never disturbed) and the liveness loop
+// re-runs every cycle.
 func (c *Client) SetChannelsNotLive(pairs [][2]string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	filter := "/channel_assignments?is_live=eq.true"
-	if len(pairs) > 0 {
-		filter = "/channel_assignments?not." + compositeOrFilter(pairs) + "&is_live=eq.true"
-	}
-	return c.patch(filter,
+	// Step 1: clear every live flag — a single tiny PATCH.
+	if err := c.patch("/channel_assignments?is_live=eq.true",
 		map[string]interface{}{
 			"is_live":         false,
 			"live_checked_at": now,
-		})
+		}); err != nil {
+		return err
+	}
+	// Step 2: re-mark the still-live pairs in chunks.
+	return c.setChannelsLiveChunked(pairs, now)
 }
 
 // ReclaimChannels sets assigned_node=NULL for all channels belonging to a dead node.
