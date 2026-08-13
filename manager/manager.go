@@ -115,14 +115,14 @@ type Manager struct {
 
 	// sessionMu prevents multiple concurrent sessionLoop goroutines when
 	// StartSession is called more than once (e.g. from create-channel handler).
-	sessionMu       sync.Mutex
-	sessionStarted  bool
-	sessionStopped  bool // set by StopSession to permanently stop the loop
+	sessionMu      sync.Mutex
+	sessionStarted bool
+	sessionStopped bool // set by StopSession to permanently stop the loop
 
 	// Cloudflare block tracking: channels currently in a blocked state, plus
 	// whether the global multi-channel alert has already fired.
-	cfMu            sync.Mutex
-	cfBlocked       map[string]struct{}
+	cfMu             sync.Mutex
+	cfBlocked        map[string]struct{}
 	cfGlobalNotified bool
 
 	// cfRefreshFn is the registered cookie re-mint function (runs the cookie
@@ -607,6 +607,20 @@ func (m *Manager) ScanThumbnails() {
 		dirs = append(dirs, server.Config.OutputDir)
 	}
 
+	// Set of files channels are actively recording — computed once before the
+	// walk.  The thumbnail sweep walks the same recording directory as the
+	// orphan scan; a live recording is not marked in-flight (it is only being
+	// appended to), so without this guard a probe of a half-written file could
+	// fail and the failure counter could evict a live recording.
+	activeRecs := map[string]bool{}
+	for _, p := range m.ActiveRecordingFiles() {
+		if abs, err := filepath.Abs(p); err == nil {
+			activeRecs[filepath.Clean(abs)] = true
+		} else {
+			activeRecs[filepath.Clean(p)] = true
+		}
+	}
+
 	for _, dir := range dirs {
 		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info == nil || info.IsDir() {
@@ -631,6 +645,16 @@ func (m *Manager) ScanThumbnails() {
 			// own thumbnails.  Racing it would collide on the shared sidecar
 			// filenames and could cause spurious thumbnail failures.
 			if channel.IsUploadInFlight(path) {
+				return nil
+			}
+			// Skip files a channel is actively recording: probes on a
+			// half-written file can fail and the failure counter must never
+			// evict a live recording.
+			if abs, aerr := filepath.Abs(path); aerr == nil {
+				if activeRecs[filepath.Clean(abs)] {
+					return nil
+				}
+			} else if activeRecs[filepath.Clean(path)] {
 				return nil
 			}
 			// Only regenerate when the THUMBNAIL — the asset actually shown on the
@@ -663,8 +687,27 @@ func (m *Manager) ScanThumbnails() {
 			m.thumbThrottle[path] = time.Now()
 			m.thumbThrottleMu.Unlock()
 			if newThumb != "" || newSprite != "" || newPreview != "" {
+				server.ClearThumbFailure(path)
 				if err := server.SavePreviewLinks(info.Name(), newThumb, newSprite, newPreview); err != nil {
 					log.Printf("[thumb] failed to save preview links for %s: %v", info.Name(), err)
+				}
+			} else if channel.IsUnreadableVideo(path) {
+				// Generation failed AND the file cannot even be probed — a
+				// permanently-corrupt recording.  Counting every failed scan
+				// would burn disk + image-host quota forever; evict it once it
+				// has failed MaxThumbFailures times (upload → save metadata →
+				// delete local entirely, per the eviction policy).
+				count := server.RecordThumbFailure(path)
+				if count >= server.MaxThumbFailures {
+					log.Printf("[thumb] %s failed thumbnail generation %d times and is unreadable — evicting (upload + metadata + delete)", info.Name(), count)
+					server.ClearThumbFailure(path)
+					if channel.UploadOrphanedFileEvict(path) {
+						log.Printf("[thumb] %s evicted successfully", info.Name())
+					} else {
+						log.Printf("[thumb] %s eviction upload failed — file kept, will retry", info.Name())
+					}
+					time.Sleep(thumbBackfillSpacing)
+					return nil
 				}
 			}
 			// Space regenerations so a mass backfill cannot exceed the image
@@ -1063,6 +1106,24 @@ sessionWait:
 // being uploaded by any channel's upload goroutine.
 func (m *Manager) IsFileUploadInFlight(filePath string) bool {
 	return channel.IsUploadInFlight(filePath)
+}
+
+// ActiveRecordingFiles returns the absolute paths of files currently being
+// recorded by any channel.  The orphan scan walks the recording directory and
+// uses this to avoid treating a live recording as a stranded orphan.
+func (m *Manager) ActiveRecordingFiles() []string {
+	var out []string
+	m.Channels.Range(func(_, value any) bool {
+		ch, ok := value.(*channel.Channel)
+		if !ok {
+			return true
+		}
+		if p := ch.CurrentRecordingPath(); p != "" {
+			out = append(out, p)
+		}
+		return true
+	})
+	return out
 }
 
 // channelCount returns the number of channels currently in the map.

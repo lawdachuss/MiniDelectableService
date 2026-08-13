@@ -45,8 +45,8 @@ func (s *stubManager) ResumeChannel(username string) error {
 	return nil
 }
 func (s *stubManager) Publish(name string, ch *entity.ChannelInfo) {}
-func (s *stubManager) PublishLog(username, line string)           {}
-func (s *stubManager) PublishUploadState()                        {}
+func (s *stubManager) PublishLog(username, line string)            {}
+func (s *stubManager) PublishUploadState()                         {}
 func (s *stubManager) Subscriber(w http.ResponseWriter, r *http.Request) {
 }
 func (s *stubManager) LoadConfig() error { return nil }
@@ -55,20 +55,21 @@ func (s *stubManager) WaitForUploads()   {}
 func (s *stubManager) StopAllChannels()  {}
 func (s *stubManager) WaitForAllChannels() {
 }
-func (s *stubManager) StopWatcher()               {}
-func (s *stubManager) CFBlockedCount() int        { return 0 }
-func (s *stubManager) RequestCookieRefresh()      {}
+func (s *stubManager) StopWatcher()                {}
+func (s *stubManager) CFBlockedCount() int         { return 0 }
+func (s *stubManager) RequestCookieRefresh()       {}
 func (s *stubManager) SetCookieRefreshFunc(func()) {}
 func (s *stubManager) ChannelMinDurationBeforeUpload(username string) int {
 	return 0
 }
 func (s *stubManager) StartSession(duration time.Duration) {
 }
-func (s *stubManager) StopSession() {}
+func (s *stubManager) StopSession()  {}
 func (s *stubManager) StartWatcher() {}
 func (s *stubManager) IsFileUploadInFlight(filePath string) bool {
 	return false
 }
+func (s *stubManager) ActiveRecordingFiles() []string     { return nil }
 func (s *stubManager) SessionInfo() (time.Duration, bool) { return 0, false }
 func (s *stubManager) TriggerSessionStop()                {}
 func (s *stubManager) UploadEntries() *entity.UploadsResponse {

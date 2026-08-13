@@ -391,7 +391,7 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 					status = "failed"
 					errMsg = r.Error.Error()
 				}
-				if jErr := server.SaveJournalEntry(p.FileHash, filename, r.Host, status, filesize, errMsg); jErr != nil {
+				if jErr := server.SaveJournalEntry(p.FileHash, filename, r.Host, status, r.DownloadLink, filesize, errMsg); jErr != nil {
 					ch.Warn("upload: could not save journal for %s/%s: %v", r.Host, filename, jErr)
 				}
 			}
@@ -578,10 +578,15 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 	ch.Info("cleanup: removing local files for %s", p.Filename)
 	DeleteSidecarFiles(p.FilePath)
 	if err := removeFileWithRetry(p.FilePath); err != nil {
-		ch.Warn("cleanup: could not remove %s (will retry on next run): %v", p.Filename, err)
-	} else {
-		ch.Info("cleanup: removed %s", p.Filename)
+		// KEEP the upload journal when the local file could not be removed.
+		// The next orphan scan sees the file, finds the journal (all hosts
+		// completed), and removes the local copy WITHOUT re-uploading.  Deleting
+		// the journal here would destroy the dedup record and trigger a
+		// duplicate upload of all hosts on the next scan.
+		ch.Warn("cleanup: could not remove %s (will retry on next run, journal kept): %v", p.Filename, err)
+		return nil
 	}
+	ch.Info("cleanup: removed %s", p.Filename)
 	if p.FileHash != "" {
 		if jErr := server.DeleteJournalByHash(p.FileHash); jErr != nil {
 			ch.Warn("cleanup: could not delete journal for %s: %v", p.Filename, jErr)

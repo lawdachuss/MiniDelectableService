@@ -1154,7 +1154,17 @@ func DeleteVideoCompletely(filename string) error {
 // ─── Upload Journal ───────────────────────────────────────────────────────────
 
 // SaveJournalEntry records the upload state for a file on a specific host.
-func SaveJournalEntry(fileHash, filename, host, status string, fileSize int64, errMsg string) error {
+//
+// Local-first: the entry is ALWAYS written to the local on-disk journal before
+// any Supabase attempt.  A Supabase outage therefore cannot destroy the dedup
+// record — the root cause of duplicate re-uploads.  The link is persisted
+// locally too so recording metadata can be rebuilt without re-uploading.
+// The Supabase write remains best-effort (it is the cross-node durable copy).
+func SaveJournalEntry(fileHash, filename, host, status, link string, fileSize int64, errMsg string) error {
+	if lErr := saveLocalJournalEntry(fileHash, host, status, link, fileSize, errMsg); lErr != nil {
+		return lErr
+	}
+
 	client := GetDBClient()
 	if client == nil {
 		return fmt.Errorf("Supabase not configured")
@@ -1173,33 +1183,66 @@ func SaveJournalEntry(fileHash, filename, host, status string, fileSize int64, e
 	return client.SaveJournalEntry(entry)
 }
 
-// LoadJournalByHash returns all journal entries for a given file hash.
+// LoadJournalByHash returns all journal entries for a given file hash,
+// merging the local on-disk journal with Supabase (union of both).
 func LoadJournalByHash(fileHash string) ([]database.UploadJournal, error) {
 	client := GetDBClient()
 	if client == nil {
-		return nil, fmt.Errorf("Supabase not configured")
+		// Supabase unavailable — fall back to the local journal alone so dedup
+		// and recovery keep working during an outage.
+		var out []database.UploadJournal
+		for _, e := range loadLocalJournal(fileHash) {
+			out = append(out, database.UploadJournal{
+				FileHash:  fileHash,
+				Host:      e.Host,
+				Status:    e.Status,
+				ErrorMsg:  e.ErrMsg,
+				FileSize:  e.FileSize,
+				UpdatedAt: e.UpdatedAt,
+			})
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("Supabase not configured")
+		}
+		return out, nil
 	}
 	return client.GetJournalByHash(fileHash)
 }
 
 // LoadCompletedHosts returns the list of hosts that have successfully received
-// the file identified by fileHash.
+// the file identified by fileHash.  The local journal is the source of truth
+// during a Supabase outage; remote entries are merged in when reachable.
 func LoadCompletedHosts(fileHash string) ([]string, error) {
-	entries, err := LoadJournalByHash(fileHash)
-	if err != nil {
-		return nil, err
-	}
-	var hosts []string
-	for _, e := range entries {
-		if e.Status == "success" {
-			hosts = append(hosts, e.Host)
+	hosts := make(map[string]bool)
+	mergeLocalJournalSuccessHosts(fileHash, hosts)
+
+	client := GetDBClient()
+	if client != nil {
+		if entries, err := client.GetJournalByHash(fileHash); err == nil {
+			for _, e := range entries {
+				if e.Status == "success" {
+					hosts[e.Host] = true
+				}
+			}
 		}
 	}
-	return hosts, nil
+
+	if len(hosts) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(hosts))
+	for h := range hosts {
+		out = append(out, h)
+	}
+	return out, nil
 }
 
-// DeleteJournalByHash removes all journal entries for a file hash.
+// DeleteJournalByHash removes all journal entries for a file hash from BOTH
+// the local on-disk journal and Supabase.
 func DeleteJournalByHash(fileHash string) error {
+	if err := deleteLocalJournal(fileHash); err != nil {
+		return err
+	}
 	client := GetDBClient()
 	if client == nil {
 		return nil

@@ -73,11 +73,25 @@ func (c *Client) request(method, path string, body interface{}) (*http.Response,
 	return c.client.Do(req)
 }
 
+// defaultMaxRetries is used for all Supabase calls unless a call opts into
+// more (metadata saves use metadataSaveMaxRetries so a transient outage at
+// finalize time cannot strand a recording without its DB row).
+const defaultMaxRetries = 3
+
+// metadataSaveMaxRetries applies to the SaveRecordingWithLinks path
+// (SaveRecording, GetRecording, SaveUploadLinks): a recording's metadata is
+// the last write before the local copy is deleted, so it gets extra attempts.
+const metadataSaveMaxRetries = 10
+
 // requestWithRetry executes the request and retries on transient errors:
 // - 503 PGRST002 — schema cache rebuilding after migration
 // - 400 PGRST204 — column not in schema cache yet (PostgREST needs to refresh)
 func (c *Client) requestWithRetry(method, path string, body interface{}) (*http.Response, error) {
-	const maxRetries = 3
+	return c.requestWithRetryN(method, path, body, defaultMaxRetries)
+}
+
+// requestWithRetryN is requestWithRetry with an explicit retry budget.
+func (c *Client) requestWithRetryN(method, path string, body interface{}, maxRetries int) (*http.Response, error) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -152,7 +166,11 @@ func retryBackoff(attempt int) time.Duration {
 }
 
 func (c *Client) get(path string, result interface{}) error {
-	resp, err := c.requestWithRetry("GET", path, nil)
+	return c.getN(path, result, defaultMaxRetries)
+}
+
+func (c *Client) getN(path string, result interface{}, maxRetries int) error {
+	resp, err := c.requestWithRetryN("GET", path, nil, maxRetries)
 	if err != nil {
 		return err
 	}
@@ -460,8 +478,10 @@ type Recording struct {
 
 // SaveRecording creates or updates a recording using Supabase's upsert functionality.
 // Uses on_conflict to atomically upsert by filename, avoiding TOCTOU race conditions.
+// Retries metadataSaveMaxRetries times: a recording's DB row is written before the
+// local copy is deleted, so it must survive transient Supabase outages.
 func (c *Client) SaveRecording(rec *Recording) error {
-	resp, err := c.requestWithRetry("POST", "/recordings?on_conflict=filename", rec)
+	resp, err := c.requestWithRetryN("POST", "/recordings?on_conflict=filename", rec, metadataSaveMaxRetries)
 	if err != nil {
 		return err
 	}
@@ -477,7 +497,7 @@ func (c *Client) SaveRecording(rec *Recording) error {
 // GetRecording retrieves a recording by filename
 func (c *Client) GetRecording(filename string) (*Recording, error) {
 	var recordings []Recording
-	err := c.get(fmt.Sprintf("/recordings?filename=eq.%s&limit=1", url.QueryEscape(filename)), &recordings)
+	err := c.getN(fmt.Sprintf("/recordings?filename=eq.%s&limit=1", url.QueryEscape(filename)), &recordings, metadataSaveMaxRetries)
 	if err != nil {
 		return nil, err
 	}
@@ -547,8 +567,10 @@ func (c *Client) SaveUploadLink(link *UploadLink) error {
 
 // SaveUploadLinks batch-saves all upload links in a single request.
 // Uses on_conflict to upsert by (recording_id, host).
+// Part of the SaveRecordingWithLinks metadata path, so it retries
+// metadataSaveMaxRetries times like SaveRecording/GetRecording.
 func (c *Client) SaveUploadLinks(links []UploadLink) error {
-	resp, err := c.requestWithRetry("POST", "/upload_links?on_conflict=recording_id,host", links)
+	resp, err := c.requestWithRetryN("POST", "/upload_links?on_conflict=recording_id,host", links, metadataSaveMaxRetries)
 	if err != nil {
 		return err
 	}

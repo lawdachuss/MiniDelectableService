@@ -132,7 +132,7 @@ func (ch *Channel) uploadFile(filePath string, thumbURL, spriteURL, previewURL s
 					status = "failed"
 					errMsg = r.Error.Error()
 				}
-				if jErr := server.SaveJournalEntry(fileHash, filename, r.Host, status, filesize, errMsg); jErr != nil {
+				if jErr := server.SaveJournalEntry(fileHash, filename, r.Host, status, r.DownloadLink, filesize, errMsg); jErr != nil {
 					ch.Warn("upload: could not save journal for %s/%s: %v", r.Host, filename, jErr)
 				}
 			}

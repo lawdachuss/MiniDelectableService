@@ -46,6 +46,10 @@ type IManager interface {
 	// threshold in the pool is gated even when the node's global
 	// MIN_DURATION_BEFORE_UPLOAD env var is unset.
 	ChannelMinDurationBeforeUpload(username string) int
+	// ActiveRecordingFiles returns the absolute paths of files currently being
+	// recorded by any channel.  The orphan scan walks the recording directory
+	// and uses this to avoid treating a live recording as a stranded orphan.
+	ActiveRecordingFiles() []string
 	// RequestCookieRefresh triggers a rate-limited cookie re-mint (scripts +
 	// Supabase reload) so a Cloudflare-starved node can recover without a
 	// restart.

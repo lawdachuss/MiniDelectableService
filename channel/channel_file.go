@@ -262,6 +262,20 @@ func (ch *Channel) GenerateFilename() (string, error) {
 	return ch.generateFilenameLocked()
 }
 
+// CurrentRecordingPath returns the absolute path of the file this channel is
+// currently recording, or "" when no recording is active.  The orphan scan
+// walks the same directory (videos/ and OutputDir) and must never treat a
+// live recording as a stranded orphan.
+func (ch *Channel) CurrentRecordingPath() string {
+	ch.fileMu.RLock()
+	defer ch.fileMu.RUnlock()
+
+	if ch.File == nil || ch.CurrentFilename == "" {
+		return ""
+	}
+	return filepath.Clean(ch.CurrentFilename + ch.FileExt)
+}
+
 func (ch *Channel) generateFilenameLocked() (string, error) {
 	var buf bytes.Buffer
 
@@ -1024,6 +1038,78 @@ func CleanupOrphanedFiles() {
 			sem <- struct{}{}
 		}
 
+		// Process orphaned MAIN videos (fully finalized recordings that were
+		// never uploaded — e.g. a pipeline retry dropped when the channel
+		// stopped, a Supabase outage lost the journal, or a crash left the file
+		// stranded).  Previously the scan built this map but never acted on it,
+		// so such recordings had no recovery path and sat on disk forever.
+		activeRecs := map[string]bool{}
+		if m := server.Manager; m != nil {
+			for _, p := range m.ActiveRecordingFiles() {
+				if abs, err := filepath.Abs(p); err == nil {
+					activeRecs[filepath.Clean(abs)] = true
+				} else {
+					activeRecs[filepath.Clean(p)] = true
+				}
+			}
+		}
+		for stem, info := range mainVideos {
+			stem := stem
+			// Never touch a file a channel is recording RIGHT NOW: the orphan
+			// scan walks the recording directory too, and a live recording is
+			// not marked in-flight (it is only being appended to).
+			absPath, absErr := filepath.Abs(info.path)
+			if absErr == nil {
+				if activeRecs[filepath.Clean(absPath)] {
+					continue
+				}
+			} else if activeRecs[filepath.Clean(info.path)] {
+				continue
+			}
+			if IsUploadInFlight(info.path) {
+				continue // another flow (pipeline/watcher) owns it right now
+			}
+			if IsFinalizingTemp(info.name) || strings.Contains(info.name, ".deleting.") {
+				continue // scratch/in-flight finalize artifact, not a recording
+			}
+			// Settle guard: a channel that just stopped recording is about to
+			// finalize this file (ffmpeg reads the source in videos/ while
+			// writing the .finalizing scratch, and only marks the OUTPUT
+			// in-flight after the rename).  Skipping recently-touched files
+			// prevents the scan from uploading the pre-finalize source while
+			// the pipeline then uploads the finalized output — a duplicate.
+			if st, serr := os.Stat(info.path); serr == nil && time.Since(st.ModTime()) < orphanSettleWindow {
+				continue
+			}
+
+			// Skip files that were already fully uploaded AND have their
+			// thumbnail: content is safe in the cloud, so drop the local copy.
+			// If the thumbnail is missing, KEEP the file so ScanThumbnails can
+			// retry generation — deleting now would make the thumbnail
+			// un-recoverable forever.
+			if IsAlreadyFullyUploaded(info.path) {
+				thumbURL, _, _ := server.LoadPreviewLinks(info.name)
+				if thumbURL == "" {
+					recoveryLogf(info.name, "recovery: fully uploaded but thumbnail missing — keeping for thumbnail retry")
+					continue
+				}
+				recoveryLogf(info.name, "recovery: fully uploaded main video — removing local copy")
+				os.Remove(info.path)
+				DeleteSidecarFiles(info.path)
+				continue
+			}
+
+			if MaybeDeferToPending(info.path) {
+				continue // short segment parked for merge
+			}
+
+			recoveryLogf(info.name, "recovery: uploading orphaned main video %s", info.name)
+			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
+			UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
+			DeleteSidecarFiles(info.path)
+			_ = stem
+		}
+
 		// Process any pending segments (short videos awaiting merge).
 		// Pending segments are stored under .pending/{username}/.
 		processAllPendingSegments()
@@ -1322,6 +1408,18 @@ func configuredUploadHosts() []string {
 // times with a 60-second delay between attempts.  This handles transient network
 // or API outages that can occur when the app restarts after a crash.
 func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
+	return uploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL, true)
+}
+
+// UploadOrphanedFileEvict uploads a file whose thumbnails can never be
+// generated (permanently corrupt recording) and then deletes the local copy
+// entirely once its metadata is saved — the user's chosen policy for evicting
+// files that would otherwise burn disk + CPU forever on thumbnail retries.
+func UploadOrphanedFileEvict(filePath string) bool {
+	return uploadOrphanedFile(filePath, "", "", "", false)
+}
+
+func uploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string, thumbMustExist bool) bool {
 	MarkUploadInFlight(filePath)
 	defer MarkUploadDone(filePath)
 	cfg := server.Config
@@ -1384,9 +1482,33 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 		if len(hostsToTry) == 0 {
 			if server.RecordingExists(filename) {
 				recoveryLogf(filename, "all hosts already have this file per journal — skipping upload")
+				// Eviction mode: the file is corrupt (no thumbnail possible)
+				// but already safe in the cloud — delete the local copy even
+				// though nothing new was uploaded this pass.
+				if !thumbMustExist && cfg.DeleteLocalAfterUpload {
+					DeleteSidecarFiles(filePath)
+					if err := removeFileWithRetry(filePath); err != nil {
+						recoveryLogf(filename, "could not remove local file: %v — will retry on next restart", err)
+						return true
+					}
+					if fileHash != "" {
+						if jErr := server.DeleteJournalByHash(fileHash); jErr != nil {
+							recoveryLogf(filename, "could not delete journal: %v", jErr)
+						}
+					}
+					recoveryLogf(filename, "removed local file (evicted corrupt file)")
+				}
 				return true
 			}
-			recoveryLogf(filename, "stale journal has no Supabase recording; clearing journal and re-uploading")
+			// All hosts have the file per the journal but the recording row is
+			// missing — the original metadata save failed (e.g. during a
+			// Supabase outage).  Recover the metadata from the local journal's
+			// stored links instead of re-uploading, which would duplicate the
+			// video on every host.
+			if recoverOrphanMetadataFromJournal(filePath, filename, fileHash) {
+				return true
+			}
+			recoveryLogf(filename, "stale journal has no Supabase recording and no recoverable links; clearing journal and re-uploading")
 			if fileHash != "" {
 				if jErr := server.DeleteJournalByHash(fileHash); jErr != nil {
 					recoveryLogf(filename, "could not clear stale journal: %v", jErr)
@@ -1419,7 +1541,7 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 					status = "failed"
 					errMsg = r.Error.Error()
 				}
-				if jErr := server.SaveJournalEntry(fileHash, filename, r.Host, status, filesize, errMsg); jErr != nil {
+				if jErr := server.SaveJournalEntry(fileHash, filename, r.Host, status, r.DownloadLink, filesize, errMsg); jErr != nil {
 					recoveryLogf(filename, "could not save journal for %s: %v", r.Host, jErr)
 				}
 			}
@@ -1479,32 +1601,45 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 		recoveryLogf(filename, "could not probe duration: %v", probeErr)
 	}
 
+	return saveOrphanMetadataAndCleanup(filePath, filename, fileHash, embedURL, filesize, dur, timestamp, thumbURL, spriteURL, previewURL, links, thumbMustExist)
+}
+
+// saveOrphanMetadataAndCleanup persists recording metadata to Supabase and
+// removes the local file once the recording is safely stored.  Returns true
+// when the upload was handled (metadata saved OR the file intentionally kept),
+// false only when the local copy must be retried on the next scan.
+//
+// thumbMustExist gates local deletion on a generated thumbnail — the same rule
+// the pipeline cleanup uses: a file whose thumbnail is missing is kept so a
+// later ScanThumbnails pass can retry generation (the video itself is already
+// safe on the hosts).  Corrupt-file eviction passes false so the file is
+// deleted even without a thumbnail.
+func saveOrphanMetadataAndCleanup(filePath, filename, fileHash, embedURL string, filesize int64, dur float64, timestamp, thumbURL, spriteURL, previewURL string, links map[string]string, thumbMustExist bool) bool {
+	cfg := server.Config
 	dbSaved := false
 	if err := server.SaveRecordingWithLinks(
 		extractUsernameFromFilename(filename), filename, timestamp,
 		"", nil, 0, "", 0, filesize, dur, "", embedURL, thumbURL, spriteURL, previewURL, links,
 	); err != nil {
-		recoveryLogf(filename, "failed to save recording to Supabase: %v", err)
-		if fileHash != "" {
-			if jErr := server.DeleteJournalByHash(fileHash); jErr != nil {
-				recoveryLogf(filename, "could not delete journal after DB failure: %v", jErr)
-			}
-		}
+		// Keep the local journal on DB failure: it holds the dedup record AND
+		// the download links, so the next scan can retry metadata recovery
+		// without re-uploading to any host.  Deleting it here (the old
+		// behavior) destroyed the dedup proof and caused duplicate uploads.
+		recoveryLogf(filename, "failed to save recording to Supabase: %v (journal kept for retry)", err)
 	} else {
 		dbSaved = true
 		recoveryLogf(filename, "saved recording metadata")
 	}
 
 	// Delete local file only once ALL hosts have the file safely, metadata
-	// is persisted, and the THUMBNAIL exists.  Gating on "any of the three
-	// assets" (the old check) let a file whose sprite uploaded but whose
-	// thumbnail failed be deleted — making the thumbnail un-recoverable
-	// forever, because ScanThumbnails needs the source video.  Keep the file
-	// whenever the thumbnail is missing so a later ScanThumbnails pass can
-	// retry generation and fill in the missing URL — the video itself is
-	// already safe on the hosts.
-	if cfg.DeleteLocalAfterUpload && len(uploader.GetSuccessfulUploads(allResults)) > 0 && dbSaved &&
-		thumbURL != "" {
+	// is persisted, and (when thumbMustExist) the THUMBNAIL exists.  Gating on
+	// "any of the three assets" (the old check) let a file whose sprite
+	// uploaded but whose thumbnail failed be deleted — making the thumbnail
+	// un-recoverable forever, because ScanThumbnails needs the source video.
+	// Keep the file whenever the thumbnail is missing so a later
+	// ScanThumbnails pass can retry generation and fill in the missing URL —
+	// the video itself is already safe on the hosts.
+	if cfg.DeleteLocalAfterUpload && dbSaved && (thumbURL != "" || !thumbMustExist) {
 		DeleteSidecarFiles(filePath)
 		if err := removeFileWithRetry(filePath); err != nil {
 			recoveryLogf(filename, "could not remove local file: %v — will retry on next restart", err)
@@ -1521,6 +1656,45 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 	return true
 }
 
+// recoverOrphanMetadataFromJournal rebuilds a missing recording row from the
+// local upload journal after a Supabase outage lost the original metadata
+// save.  The file was already fully uploaded (all hosts recorded as success in
+// the journal), so we persist the stored links instead of re-uploading — which
+// would duplicate the video on every host.
+func recoverOrphanMetadataFromJournal(filePath, filename, fileHash string) bool {
+	if fileHash == "" {
+		return false
+	}
+	links := server.LoadJournalLinks(fileHash)
+	if len(links) == 0 {
+		return false
+	}
+
+	stat, _ := os.Stat(filePath)
+	var filesize int64
+	if stat != nil {
+		filesize = stat.Size()
+	}
+	timestamp := extractTimestampFromFilename(filename)
+	if timestamp == "" {
+		timestamp = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	}
+	dur, _ := VideoDurationSeconds(filePath)
+
+	var embedURL string
+	for _, host := range []string{"VOE.sx", "Vidara", "Mixdrop", "Streamtape"} {
+		if link, ok := links[host]; ok && link != "" {
+			embedURL = embedURLFromLink(host, link)
+			if embedURL != "" {
+				break
+			}
+		}
+	}
+
+	recoveryLogf(filename, "recovery: restoring metadata for fully-uploaded file from journal (%d hosts)", len(links))
+	return saveOrphanMetadataAndCleanup(filePath, filename, fileHash, embedURL, filesize, dur, timestamp, "", "", "", links, true)
+}
+
 // pendingSegmentsDir returns the directory where short video segments are stored
 // awaiting merge with the next recording.  A subdirectory per channel keeps
 // segments from different models separate.
@@ -1530,6 +1704,48 @@ func pendingSegmentsDir(username string) string {
 		dir = server.Config.OutputDir
 	}
 	return filepath.Join(dir, ".pending", username)
+}
+
+// pendingMaxAge is how long a sub-threshold pending segment may sit in
+// .pending before it is deleted outright.  Segments land there when they are
+// below the min-duration-before-upload threshold (the user does not want
+// sub-threshold recordings uploaded); if no new recording arrives to merge
+// them up to the threshold within this window, the stream is not coming back
+// and the segments would leak disk forever.  Age is measured by file
+// modification time — a merge refreshes the mtime, so a segment still being
+// extended by newer recordings is never deleted.
+const pendingMaxAge = 24 * time.Hour
+
+// orphanSettleWindow is how recently a main-video file may have been modified
+// before the orphan scan will consider it "settled".  A channel that just
+// stopped recording finalizes the source in place (ffmpeg reads it while
+// writing the .finalizing scratch and only marks the OUTPUT in-flight), so a
+// recently-touched file is likely mid-finalize — skip it this pass and let
+// the pipeline own it.
+const orphanSettleWindow = 5 * time.Minute
+
+// deleteStalePendingSegments removes pending segments older than pendingMaxAge.
+// Callers must hold the channel's pending mutex.
+func deleteStalePendingSegments(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-pendingMaxAge)
+	for _, e := range entries {
+		if e.IsDir() || isSidecar(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			path := filepath.Join(dir, e.Name())
+			log.Printf("[min-duration] deleting stale pending segment %s (mod %s, older than %s)", path, info.ModTime().Format(time.RFC3339), pendingMaxAge)
+			_ = os.Remove(path)
+		}
+	}
 }
 
 // collectPendingSegments returns sorted absolute paths of all pending segments
@@ -1645,8 +1861,18 @@ func renameOverwriting(src, dst string) error {
 	return os.Rename(src, dst)
 }
 
-// VideoDurationSeconds probes a video file and returns its duration in seconds.
-// Falls back to parsing ffmpeg stderr output when ffprobe is unavailable or fails.
+// IsUnreadableVideo reports whether a video file cannot be probed by ffprobe
+// (or reports zero duration).  Used by the thumbnail-failure eviction path to
+// distinguish a permanently-corrupt recording from a healthy file whose
+// thumbnail upload failed transiently (image-host outage) — only genuinely
+// unreadable files are evicted.
+func IsUnreadableVideo(videoPath string) bool {
+	dur, err := VideoDurationSeconds(videoPath)
+	return err != nil || dur <= 0
+}
+
+// VideoDurationSeconds probes the duration of a video file using ffprobe, falling back
+// to parsing ffmpeg's "Duration:" stderr output when ffprobe fails.
 func VideoDurationSeconds(videoPath string) (float64, error) {
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer probeCancel()
@@ -2121,6 +2347,18 @@ func processPendingUserSegments(username string) {
 
 	mu.Lock()
 	segments := collectPendingSegmentsInDir(pendingSegmentsDir(username))
+	if len(segments) < 1 {
+		mu.Unlock()
+		return
+	}
+
+	// Age out sub-threshold segments that have been pending too long.  The
+	// user does not want <threshold uploads, and a segment that has not been
+	// extended by newer recordings within pendingMaxAge means the stream is
+	// not coming back — keeping it would leak disk forever with no upload
+	// ever possible.  Delete it outright.
+	deleteStalePendingSegments(pendingSegmentsDir(username))
+	segments = collectPendingSegmentsInDir(pendingSegmentsDir(username))
 	if len(segments) < 1 {
 		mu.Unlock()
 		return
