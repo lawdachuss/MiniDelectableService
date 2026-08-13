@@ -6,8 +6,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/teacat/chaturbate-dvr/config"
@@ -79,6 +81,43 @@ func fileExists(path string) bool {
 	return err == nil && !fi.IsDir()
 }
 
+// runFFmpegParallel runs fn for each index in [0, n) with up to workers
+// goroutines running at once.  Each fn is responsible for acquiring its own
+// ffmpeg slot (AcquireFFmpeg/ReleaseFFmpeg) so the global ffmpegSem bounds
+// total concurrency across all channels.  Returns the first error (others are
+// still awaited; their results are discarded).
+func runFFmpegParallel(workers, n int, fn func(i int) error) error {
+	if workers < 1 {
+		workers = 1
+	}
+	if n < 1 {
+		return nil
+	}
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	slots := make(chan struct{}, workers)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		slots <- struct{}{}
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			if err := fn(idx); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	return firstErr
+}
+
 func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{})) (thumbURL, spriteURL, previewURL string) {
 	ext := strings.ToLower(filepath.Ext(videoPath))
 	if ext != ".mp4" && ext != ".mkv" && ext != ".ts" {
@@ -120,13 +159,38 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 	}
 
-	// Compute the interval so we get exactly spriteFrames frames spread
-	// evenly across the whole video.  Clamp to at least 0.1 s.
-	interval := 10.0
-	if dur > 0 {
-		interval = dur / float64(spriteFrames)
-		if interval < 0.1 {
-			interval = 0.1
+	// MPEG-TS has no seek index: every -ss before -i still demuxes from byte 0,
+	// so extracting 16 sprite tiles + 12 preview clips from a long .ts
+	// recording means up to ~28 full-file scans (minutes to tens of minutes
+	// for 2-4 h videos on shared hosts).  Remux ONCE to a seekable temp .mp4
+	// (stream copy — no re-encode, purely I/O-bound) and extract from that:
+	// the single remux read/write replaces all 28 scans, and the subsequent
+	// keyframe seeks are instant index-based jumps.
+	workPath := videoPath
+	if ext == ".ts" {
+		remuxCtx, remuxCancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer remuxCancel()
+		workDir, mkErr := os.MkdirTemp("", "thumb-seekable-")
+		if mkErr != nil {
+			errFn("thumb: mkdir temp for seekable remux: %v", mkErr)
+		} else {
+			defer os.RemoveAll(workDir)
+			seekablePath := filepath.Join(workDir, "seekable.mp4")
+			config.AcquireFFmpeg()
+			remuxErr := config.FFmpegCommandContext(remuxCtx,
+				"-y",
+				"-i", videoPath,
+				"-c", "copy",
+				"-movflags", "+faststart",
+				seekablePath,
+			).Run()
+			config.ReleaseFFmpeg()
+			if remuxErr == nil && fileExists(seekablePath) {
+				workPath = seekablePath
+				info("thumb: remuxed %s to seekable temp for fast extraction", baseName)
+			} else {
+				errFn("thumb: seekable remux failed for %s: %v — extracting directly", baseName, remuxErr)
+			}
 		}
 	}
 
@@ -164,9 +228,9 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		generateThumb := func(slow bool) error {
 			args := []string{"-y"}
 			if slow {
-				args = append(args, "-i", videoPath, "-ss", seekPos)
+				args = append(args, "-i", workPath, "-ss", seekPos)
 			} else {
-				args = append(args, "-ss", seekPos, "-i", videoPath)
+				args = append(args, "-ss", seekPos, "-i", workPath)
 			}
 			args = append(args,
 				"-vframes", "1",
@@ -226,10 +290,18 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	// (spriteCols*spriteFrameW) × (spriteRows*spriteFrameH) = 2560×1440.
 	// Using 640×360 frames so HiDPI/Retina displays get sharp previews.
 	//
-	// Independent 15-minute context: for long recordings (1 h+), ffmpeg must
-	// seek to 16 evenly-spaced positions, which can take several minutes on a
-	// slow or resource-constrained host.  A short shared context would cause
-	// SIGKILL ("signal: killed") and silently skip sprite generation.
+	// FAST PATH: instead of decoding the ENTIRE video with a sequential
+	// fps=1/INTERVAL filter (which costs one full decode pass — minutes to
+	// tens of minutes for 2-4 h recordings on shared hosts), each tile is
+	// extracted with an input keyframe seek (-ss before -i).  A seek decodes
+	// only ~1 GOP (~1-4 s of frames) instead of the whole file, so the sprite
+	// takes ~1 s regardless of recording length.  Tiles land on the keyframe
+	// nearest each target position, which is visually identical in a 640×360
+	// contact-sheet tile.
+	//
+	// Independent 15-minute context: extraction runs N quick seeks; a short
+	// shared context would cause SIGKILL ("signal: killed") and silently skip
+	// sprite generation on slow hosts.
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -246,35 +318,122 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		spriteJPG := videoPath + ".sprite.jpg"
 		defer os.Remove(spriteJPG)
 
-		// fps=1/INTERVAL extracts one frame per interval.
-		// scale with lanczos gives sharper results than the default bilinear.
-		// pad keeps each tile at exactly spriteFrameW×spriteFrameH.
-		// tile=COLSxROWS assembles them into the contact sheet.
-		vf := fmt.Sprintf(
-			"fps=1/%.4f,scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,tile=%dx%d",
-			interval,
-			spriteFrameW, spriteFrameH,
-			spriteFrameW, spriteFrameH,
-			spriteCols, spriteRows,
-		)
+		tileDir, err := os.MkdirTemp("", "sprite-tiles-")
+		if err != nil {
+			errFn("sprite: mkdir temp for %s: %v", baseName, err)
+			spriteDone <- ""
+			return
+		}
+		defer os.RemoveAll(tileDir)
 
-		// generateSprite renders the contact sheet (slow seek is not needed
-		// here — the fps filter reads sequentially).
+		// Positions for the 16 tiles, evenly spaced across the video.
+		// Clamp so the last tile never seeks past the end.
+		positions := make([]float64, spriteFrames)
+		if dur > 0 {
+			spacing := dur / float64(spriteFrames)
+			for i := range positions {
+				positions[i] = spacing * float64(i)
+			}
+		} else {
+			// No duration available — fall back to fixed 10 s spacing like
+			// the old fps=1/10 filter did.
+			for i := range positions {
+				positions[i] = 10.0 * float64(i)
+			}
+		}
+
+		// generateSprite extracts all 16 tiles via keyframe seeks (in parallel,
+		// bounded by the global ffmpeg semaphore), then assembles them into the
+		// contact sheet with one tile=4x4 pass.
 		generateSprite := func() error {
-			return config.FFmpegCommandContext(spriteCtx,
+			// Extract one tile via a fast keyframe seek.  Each tile acquires its
+			// own ffmpeg slot so tiles run concurrently across the pool; -threads 1
+			// keeps a single seek from grabbing the whole CPU when N run at once.
+			extractTile := func(i int) error {
+				pos := positions[i]
+				tilePath := filepath.Join(tileDir, fmt.Sprintf("t%d.jpg", i))
+				vf := fmt.Sprintf(
+					"scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
+					spriteFrameW, spriteFrameH,
+					spriteFrameW, spriteFrameH,
+				)
+				// Fast keyframe seek: -ss before -i.  Decodes only the GOP
+				// containing the target position.
+				seekArgs := []string{
+					"-y",
+					"-threads", "1",
+					"-ss", fmt.Sprintf("%.3f", pos),
+					"-i", workPath,
+					"-frames:v", "1",
+					"-vf", vf,
+					"-c:v", "mjpeg",
+					"-q:v", "5",
+					tilePath,
+				}
+				config.AcquireFFmpeg()
+				err := config.FFmpegCommandContext(spriteCtx, seekArgs...).Run()
+				config.ReleaseFFmpeg()
+				if err != nil || !fileExists(tilePath) {
+					// Fast seek failed (some codecs crash with -ss before -i on
+					// Windows, exit 0xffffffea).  Retry with slow seek (-ss after
+					// -i); the decode cost is bounded by the GOP, not the file.
+					errFn("sprite: tile %d fast seek failed for %s: %v — retrying with slow seek", i, baseName, err)
+					slowArgs := []string{
+						"-y",
+						"-threads", "1",
+						"-i", workPath,
+						"-ss", fmt.Sprintf("%.3f", pos),
+						"-frames:v", "1",
+						"-vf", vf,
+						"-c:v", "mjpeg",
+						"-q:v", "5",
+						tilePath,
+					}
+					config.AcquireFFmpeg()
+					err = config.FFmpegCommandContext(spriteCtx, slowArgs...).Run()
+					config.ReleaseFFmpeg()
+					if err != nil {
+						return fmt.Errorf("tile %d at %.0fs: %w", i, pos, err)
+					}
+				}
+				if !fileExists(tilePath) {
+					return fmt.Errorf("tile %d at %.0fs never appeared", i, pos)
+				}
+				return nil
+			}
+
+			// Spawn tiles concurrently — 16 sequential ffmpeg spawns (each with
+			// process startup + GOP decode) is the sprite's dominant cost.
+			// Cap workers at NumCPU so we don't thrash; ffmpegSem bounds the
+			// true concurrent ffmpeg count across the whole fleet of channels.
+			workers := runtime.NumCPU()
+			if workers > spriteFrames {
+				workers = spriteFrames
+			}
+			if err := runFFmpegParallel(workers, spriteFrames, extractTile); err != nil {
+				return err
+			}
+
+			// Assemble the 16 tiles into the 4×4 contact sheet via the image2
+			// demuxer + tile filter (one cheap pass over the tiny JPEGs).
+			pattern := filepath.ToSlash(filepath.Join(tileDir, "t%d.jpg"))
+			config.AcquireFFmpeg()
+			err := config.FFmpegCommandContext(spriteCtx,
 				"-y",
-				"-i", videoPath,
-				"-vf", vf,
+				"-framerate", "1",
+				"-start_number", "0",
+				"-i", pattern,
+				"-vf", fmt.Sprintf("tile=%dx%d", spriteCols, spriteRows),
 				"-frames:v", "1",
 				"-c:v", "mjpeg",
 				"-q:v", "5",
 				spriteJPG,
 			).Run()
+			config.ReleaseFFmpeg()
+			return err
 		}
 
-		config.AcquireFFmpeg()
-		defer config.ReleaseFFmpeg()
-		err := generateSprite()
+		err = generateSprite()
 
 		// Same missing-file-at-upload-time race as the thumbnail: a concurrent
 		// flow can DeleteSidecarFiles on this video while we're between ffmpeg
@@ -319,6 +478,16 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	//   <6 sec:  no segmenting, plays whole video at normal speed
 	//   1 min:   12 clips × 0.5s = 6s (5s between clips)
 	//   60 min:  12 clips × 0.5s = 6s (5 min between clips)
+	//
+	// FAST PATH: the old implementation decoded the ENTIRE video once through
+	// a filter_complex (every trim=start=… branch forced a full sequential
+	// decode from frame 0), which took minutes to tens of minutes for 2-4 h
+	// recordings and even hit the 15-minute timeout — producing truncated
+	// ~1.7 s previews.  Each clip is now extracted with an input keyframe
+	// seek (-ss before -i), which decodes only ~1 GOP (~1-4 s of frames)
+	// before the clip start, so the whole preview takes ~1-2 s regardless of
+	// recording length.  Clips land on the keyframe nearest each target
+	// position — visually identical for 0.5 s hover clips.
 	//
 	// Uploaded to Catbox.moe (free, permanent, CDN-backed) with ImgBB
 	// as fallback — both return direct file URLs suitable for embedding.
@@ -369,7 +538,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			// libwebp needs a constant frame rate, so -r 15 forces CFR.
 			err = config.FFmpegCommandContext(previewCtx,
 				"-y",
-				"-i", videoPath,
+				"-i", workPath,
 				"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
 				"-c:v", "libwebp",
 				"-lossless", "0",
@@ -379,70 +548,137 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				previewPath,
 			).Run()
 		} else {
-			// Build a filter_complex that extracts clips and stitches them.
+			// Extract 12 short clips via keyframe seeks into a temp dir, then
+			// concat them and run ONE final WEBP encode.  Each clip is tiny
+			// (0.5 s at 320 px), so the intermediate re-encode cost is
+			// negligible compared to the full-decode the old filter_complex
+			// approach required.
 			segDuration := previewDuration / float64(previewSegments)
 			step := dur / float64(previewSegments)
 
-			var filterParts []string
-			var concatInputs []string
+			clipDir, mkErr := os.MkdirTemp("", "preview-clips-")
+			if mkErr != nil {
+				err = fmt.Errorf("mkdir temp clips: %w", mkErr)
+			} else {
+				defer os.RemoveAll(clipDir)
 
-			for i := 0; i < previewSegments; i++ {
-				midpoint := step * (float64(i) + 0.5)
-				start := midpoint - segDuration/2
+				// Extract all 12 clips concurrently (bounded by the global ffmpeg
+				// semaphore).  The clips are independent keyframe seeks, so 12
+				// sequential ffmpeg spawns become ~1 round-trip each.
+				extractClip := func(i int) error {
+					midpoint := step * (float64(i) + 0.5)
+					start := midpoint - segDuration/2
+					if start+segDuration > dur {
+						start = dur - segDuration
+					}
+					if start < 0 {
+						start = 0
+					}
 
-				if start+segDuration > dur {
-					start = dur - segDuration
+					clipPath := filepath.Join(clipDir, fmt.Sprintf("c%d.mp4", i))
+					seekArgs := []string{
+						"-y",
+						"-threads", "1",
+						"-ss", fmt.Sprintf("%.3f", start),
+						"-i", workPath,
+						"-t", fmt.Sprintf("%.3f", segDuration),
+						"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos,setpts=PTS-STARTPTS", previewWidth),
+						"-c:v", "libx264",
+						"-preset", "ultrafast",
+						"-crf", "23",
+						"-r", "15",
+						"-an",
+						clipPath,
+					}
+					config.AcquireFFmpeg()
+					seekErr := config.FFmpegCommandContext(previewCtx, seekArgs...).Run()
+					config.ReleaseFFmpeg()
+					if seekErr != nil || !fileExists(clipPath) {
+						if seekErr != nil {
+							errFn("preview: clip %d fast seek failed for %s: %v — retrying with slow seek", i, baseName, seekErr)
+						}
+						slowArgs := []string{
+							"-y",
+							"-threads", "1",
+							"-i", workPath,
+							"-ss", fmt.Sprintf("%.3f", start),
+							"-t", fmt.Sprintf("%.3f", segDuration),
+							"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos,setpts=PTS-STARTPTS", previewWidth),
+							"-c:v", "libx264",
+							"-preset", "ultrafast",
+							"-crf", "23",
+							"-r", "15",
+							"-an",
+							clipPath,
+						}
+						config.AcquireFFmpeg()
+						seekErr = config.FFmpegCommandContext(previewCtx, slowArgs...).Run()
+						config.ReleaseFFmpeg()
+						if seekErr != nil {
+							return fmt.Errorf("clip %d at %.2fs: %w", i, start, seekErr)
+						}
+					}
+					if !fileExists(clipPath) {
+						return fmt.Errorf("clip %d at %.2fs never appeared", i, start)
+					}
+					return nil
 				}
-				if start < 0 {
-					start = 0
+
+				workers := runtime.NumCPU()
+				if workers > previewSegments {
+					workers = previewSegments
+				}
+				if cErr := runFFmpegParallel(workers, previewSegments, extractClip); cErr != nil {
+					err = cErr
 				}
 
-				label := fmt.Sprintf("v%d", i)
-				filterParts = append(filterParts, fmt.Sprintf(
-					"[0:v]trim=start=%.3f:duration=%.3f,setpts=PTS-STARTPTS,scale=%d:-2:flags=lanczos[%s]",
-					start, segDuration, previewWidth, label,
-				))
-				concatInputs = append(concatInputs, fmt.Sprintf("[%s]", label))
+				if err == nil {
+					// Concat the clips with the concat demuxer, then run ONE
+					// final WEBP encode over the stitched 6 s.
+					listPath := filepath.Join(clipDir, "list.txt")
+					var list strings.Builder
+					for i := 0; i < previewSegments; i++ {
+						clipPath := filepath.ToSlash(filepath.Join(clipDir, fmt.Sprintf("c%d.mp4", i)))
+						list.WriteString(fmt.Sprintf("file '%s'\n", clipPath))
+					}
+					if werr := os.WriteFile(listPath, []byte(list.String()), 0o666); werr != nil {
+						err = fmt.Errorf("write concat list: %w", werr)
+					} else {
+						err = config.FFmpegCommandContext(previewCtx,
+							"-y",
+							"-f", "concat",
+							"-safe", "0",
+							"-i", listPath,
+							"-c:v", "libwebp",
+							"-lossless", "0",
+							"-q:v", "60",
+							"-r", "15",
+							"-an",
+							previewPath,
+						).Run()
+					}
+				}
 			}
 
-			filterComplex := strings.Join(filterParts, ";") + ";" +
-				strings.Join(concatInputs, "") +
-				fmt.Sprintf("concat=n=%d:v=1:a=0[out]", previewSegments)
-
-			err = config.FFmpegCommandContext(previewCtx,
-				"-y",
-				"-i", videoPath,
-				"-filter_complex", filterComplex,
-				"-map", "[out]",
-				"-c:v", "libwebp",
-				"-lossless", "0",
-				"-q:v", "60",
-				"-r", "15",
-				"-an",
-				previewPath,
-			).Run()
-
-			// If the complex filter_complex failed, fall back to a simple
-			// single-clip preview from the middle of the video.  The
-			// filter_complex can silently produce no output on some videos
-			// (e.g. when the video stream has unusual timing), causing the
-			// uploader to fail with "file not found" even though ffmpeg
-			// exited 0.
+			// If extraction or the concat encode failed, fall back to a simple
+			// single-clip preview from the middle of the video.  The old
+			// filter_complex could also silently produce no output on some
+			// videos (e.g. unusual stream timing), so keep the fallback.
 			//
 			// Use a fresh context so the fallback gets its own 5-minute
 			// timeout instead of inheriting the nearly-expired previewCtx.
 			if err != nil || !fileExists(previewPath) {
 				if err != nil {
-					errFn("preview: complex filter failed for %s: %v, trying simple fallback", baseName, err)
+					errFn("preview: clip extraction failed for %s: %v, trying simple fallback", baseName, err)
 				} else {
-					errFn("preview: complex filter produced no output for %s, trying simple fallback", baseName)
+					errFn("preview: clip concat produced no output for %s, trying simple fallback", baseName)
 				}
 				fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 				defer fallbackCancel()
 				err = config.FFmpegCommandContext(fallbackCtx,
 					"-y",
 					"-ss", fmt.Sprintf("%.2f", dur*0.3),
-					"-i", videoPath,
+					"-i", workPath,
 					"-t", fmt.Sprintf("%.2f", previewDuration),
 					"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
 					"-c:v", "libwebp",

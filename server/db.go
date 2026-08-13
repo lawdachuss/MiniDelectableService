@@ -116,10 +116,19 @@ func CookieSettingsKey() string {
 
 var dbClient *database.Client
 
+// supabaseKey returns the service_role key when configured (bypasses RLS so
+// writes succeed), falling back to the anon/public key.
+func supabaseKey() string {
+	if Config != nil && Config.SupabaseServiceRoleKey != "" {
+		return Config.SupabaseServiceRoleKey
+	}
+	return supabaseRestAPIKey()
+}
+
 // GetDBClient returns the Supabase database client
 func GetDBClient() *database.Client {
 	if dbClient == nil && Config != nil && Config.SupabaseURL != "" && Config.SupabaseAPIKey != "" {
-		dbClient = database.NewClient(Config.SupabaseURL, Config.SupabaseAPIKey)
+		dbClient = database.NewClient(Config.SupabaseURL, supabaseKey())
 	}
 	return dbClient
 }
@@ -174,7 +183,7 @@ func supabaseRequestFast(method, path string, body []byte, prefer string) (*http
 // supabaseRequestWithClient is the low-level HTTP helper using the given client.
 func supabaseRequestWithClient(method, path string, body []byte, prefer string, client *http.Client) (*http.Response, error) {
 	baseURL := supabaseRestURL()
-	apiKey := supabaseRestAPIKey()
+	apiKey := supabaseKey()
 	if baseURL == "" || apiKey == "" {
 		return nil, fmt.Errorf("Supabase not configured")
 	}

@@ -82,19 +82,19 @@ func (c *ChannelConfig) Sanitize() {
 type PauseReason string
 
 const (
-	PauseReasonManual    PauseReason = "manual"           // user clicked Pause in the web UI
-	PauseReasonBoundary  PauseReason = "session-boundary" // session stop / processing phase
-	PauseReasonHandoff   PauseReason = "handoff"          // channel being moved to another node
+	PauseReasonManual   PauseReason = "manual"           // user clicked Pause in the web UI
+	PauseReasonBoundary PauseReason = "session-boundary" // session stop / processing phase
+	PauseReasonHandoff  PauseReason = "handoff"          // channel being moved to another node
 )
 
 // ChannelInfo represents the information about a channel,
 // mostly used for the template rendering.
 type ChannelInfo struct {
-	IsOnline       bool
-	IsConnecting   bool
-	IsPaused       bool
-	IsCompressing  bool
-	RoomStatus     string // public, private, group, away, offline, hidden
+	IsOnline      bool
+	IsConnecting  bool
+	IsPaused      bool
+	IsCompressing bool
+	RoomStatus    string // public, private, group, away, offline, hidden
 	// PauseReason explains WHY a paused channel is paused (empty when not
 	// paused or the reason is unknown/legacy). "manual" pauses are sticky and
 	// are never auto-resumed or flagged as stuck.
@@ -104,23 +104,23 @@ type ChannelInfo struct {
 	// paused while the DB still assigned it to this node). The node web UI
 	// shows a badge so the recovery is visible.
 	AutoResumedFromPause bool
-	Username       string
-	Site           string // "chaturbate" or "stripchat"
-	SiteDomain     string // domain for channel link, e.g. "https://www.cb.xxx/"
-	LiveThumbURL   string // live-updating thumbnail; empty = use platform default
-	Duration       string
-	Filesize       string
-	TotalDiskUsage string // total bytes across all recordings for this channel
-	Filename       string
-	StreamedAt     string
-	MaxDuration    string
-	MaxFilesize    string
-	CreatedAt      int64
-	Logs           []string
-	GlobalConfig   *Config // for nested template to access $.Config
-	UploadStatus   string  // human-readable upload status (empty = idle)
-	UploadProgress float64 // 0–100 upload progress estimate
-	UploadFilename string  // file currently being uploaded
+	Username             string
+	Site                 string // "chaturbate" or "stripchat"
+	SiteDomain           string // domain for channel link, e.g. "https://www.cb.xxx/"
+	LiveThumbURL         string // live-updating thumbnail; empty = use platform default
+	Duration             string
+	Filesize             string
+	TotalDiskUsage       string // total bytes across all recordings for this channel
+	Filename             string
+	StreamedAt           string
+	MaxDuration          string
+	MaxFilesize          string
+	CreatedAt            int64
+	Logs                 []string
+	GlobalConfig         *Config // for nested template to access $.Config
+	UploadStatus         string  // human-readable upload status (empty = idle)
+	UploadProgress       float64 // 0–100 upload progress estimate
+	UploadFilename       string  // file currently being uploaded
 
 	// Persisted room metadata (shown even when offline).
 	RoomTitle        string
@@ -205,7 +205,7 @@ type Config struct {
 	Csrftoken     string
 	CfClearance   string
 	UserAgent     string
-	Domain string
+	Domain        string
 
 	OutputDir               string
 	PerModelFolder          bool
@@ -216,21 +216,22 @@ type Config struct {
 	DiskCriticalPercent     int // auto-delete oldest recordings when disk exceeds this (0 = disabled, default 90)
 	MaxLocalAgeDays         int // delete local files older than N days if uploaded (0 = disabled)
 
-	VoeSXAPIKey      string
-	StreamtapeLogin  string
-	StreamtapeKey    string
-	MixdropEmail     string
-	MixdropToken     string
-	VidaraKey        string
-	CatboxProxyURL   string
+	VoeSXAPIKey     string
+	StreamtapeLogin string
+	StreamtapeKey   string
+	MixdropEmail    string
+	MixdropToken    string
+	VidaraKey       string
+	CatboxProxyURL  string
 
 	// Upload throughput tuning.
 	UploadMaxConcurrent   int // max video files uploading concurrently (0 = default 100)
 	UploadHostConcurrency int // max concurrent uploads per host (0 = default 8)
 	PipelineWorkers       int // concurrent pipelines per channel queue (0 = default 3)
 
-	SupabaseURL    string
-	SupabaseAPIKey string
+	SupabaseURL            string
+	SupabaseAPIKey         string
+	SupabaseServiceRoleKey string
 
 	StripchatPDKey string
 

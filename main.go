@@ -410,6 +410,12 @@ func main() {
 				Value:   "",
 			},
 			&cli.StringFlag{
+				Name:    "supabase-service-role-key",
+				Usage:   "Supabase service_role key (bypasses RLS) for database writes",
+				EnvVars: []string{"SUPABASE_SERVICE_ROLE_KEY"},
+				Value:   "",
+			},
+			&cli.StringFlag{
 				Name:    "affiliate-wm",
 				Usage:   "Webmaster code for the affiliate onlinerooms bulk liveness check",
 				EnvVars: []string{"AFFILIATE_WM"},

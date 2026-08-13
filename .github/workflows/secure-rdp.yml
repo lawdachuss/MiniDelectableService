@@ -21,8 +21,13 @@ permissions:
 # queue and can never self-cancel (Init doesn't run while queued). Without the
 # group, the new run starts as soon as a runner is free and the Init
 # self-cancel check in the job below kills it within a minute if a session is
-# still recording — same behavior as the reference fleet. Only queued runs that
-# wait for a RUNNER (account concurrent-job limit) can still appear.
+# still recording — same behavior as the reference fleet.
+#
+# Runs that wait for a RUNNER (account concurrent-job limit on the scarce
+# windows-latest quota) stay "Queued" and still cannot run Init. They are now
+# cancelled from inside any active session instead: Init clears queued
+# duplicates at startup (below) and the keep-alive loop re-cleans them every
+# 5 minutes for the whole session (see scripts/keep-alive.ps1).
 
 env:
   GH_TOKEN: ${{ github.token }}
@@ -80,9 +85,15 @@ jobs:
           Remove-Item "D:\repos\$repoName\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
           echo "START_TIME=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
           # Self-cancel instead of queuing: if another run is still recording
-          # within its 6h window (<348 min), cancel THIS run and exit.
+          # within its 6h window (<355 min), cancel THIS run and exit.
           $r = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status,startedAt 2>$null | ConvertFrom-Json
-          if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt 348)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
+          if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt 355)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
+          # A run waiting in the runner queue can NEVER self-cancel (its steps
+          # don't execute). Since THIS run has a runner, cancel any queued
+          # runs of the same workflow so the account's concurrent-job slot is
+          # freed immediately instead of holding a dead run for hours.
+          $q = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status 2>$null | ConvertFrom-Json
+          if ($q) { foreach ($run in $q) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'queued') { Write-Host "Cancelling queued run $($run.databaseId)"; gh run cancel $run.databaseId --repo "$env:GITHUB_REPOSITORY" 2>$null } } }
 
       # ── Caches: restore everything, save everything ──────────────────────────
       # Go modules + build cache are handled by setup-go below (cache: true).

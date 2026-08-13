@@ -1,4 +1,4 @@
-$repoDir = "$env:REPO_DIR"; $dvrExe = "$repoDir\chaturbate-dvr.exe"; $videosDir = "D:\videos"
+﻿$repoDir = "$env:REPO_DIR"; $dvrExe = "$repoDir\chaturbate-dvr.exe"; $videosDir = "D:\videos"
 $dvrLog = "$repoDir\dvr-output.log"; $tunnelUrlFile = "$repoDir\tunnel-url.txt"; $uploadFlag = "$repoDir\upload-complete.flag"
 $cloudflaredPath = "$repoDir\cloudflared.exe"
 $tsIp = "$env:TAILSCALE_IP"
@@ -557,6 +557,53 @@ while ($true) {
       $lastWebUrlUpdate = $elapsed
       Update-NodeWebUrl $myNodeId "$tunnelUrl"
     }
+  }
+
+  # ═══ Run arbiter (every 5 min + once at boot) ═══
+  # Exactly ONE active session per repo. A cron run that waits in the runner
+  # queue (account concurrent-job limit) can start AFTER the previous session's
+  # Init self-cancel window closed, leaving two in_progress runs recording the
+  # same channels. Arbiter rule, keyed off run startedAt (deterministic):
+  #   - cancel every queued/pending run (can never run Init, so only a running
+  #     session can free the slot);
+  #   - among in_progress runs, the OLDEST (earliest startedAt) owns recording;
+  #     cancel every newer in_progress duplicate;
+  #   - if THIS run is a newer duplicate and the oldest is still within its
+  #     355-min session window, cancel ourselves.
+  if (-not $lastRunSweep) { $lastRunSweep = -301 }
+  if ($elapsed - $lastRunSweep -ge 300) {
+    $lastRunSweep = $elapsed
+    try {
+      $rr = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 20 --json databaseId,status,startedAt 2>$null | ConvertFrom-Json
+      if ($rr) {
+        foreach ($rq in $rr) {
+          if ($rq.databaseId -eq $env:GITHUB_RUN_ID) { continue }
+          if ($rq.status -eq 'queued' -or $rq.status -eq 'pending' -or $rq.status -eq 'waiting') {
+            Write-Host "(ARBITER) Cancelling $($rq.status) run $($rq.databaseId)"; $null = [System.Console]::Out.Flush()
+            gh run cancel $rq.databaseId --repo "$env:GITHUB_REPOSITORY" 2>$null
+          }
+        }
+        $inProgress = @($rr | Where-Object { $_.status -eq 'in_progress' -and $_.startedAt })
+        if ($inProgress.Count -gt 1) {
+          $oldest = ($inProgress | Sort-Object { [DateTime]::Parse($_.startedAt) } | Select-Object -First 1)
+          foreach ($rip in $inProgress) {
+            if ($rip.databaseId -eq $oldest.databaseId -or $rip.databaseId -eq $env:GITHUB_RUN_ID) { continue }
+            Write-Host "(ARBITER) Duplicate in_progress run $($rip.databaseId) — cancelling"; $null = [System.Console]::Out.Flush()
+            gh run cancel $rip.databaseId --repo "$env:GITHUB_REPOSITORY" 2>$null
+          }
+          # This run is a duplicate (an older run is still recording).
+          $myStart = $rr | Where-Object { $_.databaseId -eq $env:GITHUB_RUN_ID } | Select-Object -First 1
+          if ($myStart -and $myStart.startedAt) {
+            $oldestAgeMin = ([DateTime]::UtcNow - [DateTime]::Parse($oldest.startedAt).ToUniversalTime()).TotalMinutes
+            $myIsOldest = ($myStart.databaseId -eq $oldest.databaseId)
+            if (-not $myIsOldest -and $oldestAgeMin -lt 355) {
+              Write-Host "(ARBITER) Older run $($oldest.databaseId) still recording (${oldestAgeMin}m) — cancelling self"; $null = [System.Console]::Out.Flush()
+              gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY" 2>$null
+            }
+          }
+        }
+      }
+    } catch {}
   }
 
   Start-Sleep -Seconds $sleepSecs
