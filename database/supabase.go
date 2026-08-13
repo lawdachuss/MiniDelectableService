@@ -381,25 +381,54 @@ func (c *Client) DeleteChannel(username string) error {
 	return c.delete(fmt.Sprintf("/channels?username=eq.%s", url.QueryEscape(username)))
 }
 
+// deleteByUsernamesChunked DELETEs rows by username in small batches so each
+// filter URL stays far below the ~8KB proxy limit (HTTP 414).
+func (c *Client) deleteByUsernamesChunked(table string, usernames []string) error {
+	for start := 0; start < len(usernames); start += releaseBatchSize {
+		end := start + releaseBatchSize
+		if end > len(usernames) {
+			end = len(usernames)
+		}
+		batch := usernames[start:end]
+		if err := c.delete(fmt.Sprintf("/%s?username=in.(%s)", table, joinEscaped(batch))); err != nil {
+			return fmt.Errorf("delete %s batch %d/%d: %w", table, start/releaseBatchSize+1, (len(usernames)+releaseBatchSize-1)/releaseBatchSize, err)
+		}
+	}
+	return nil
+}
+
 // DeleteChannelsNotIn removes all channel rows whose username is NOT in the
 // provided list. Pass an empty slice to delete all channels.
+//
+// The old implementation built a single not.in.(keep...) filter listing every
+// kept username — at scale that URL exceeds the ~8KB proxy limit (HTTP 414),
+// and chunking an exclusion filter is unsafe (each chunk would delete the
+// other chunks' keep rows). So we fetch the existing channels, compute the
+// exact to-delete set, and DELETE it in small in.(...) batches instead.
 func (c *Client) DeleteChannelsNotIn(usernames []string) error {
 	if len(usernames) == 0 {
 		return c.delete("/channels")
 	}
-	// Build a PostgREST "not.in.(a,b,c)" filter
-	escaped := make([]string, len(usernames))
-	for i, u := range usernames {
-		escaped[i] = url.QueryEscape(u)
+
+	keep := make(map[string]bool, len(usernames))
+	for _, u := range usernames {
+		keep[u] = true
 	}
-	list := ""
-	for i, u := range usernames {
-		if i > 0 {
-			list += ","
+
+	var existing []Channel
+	if err := c.get("/channels?select=username&limit=50000", &existing); err != nil {
+		return err
+	}
+	var toDelete []string
+	for _, ch := range existing {
+		if !keep[ch.Username] {
+			toDelete = append(toDelete, ch.Username)
 		}
-		list += u
 	}
-	return c.delete(fmt.Sprintf("/channels?username=not.in.(%s)", url.QueryEscape("("+list+")")))
+	if len(toDelete) == 0 {
+		return nil
+	}
+	return c.deleteByUsernamesChunked("channels", toDelete)
 }
 
 // ============================================================================

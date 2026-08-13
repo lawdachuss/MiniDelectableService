@@ -199,6 +199,70 @@ func TestReleaseNodeOfflineChannelsExcludesPaused(t *testing.T) {
 	}
 }
 
+func TestDeleteChannelsNotInChunked(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	// The fake serves 100 existing channels (u000..u099); keeping 2 means 98
+	// must be deleted → ceil(98/40) = 3 DELETE batches.
+	if err := c.DeleteChannelsNotIn([]string{"u000", "u001"}); err != nil {
+		t.Fatalf("DeleteChannelsNotIn: %v", err)
+	}
+
+	var deletes []reqRecord
+	for _, rec := range fake.reqs {
+		if rec.method == "DELETE" {
+			deletes = append(deletes, rec)
+		}
+	}
+	if want := (98 + releaseBatchSize - 1) / releaseBatchSize; len(deletes) != want {
+		t.Fatalf("DELETE count = %d, want %d", len(deletes), want)
+	}
+	for i, rec := range deletes {
+		if len(rec.path) > maxFilterURLLen {
+			t.Errorf("DELETE %d URL is %d bytes (> %d, 414 risk)", i, len(rec.path), maxFilterURLLen)
+		}
+		if strings.Contains(rec.path, "not.in.(") {
+			t.Errorf("DELETE %d must delete by in.(toDelete), not not.in.(keep): %s", i, rec.path)
+		}
+		if !strings.Contains(rec.path, "username=in.(") {
+			t.Errorf("DELETE %d missing username=in.(...) filter: %s", i, rec.path)
+		}
+	}
+}
+
+func TestDeleteChannelsNotInEmptyDeletesAll(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	if err := c.DeleteChannelsNotIn(nil); err != nil {
+		t.Fatalf("DeleteChannelsNotIn(nil): %v", err)
+	}
+	// Empty keep-list = delete everything: exactly one filter-less DELETE.
+	if len(fake.reqs) != 1 || fake.reqs[0].method != "DELETE" || fake.reqs[0].path != "/rest/v1/channels" {
+		t.Errorf("expected exactly one DELETE to /rest/v1/channels, got %+v", fake.reqs)
+	}
+}
+
+func TestDeleteChannelsNotInAllKeptNoDeletes(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	// Keep all 100 fake channels → nothing to delete.
+	keep := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		keep = append(keep, fmt.Sprintf("u%03d", i))
+	}
+	if err := c.DeleteChannelsNotIn(keep); err != nil {
+		t.Fatalf("DeleteChannelsNotIn: %v", err)
+	}
+	for _, rec := range fake.reqs {
+		if rec.method == "DELETE" {
+			t.Errorf("no channels are stale — got unexpected DELETE: %s", rec.path)
+		}
+	}
+}
+
 func TestReleaseExcessOfflineChannelsChunked(t *testing.T) {
 	fake := &fakeSupabase{}
 	c := newTestClient(t, fake)
