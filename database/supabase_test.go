@@ -56,6 +56,9 @@ func (f *fakeSupabase) handler(w http.ResponseWriter, r *http.Request) {
 		if v := q.Get("limit"); v != "" {
 			fmt.Sscanf(v, "%d", &limit)
 		}
+		if limit > 100 {
+			limit = 100 // keep the fake cheap for limit=50000 fetches
+		}
 		rows := make([]ChannelAssignment, 0, limit)
 		for i := 0; i < limit; i++ {
 			rows = append(rows, ChannelAssignment{Username: fmt.Sprintf("u%03d", i), Site: "chaturbate"})
@@ -137,6 +140,64 @@ const maxFilterURLLen = 3000
 // ============================================================================
 // ReleaseExcessOfflineChannels / ReleaseExcessChannels
 // ============================================================================
+
+func TestReleaseNodeOfflineChannels(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	n, err := c.ReleaseNodeOfflineChannels("node-18", nil)
+	if err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("expected a non-zero release count from the fake GET")
+	}
+
+	// Exactly one GET (count) + one PATCH (release), and the PATCH filter is a
+	// tiny filter-based URL — no giant username=in.(...) list.
+	var getPath, patchPath string
+	for _, rec := range fake.reqs {
+		if rec.method == "GET" {
+			getPath = rec.path
+		} else if rec.method == "PATCH" {
+			patchPath = rec.path
+		}
+	}
+	if getPath == "" || patchPath == "" {
+		t.Fatalf("expected one GET and one PATCH, got GET=%q PATCH=%q", getPath, patchPath)
+	}
+	if strings.Contains(patchPath, "username=in.(") {
+		t.Errorf("release PATCH must not carry a username in-list: %s", patchPath)
+	}
+	if len(patchPath) > maxFilterURLLen {
+		t.Errorf("release PATCH URL is %d bytes (> %d, 414 risk)", len(patchPath), maxFilterURLLen)
+	}
+	if strings.Contains(patchPath, "select=") {
+		t.Errorf("release PATCH should not carry select=, got: %s", patchPath)
+	}
+	for _, want := range []string{"assigned_node=eq.node-18", "is_live=eq.false", "status=neq.recording"} {
+		if !strings.Contains(patchPath, want) {
+			t.Errorf("release PATCH missing %q: %s", want, patchPath)
+		}
+	}
+}
+
+func TestReleaseNodeOfflineChannelsExcludesPaused(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	if _, err := c.ReleaseNodeOfflineChannels("node-18", []string{"paused_user"}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	for _, rec := range fake.reqs {
+		if rec.method == "PATCH" {
+			if !strings.Contains(rec.path, "username=not.in.(paused_user)") {
+				t.Errorf("release PATCH must exclude paused usernames, got: %s", rec.path)
+			}
+		}
+	}
+}
 
 func TestReleaseExcessOfflineChannelsChunked(t *testing.T) {
 	fake := &fakeSupabase{}

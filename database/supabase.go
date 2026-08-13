@@ -1244,6 +1244,41 @@ func (c *Client) ReleaseNodeChannels(nodeID string) error {
 		})
 }
 
+// ReleaseNodeOfflineChannels releases a node's OFFLINE channels back to the
+// pool with a single filter-based PATCH. Unlike ReleaseExcessOfflineChannels
+// there is no username in-list, so the URL stays tiny and can never hit the
+// ~8KB proxy limit (HTTP 414) no matter how many channels the node holds. Only
+// is_live=false, non-recording channels match, so live broadcasts and
+// in-progress recordings are never disturbed. excludeUsernames (e.g.
+// user-paused channels) stay assigned to the node. Returns the number of
+// channels released.
+func (c *Client) ReleaseNodeOfflineChannels(nodeID string, excludeUsernames []string) (int, error) {
+	filter := fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&is_live=eq.false&status=neq.recording&status=neq.unassigned",
+		url.QueryEscape(nodeID))
+	if len(excludeUsernames) > 0 {
+		filter += "&username=not.in.(" + joinEscaped(excludeUsernames) + ")"
+	}
+
+	// Count what the PATCH will release (drives the caller's log message).
+	var matches []ChannelAssignment
+	if err := c.get(filter+"&select=username&limit=50000", &matches); err != nil {
+		return 0, err
+	}
+	if len(matches) == 0 {
+		return 0, nil
+	}
+
+	// Release them. The filter re-evaluates atomically inside the UPDATE, so a
+	// channel that went live since the count is not swept.
+	if err := c.patch(filter, map[string]interface{}{
+		"assigned_node": nil,
+		"status":        "unassigned",
+	}); err != nil {
+		return 0, err
+	}
+	return len(matches), nil
+}
+
 // releaseChunked PATCHes the given usernames back to unassigned for this node
 // in small batches (releaseBatchSize per request). The release is idempotent —
 // a row already released simply matches nothing — so on a failed batch the

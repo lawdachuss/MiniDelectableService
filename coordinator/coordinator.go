@@ -168,6 +168,7 @@ func (c *Coordinator) startHealthCheckLoop(ctx context.Context) {
 			c.checkCycleHealth("live-check", &c.cycleGuardLiveCheck)
 			c.checkCycleHealth("reaper", &c.cycleGuardReaper)
 			c.checkCycleHealth("offline-shuffle", &c.cycleGuardShuffle)
+			c.checkCycleHealth("hoard-rebalance", &c.cycleGuardHoard)
 			c.checkCycleHealth("deadline-migration", &c.cycleGuardDeadline)
 			c.checkCycleHealth("reconcile", &c.cycleGuardReconcile)
 			c.checkCycleHealth("stuck-pause", &c.cycleGuardStuckPause)
@@ -285,6 +286,7 @@ type Coordinator struct {
 	cycleGuardDeadline      cycleGuard
 	cycleGuardReconcile     cycleGuard
 	cycleGuardStuckPause    cycleGuard
+	cycleGuardHoard         cycleGuard
 
 	// stuckPauseSeen tracks consecutive observations of a paused-but-still-
 	// assigned channel (key nodeID/site/username → count). A channel must be
@@ -333,6 +335,7 @@ func (c *Coordinator) Start(ctx context.Context) {
 	c.StartLiveCheckLoop(ctx)
 	c.StartReaperLoop(ctx)
 	c.StartOfflineShuffleLoop(ctx)
+	c.StartHoardRebalanceLoop(ctx)
 	c.StartDeadlineMigrationLoop(ctx)
 	c.StartReconcileLoop(ctx)
 	c.StartStuckPauseMonitorLoop(ctx)
