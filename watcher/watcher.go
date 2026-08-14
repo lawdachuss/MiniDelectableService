@@ -121,7 +121,13 @@ func isSidecar(name string) bool {
 		strings.HasSuffix(name, ".video.mp4") ||
 		strings.HasSuffix(name, ".audio.mp4") ||
 		channel.IsFinalizingTemp(name) ||
-		strings.Contains(name, ".deleting.")
+		strings.Contains(name, ".deleting.") ||
+		// Merge scratch ("<base>.merging-*"): the min-duration merge system
+		// writes its encode output to a unique ".merging-<nano>-..." name in
+		// .pending and renames it to the stable "merged-*" name only on
+		// success; a crash mid-merge leaves a partial file that must never be
+		// treated as a real video.
+		strings.Contains(name, ".merging-")
 }
 
 // Start begins watching for new files. It blocks until the context is done.

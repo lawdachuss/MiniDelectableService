@@ -31,14 +31,16 @@ func TestIsFinalizingTemp(t *testing.T) {
 }
 
 // TestIsSidecarExcludesScratch verifies the pipeline/orphan sidecar filter
-// rejects finalizer scratch files and deletion-in-progress leftovers, so
-// enqueueFile, collectPendingSegmentsInDir, and the watcher never pick them
-// up as videos.
+// rejects finalizer scratch files, merge scratch files, and deletion-in-progress
+// leftovers, so enqueueFile, collectPendingSegmentsInDir, and the watcher never
+// pick them up as videos.
 func TestIsSidecarExcludesScratch(t *testing.T) {
 	for _, name := range []string{
 		"foo.finalizing.mp4",
 		"foo.finalizing.mkv",
 		"foo.mp4.deleting.3",
+		".merging-1723600000000000000-merged-alice_2026-08-14_04-16-00.mp4",
+		".merging-1723600000000000000-merged-alice_2026-08-14_04-16-00.mp4.normalized.mp4",
 	} {
 		if !isSidecar(name) {
 			t.Errorf("isSidecar(%q) = false, want true (scratch file must never be treated as video)", name)
@@ -48,6 +50,7 @@ func TestIsSidecarExcludesScratch(t *testing.T) {
 		"foo.mp4",
 		"foo.video.muxed.mp4",
 		"alice_2026-08-08_10-00-00.mp4",
+		"merged-alice_2026-08-08_10-00-00.mp4",
 	} {
 		if isSidecar(name) {
 			t.Errorf("isSidecar(%q) = true, want false (real video)", name)

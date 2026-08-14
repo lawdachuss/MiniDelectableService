@@ -1731,6 +1731,27 @@ func deleteStalePendingSegments(dir string) {
 	if err != nil {
 		return
 	}
+	// Remove crash-left ".merging-*" merge scratch files whose mtime is older
+	// than the merge timeout.  A live merge keeps the scratch mtime fresh while
+	// it runs, and a user's merges are serialized by mergeMu, so an old scratch
+	// is a crash leftover, never a live encode.  (They are excluded from
+	// segment collection via isSidecar, so the segment loop below would
+	// otherwise never clean them.)
+	const scratchMaxAge = 35 * time.Minute
+	scratchCutoff := time.Now().Add(-scratchMaxAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.Contains(e.Name(), ".merging-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(scratchCutoff) {
+			log.Printf("[min-duration] removing stale merge scratch %s (mod %s)", e.Name(), info.ModTime().Format(time.RFC3339))
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 	cutoff := time.Now().Add(-pendingMaxAge)
 	for _, e := range entries {
 		if e.IsDir() || isSidecar(e.Name()) {
@@ -1745,6 +1766,64 @@ func deleteStalePendingSegments(dir string) {
 			log.Printf("[min-duration] deleting stale pending segment %s (mod %s, older than %s)", path, info.ModTime().Format(time.RFC3339), pendingMaxAge)
 			_ = os.Remove(path)
 		}
+	}
+}
+
+// recoverMergeScratch reconciles crash-left ".merging-*" merge scratch files in
+// a user's pending dir:
+//   - If any real pending segment still exists alongside a scratch, the scratch
+//     is mid-merge garbage — its inputs still hold all the content — so it is
+//     deleted and the segments are re-merged by the normal flow.
+//   - If a scratch is the ONLY file, its inputs were already consumed by a
+//     completed merge that crashed before the output was renamed to the stable
+//     "merged-*" name.  The scratch IS the finished content, so rename it to
+//     its stable name and let the normal flow merge/upload it exactly once.
+//
+// This closes the crash window where a finished merge's inputs were removed but
+// the output was never finalized (content would otherwise be stranded in a
+// scratch file that isSidecar now excludes), while guaranteeing a partial
+// mid-merge scratch can never be treated as a real segment.
+//
+// A merge is serialized per user by mergeMu, so a scratch observed here can
+// never belong to a live encode.  Callers must hold the channel's pending mutex.
+func recoverMergeScratch(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var scratches []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() || !strings.Contains(e.Name(), ".merging-") {
+			continue
+		}
+		scratches = append(scratches, e)
+	}
+	if len(scratches) == 0 {
+		return
+	}
+	// Ambiguous leftovers (e.g. repeated crashes) — leave them for
+	// deleteStalePendingSegments to age out rather than guessing.
+	if len(scratches) > 1 {
+		return
+	}
+	if len(collectPendingSegmentsInDir(dir)) > 0 {
+		// Inputs still present — the scratch is mid-merge garbage.
+		_ = os.Remove(filepath.Join(dir, scratches[0].Name()))
+		return
+	}
+	// Sole scratch with no segments left: finished merge waiting to be
+	// finalized.  Rename ".merging-<nano>-merged-<base>" to "merged-<base>".
+	name := filepath.Base(scratches[0].Name())
+	name = strings.TrimPrefix(name, ".merging-") // "<nano>-merged-<base>"
+	if i := strings.Index(name, "-"); i >= 0 {
+		name = name[i+1:] // "merged-<base>"
+	}
+	if !strings.HasPrefix(name, "merged-") {
+		return // unrecognized — leave for stale aging
+	}
+	log.Printf("[min-duration] recovering finished merge scratch %s", filepath.Base(scratches[0].Name()))
+	if rErr := os.Rename(filepath.Join(dir, scratches[0].Name()), filepath.Join(dir, name)); rErr != nil {
+		log.Printf("[min-duration] could not recover merge scratch: %v", rErr)
 	}
 }
 
@@ -2136,12 +2215,21 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			return false // no valid pending — proceed with normal upload
 		}
 
-		// Merge pending segments with the current video.
+		// Merge pending segments with the current video.  The output is written
+		// to a unique ".merging-*" scratch name in the pending dir — never
+		// "videoPath + .merged.mp4" in the recording dir, which a crash
+		// mid-merge left behind as a stray file the orphan scan later uploaded
+		// while the (still-present) pending segments were merged again into the
+		// next recording, uploading the same content twice.  Scratch files are
+		// excluded from segment collection, so a crash here is recoverable
+		// (recoverMergeScratch) and never double-uploads.
 		// Release the lock during the potentially long ffmpeg encode.
-		mergedPath := videoPath + ".merged.mp4"
+		pendingDir := pendingSegmentsDir(ch.Config.Username)
 		mergeInputs := make([]string, len(segments))
 		copy(mergeInputs, segments)
 		allInputs := append(mergeInputs, videoPath)
+		stableName := mergedPendingName(allInputs)
+		mergedPath := filepath.Join(pendingDir, fmt.Sprintf(".merging-%d-%s", time.Now().UnixNano(), stableName))
 		ch.Info("min-duration: merging %d pending segment(s) with %s", len(mergeInputs), filepath.Base(videoPath))
 		mu.Unlock()
 		mErr := mergeVideos(allInputs, mergedPath)
@@ -2173,27 +2261,45 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			// drop the original and park the consolidated file with the pending
 			// segments so nothing below the threshold is ever uploaded.
 			_ = os.Remove(videoPath)
-			if pkErr := moveToPendingDir(mergedPath, ch.Config.Username); pkErr != nil {
-				ch.Error("min-duration: could not park merged output %s in pending: %v — keeping it in place, NOT uploading",
-					filepath.Base(mergedPath), pkErr)
-			}
-			// The parked merged file already contains the pending segments, so
-			// drop the originals — otherwise the next merge attempt would
-			// concatenate the short content a second time.
+			// Remove the inputs BEFORE renaming the scratch to its stable name,
+			// so a crash here leaves the finished content as a sole scratch
+			// that recoverMergeScratch finalizes — never a stable merged-*
+			// file sitting next to segments that already contain its content
+			// (which would double-merge).
 			mu.Lock()
 			for _, s := range mergeInputs {
 				os.Remove(s)
 			}
 			mu.Unlock()
+			if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr != nil {
+				ch.Error("min-duration: could not park merged output in pending: %v — keeping it in place, NOT uploading",
+					rErr)
+			}
 			return true
 		}
 
+		// Consume the inputs first: the finished merge is now the only copy of
+		// this content.  A crash before the rename leaves a sole scratch that
+		// recoverMergeScratch finalizes exactly once.
 		mu.Lock()
 		for _, s := range mergeInputs {
 			os.Remove(s)
 		}
 		_ = os.Remove(videoPath)
 		mu.Unlock()
+
+		// Rename the unique scratch output to the STABLE merged-* name and
+		// upload from there, so the archive keeps a clean
+		// "<user>_YYYY-MM-DD_....mp4" filename and username extraction stays
+		// correct.  Safe because mergeMu serializes this channel's merges — no
+		// concurrent flow can renameOverwrite the stable path out from under
+		// this upload.
+		stablePath := filepath.Join(pendingDir, stableName)
+		if rErr := renameOverwriting(mergedPath, stablePath); rErr != nil {
+			ch.Warn("min-duration: could not rename merged output to %s: %v — uploading from scratch name", stableName, rErr)
+		} else {
+			mergedPath = stablePath
+		}
 
 		if ch.Config.Compress {
 			ch.Info("min-duration: merged -> %s (%.1fs), compressing before upload", filepath.Base(mergedPath), mergedDur)
@@ -2248,18 +2354,20 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 
 		mergedDur, mErr := VideoDurationSeconds(mergedPath)
 		if mErr != nil {
-			// Keep the merged result pending under the stable name (best-effort)
-			// rather than risking an upload of unconfirmed duration — the
-			// min-duration guarantee must never be violated just because
-			// probing failed.
+			// Consume the inputs first, then keep the merged result pending
+			// under the stable name (best-effort) rather than risking an
+			// upload of unconfirmed duration — the min-duration guarantee must
+			// never be violated just because probing failed.  A crash between
+			// the removal and the rename leaves a sole scratch that
+			// recoverMergeScratch finalizes.
+			for _, s := range mergeInputs {
+				os.Remove(s)
+			}
 			stablePath := filepath.Join(pendingDir, stableName)
 			if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
 				mergedPath = stablePath
 			}
 			ch.Warn("min-duration: could not probe merged result (%v) — keeping pending", mErr)
-			for _, s := range mergeInputs {
-				os.Remove(s)
-			}
 			mu.Unlock()
 			return true
 		}
@@ -2289,14 +2397,17 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 			}
 		} else {
 			// Keep pending under the stable name so the next merge dedupes it.
+			// Consume the inputs first: a crash before the rename leaves a sole
+			// scratch that recoverMergeScratch finalizes — never a stable
+			// merged-* file next to segments that already contain its content.
+			for _, s := range mergeInputs {
+				os.Remove(s)
+			}
 			stablePath := filepath.Join(pendingDir, stableName)
 			if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
 				mergedPath = stablePath
 			}
 			ch.Info("min-duration: merged %d segments = %.1fs (< %ds) — still pending", len(mergeInputs), mergedDur, minDur)
-			for _, s := range mergeInputs {
-				os.Remove(s)
-			}
 			mu.Unlock()
 		}
 	} else {
@@ -2311,22 +2422,25 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 // This is called during startup orphan cleanup so short segments from a previous
 // run don't stay pending forever when no new recording arrives.
 func processAllPendingSegments() {
-	dirs := []string{"videos"}
-	if server.Config != nil && server.Config.OutputDir != "" && server.Config.OutputDir != "videos" {
-		dirs = append(dirs, server.Config.OutputDir)
+	// Scan exactly the pending root the min-duration system actually uses:
+	// pendingSegmentsDir resolves to OutputDir/.pending when OutputDir is set,
+	// otherwise "videos/.pending".  Scanning BOTH roots (as an older version
+	// did) could process a user's segments as two separate sets, and legacy
+	// segments stranded in videos/.pending would never be touched.
+	root := "videos"
+	if server.Config != nil && server.Config.OutputDir != "" {
+		root = server.Config.OutputDir
 	}
-	for _, dir := range dirs {
-		pendingRoot := filepath.Join(dir, ".pending")
-		userDirs, err := os.ReadDir(pendingRoot)
-		if err != nil {
+	pendingRoot := filepath.Join(root, ".pending")
+	userDirs, err := os.ReadDir(pendingRoot)
+	if err != nil {
+		return
+	}
+	for _, ud := range userDirs {
+		if !ud.IsDir() {
 			continue
 		}
-		for _, ud := range userDirs {
-			if !ud.IsDir() {
-				continue
-			}
-			processPendingUserSegments(ud.Name())
-		}
+		processPendingUserSegments(ud.Name())
 	}
 }
 
@@ -2346,6 +2460,10 @@ func processPendingUserSegments(username string) {
 	mu := pendingMu(username)
 
 	mu.Lock()
+	// Reconcile crash-left ".merging-*" scratch before anything else, so a
+	// finished merge whose inputs were consumed is finalized (not stranded) and
+	// a partial mid-merge scratch is dropped while its inputs still exist.
+	recoverMergeScratch(pendingSegmentsDir(username))
 	segments := collectPendingSegmentsInDir(pendingSegmentsDir(username))
 	if len(segments) < 1 {
 		mu.Unlock()
@@ -2440,6 +2558,13 @@ func processPendingUserSegments(username string) {
 	mergedDur, durErr := VideoDurationSeconds(mergedPath)
 	if durErr != nil || mergedDur < float64(minDur) {
 		// Keep pending under the stable name so the next merge dedupes it.
+		// Consume the inputs first: a crash between the removal and the rename
+		// leaves a sole scratch that recoverMergeScratch finalizes.
+		mu.Lock()
+		for _, s := range segCopy {
+			os.Remove(s)
+		}
+		mu.Unlock()
 		if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr == nil {
 			mergedPath = filepath.Join(pendingDir, stableName)
 		}
@@ -2448,11 +2573,6 @@ func processPendingUserSegments(username string) {
 		} else {
 			recoveryLogf(mergedPath, "recovery: merged = %.1fs (< %ds) — keeping pending", mergedDur, minDur)
 		}
-		mu.Lock()
-		for _, s := range segCopy {
-			os.Remove(s)
-		}
-		mu.Unlock()
 		return
 	}
 
@@ -2463,17 +2583,19 @@ func processPendingUserSegments(username string) {
 		}
 	}
 	if totalInputDur > 0 && mergedDur < totalInputDur*0.5 {
-		// Keep pending under the stable name too.
-		if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr == nil {
-			mergedPath = filepath.Join(pendingDir, stableName)
-		}
-		recoveryLogf(mergedPath, "recovery: merged output %.1fs is <50%% of total input %.1fs — streams may be incompatible, keeping pending",
-			mergedDur, totalInputDur)
+		// Keep pending under the stable name too.  Remove the inputs first so
+		// a crash here leaves a sole scratch that recoverMergeScratch
+		// finalizes.
 		mu.Lock()
 		for _, s := range segCopy {
 			os.Remove(s)
 		}
 		mu.Unlock()
+		if rErr := renameOverwriting(mergedPath, filepath.Join(pendingDir, stableName)); rErr == nil {
+			mergedPath = filepath.Join(pendingDir, stableName)
+		}
+		recoveryLogf(mergedPath, "recovery: merged output %.1fs is <50%% of total input %.1fs — streams may be incompatible, keeping pending",
+			mergedDur, totalInputDur)
 		return
 	}
 
@@ -2532,5 +2654,11 @@ func isSidecar(name string) bool {
 		strings.HasSuffix(name, ".video.mp4") ||
 		strings.HasSuffix(name, ".audio.mp4") ||
 		IsFinalizingTemp(name) ||
-		strings.Contains(name, ".deleting.")
+		strings.Contains(name, ".deleting.") ||
+		// Merge scratch: mergeVideos writes to ".merging-<nano>-<stable>" in the
+		// pending dir (and a "<output>.normalized.mp4" temp).  A crash mid-merge
+		// leaves a partial file that must never be uploaded, thumbnailed, or
+		// merged as a real segment.  Recovered finished merges are renamed to
+		// the stable "merged-*" name by recoverMergeScratch.
+		strings.Contains(name, ".merging-")
 }
