@@ -7,9 +7,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
 )
+
+// liveCheckReleaseStreak is how many consecutive live-check cycles (~120s each)
+// a channel must report a DEFINITIVE offline before this node releases it back
+// to the pool. A single flaky probe (affiliate API blip, rate-limited room
+// status, transient network error) therefore can never pause a live channel —
+// only ~4 minutes of uninterrupted offline evidence does. Genuinely offline
+// channels still get released within the streak window; the brief pin in
+// "recording" state is harmless (nothing is being recorded anyway).
+const liveCheckReleaseStreak = 2
 
 // StartLiveCheckLoop periodically checks which channels are live and updates
 // the is_live flag in channel_assignments. Runs every 120 seconds.
@@ -60,14 +70,53 @@ func (c *Coordinator) StartLiveCheckLoop(ctx context.Context) {
 //
 // In addition to toggling is_live, it keeps the DB authoritative for this
 // node's recordings: live channels assigned here are marked status="recording"
-// (MarkChannelRecording), and channels that were recording but are now offline
-// are released back to the pool so stale "recording" rows never pin a channel
-// to a node forever.
+// (MarkChannelRecording), and channels that were recording but are now
+// definitively offline are released back to the pool so stale "recording" rows
+// never pin a channel to a node forever.
+//
+// Releasing is DEBOUNCED: a channel is only released after
+// liveCheckReleaseStreak consecutive cycles reporting a DEFINITIVE offline
+// (CheckLive == LivenessOffline). A probe that errors or returns an ambiguous
+// status (CheckLive == LivenessUnknown) is treated as "not confirmed offline"
+// and never triggers a release — so a single flaky check cannot pause a live
+// channel while the DVR is recording it.
 //
 // Uses a 2-minute timeout so a single stuck API call cannot hang the
 // goroutine indefinitely. Skips entirely when draining.
 func (c *Coordinator) runLiveCheck() {
-	if c.LiveCheck == nil {
+	c.runLiveCheckWith(c.Client, c.LiveCheck)
+}
+
+// dbLiveCheck is the subset of *database.Client used by the live-check cycle,
+// expressed as an interface so the cycle can be unit-tested with a mock.
+type dbLiveCheck interface {
+	GetAllAssignments() ([]database.ChannelAssignment, error)
+	MarkChannelRecording(username, site string) error
+	ReleaseChannel(username, site string) error
+	SetChannelsLive(pairs [][2]string) error
+	SetChannelsNotLive(pairs [][2]string) error
+}
+
+// bumpLiveCheckMiss records one definitive-offline observation for a channel
+// and returns the consecutive count.
+func (c *Coordinator) bumpLiveCheckMiss(site, username string) int {
+	c.liveCheckMissMu.Lock()
+	defer c.liveCheckMissMu.Unlock()
+	key := site + "/" + username
+	c.liveCheckMiss[key]++
+	return c.liveCheckMiss[key]
+}
+
+// resetLiveCheckMiss clears the consecutive-offline streak for a channel
+// (called on a confirmed-live or unknown result).
+func (c *Coordinator) resetLiveCheckMiss(site, username string) {
+	c.liveCheckMissMu.Lock()
+	defer c.liveCheckMissMu.Unlock()
+	delete(c.liveCheckMiss, site+"/"+username)
+}
+
+func (c *Coordinator) runLiveCheckWith(db dbLiveCheck, check LivenessChecker) {
+	if check == nil {
 		return
 	}
 
@@ -83,7 +132,7 @@ func (c *Coordinator) runLiveCheck() {
 
 	// Read all channel assignments — this is the source of truth, not the
 	// channel_pool app_settings blob (which is never written in pooled mode).
-	assignments, err := c.Client.GetAllAssignments()
+	assignments, err := db.GetAllAssignments()
 	if err != nil || len(assignments) == 0 {
 		return
 	}
@@ -106,7 +155,7 @@ func (c *Coordinator) runLiveCheck() {
 
 	// ── Phase 2: Per-channel fallback + DB bookkeeping ──
 	// For channels NOT confirmed live by the affiliate API, do a full
-	// per-channel IsLive check. Pairs are (username, site) because the
+	// per-channel CheckLive. Pairs are (username, site) because the
 	// channel_assignments primary key is composite — a username alone can exist
 	// on both sites and must not be toggled together.
 
@@ -122,51 +171,74 @@ func (c *Coordinator) runLiveCheck() {
 
 	var livePairs [][2]string
 	for _, ca := range assignments {
-		isLive := affiliateLive[ca.Username]
+		confirmedLive := affiliateLive[ca.Username]
+		mine := ca.AssignedNode == c.NodeID
+		release := false
 
-		if !isLive {
-			// Not found in affiliate list — do a per-channel check. The
-			// affiliate API is authoritative for offline, but we still want to
-			// catch models that went live between affiliate API calls.
-			isLive = c.LiveCheck.IsLive(ctx, ca.Site, ca.Username)
+		if !confirmedLive {
+			switch check.CheckLive(ctx, ca.Site, ca.Username) {
+			case LivenessLive:
+				confirmedLive = true
+				c.resetLiveCheckMiss(ca.Site, ca.Username)
+			case LivenessOffline:
+				if mine && ca.Status == "recording" {
+					// Debounced: only release after liveCheckReleaseStreak
+					// consecutive definitive-offline cycles.
+					if c.bumpLiveCheckMiss(ca.Site, ca.Username) >= liveCheckReleaseStreak {
+						c.resetLiveCheckMiss(ca.Site, ca.Username)
+						release = true
+					}
+				}
+			case LivenessUnknown:
+				// Probe failed / ambiguous — never a reason to stop recording.
+				// Reset the offline streak so a blip can't start it.
+				c.resetLiveCheckMiss(ca.Site, ca.Username)
+			}
+		} else {
+			c.resetLiveCheckMiss(ca.Site, ca.Username)
 		}
 
-		if isLive {
+		if confirmedLive {
 			livePairs = append(livePairs, [2]string{ca.Username, ca.Site})
-			if ca.AssignedNode == c.NodeID {
-				if err := c.Client.MarkChannelRecording(ca.Username, ca.Site); err != nil {
+			if mine {
+				if err := db.MarkChannelRecording(ca.Username, ca.Site); err != nil {
 					log.Printf("[coordinator] live check: mark recording error for %s: %v", ca.Username, err)
 				}
 			}
-		} else if ca.AssignedNode == c.NodeID && ca.Status == "recording" {
-			// Release the channel back to the pool when it goes offline. We
-			// can't simply set status="offline" because channel_assignments has
-			// a CHECK constraint preventing offline while assigned_node is set —
-			// a node either owns a channel or doesn't. Releasing also lets the
-			// channel be claimed by any node when it comes back online; keeping
-			// it assigned in "recording" state (skipped by
-			// ReleaseExcessOfflineChannels) would pin it to this node forever.
-			if manualSet[ca.Site+"/"+ca.Username] {
-				continue // user-paused channel — keep it parked on this node
-			}
-			if err := c.Client.ReleaseChannel(ca.Username, ca.Site); err != nil {
-				log.Printf("[coordinator] live check: release offline error for %s: %v", ca.Username, err)
-			} else {
-				log.Printf("[coordinator] live check: released %s (offline, was recording)", ca.Username)
-			}
+			continue
+		}
+
+		// Not confirmed live on this cycle. Release only when the debounce
+		// threshold was reached. We can't simply set status="offline" because
+		// channel_assignments has a CHECK constraint preventing offline while
+		// assigned_node is set — a node either owns a channel or doesn't.
+		// Releasing also lets the channel be claimed by any node when it comes
+		// back online; keeping it assigned in "recording" state (skipped by
+		// ReleaseExcessOfflineChannels) would pin it to this node forever.
+		if !release {
+			continue
+		}
+		if manualSet[ca.Site+"/"+ca.Username] {
+			log.Printf("[coordinator] live check: %s is user-paused — keeping it parked on this node", ca.Username)
+			continue
+		}
+		if err := db.ReleaseChannel(ca.Username, ca.Site); err != nil {
+			log.Printf("[coordinator] live check: release offline error for %s: %v", ca.Username, err)
+		} else {
+			log.Printf("[coordinator] live check: released %s (offline for %d cycles, was recording)", ca.Username, liveCheckReleaseStreak)
 		}
 	}
 
 	// Bulk-update is_live flags
 	if len(livePairs) > 0 {
-		if err := c.Client.SetChannelsLive(livePairs); err != nil {
+		if err := db.SetChannelsLive(livePairs); err != nil {
 			log.Printf("[coordinator] live check: set live error: %v", err)
 		}
-		if err := c.Client.SetChannelsNotLive(livePairs); err != nil {
+		if err := db.SetChannelsNotLive(livePairs); err != nil {
 			log.Printf("[coordinator] live check: set not live error: %v", err)
 		}
 	} else {
-		if err := c.Client.SetChannelsNotLive(nil); err != nil {
+		if err := db.SetChannelsNotLive(nil); err != nil {
 			log.Printf("[coordinator] live check: set all not live error: %v", err)
 		}
 	}

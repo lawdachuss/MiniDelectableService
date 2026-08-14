@@ -239,10 +239,24 @@ type ChannelManager interface {
 	RequestCookieRefresh()
 }
 
+// LivenessResult is the outcome of a liveness probe.
+type LivenessResult int
+
+const (
+	// LivenessLive means the model is confirmed broadcasting.
+	LivenessLive LivenessResult = iota
+	// LivenessOffline means the model was confirmed NOT broadcasting.
+	LivenessOffline
+	// LivenessUnknown means the probe could not be answered (transient error,
+	// rate limit, ambiguous room status). Unknown is never a reason to stop
+	// recording a channel — only a definitive offline result may be.
+	LivenessUnknown
+)
+
 // LivenessChecker is the interface for checking if a channel is currently live.
 // Implemented by main.go wiring using the site adapters.
 type LivenessChecker interface {
-	IsLive(ctx context.Context, siteName, username string) bool
+	CheckLive(ctx context.Context, siteName, username string) LivenessResult
 }
 
 // Coordinator manages the distributed node lifecycle: registration, heartbeat,
@@ -295,6 +309,15 @@ type Coordinator struct {
 	// session-boundary pauses never alert.
 	stuckPauseSeen map[string]int
 	stuckPauseMu   sync.Mutex
+
+	// liveCheckMiss tracks consecutive DEFINITIVE offline live-check results
+	// per channel (key site/username → count). A channel must be observed
+	// offline across liveCheckReleaseStreak cycles before this node releases
+	// it back to the pool, so a single flaky probe (affiliate API blip,
+	// rate-limited room status, transient network error) can never pause a
+	// live channel. Live and Unknown results reset the streak.
+	liveCheckMiss    map[string]int
+	liveCheckMissMu  sync.Mutex
 }
 
 // New creates a new Coordinator. If CHANNEL_POOL_MODE=pooled, Start() must
@@ -307,6 +330,7 @@ func New(client *database.Client, mgr ChannelManager) *Coordinator {
 		Manager:        mgr,
 		stopCh:         make(chan struct{}),
 		stuckPauseSeen: make(map[string]int),
+		liveCheckMiss:  make(map[string]int),
 	}
 }
 

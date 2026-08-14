@@ -842,17 +842,20 @@ func start(c *cli.Context) error {
 // liveChecker implements coordinator.LivenessChecker using the site adapters.
 type liveChecker struct{}
 
-func (l *liveChecker) IsLive(ctx context.Context, siteName, username string) bool {
+func (l *liveChecker) CheckLive(ctx context.Context, siteName, username string) coordinator.LivenessResult {
 	// Tier 0: Affiliate API (fastest, single cached call covers all channels).
 	// The onlinerooms endpoint is served on the cb.xxx domain this deployment
-	// uses. A model confirmed live here skips the per-channel check entirely.
+	// uses. A model CONFIRMED live here skips the per-channel check entirely.
 	if server.Config != nil && server.Config.AffiliateWM != "" {
 		affiliateLive, _, err := internal.CheckAffiliateLive(ctx, server.Config.AffiliateWM, server.Config.Domain, username)
 		if err == nil && affiliateLive {
-			return true
+			return coordinator.LivenessLive
 		}
 	}
 
+	// Absence from the affiliate list is NOT proof of offline (the cached list
+	// can be stale or miss a just-online model), so fall through to the
+	// per-channel room check.
 	var siteImpl site.Site
 	switch siteName {
 	case "stripchat":
@@ -863,11 +866,21 @@ func (l *liveChecker) IsLive(ctx context.Context, siteName, username string) boo
 
 	status, err := siteImpl.GetRoomStatus(ctx, internal.NewReq(), username)
 	if err != nil {
-		return false
+		// A failed probe is UNKNOWN, never offline: a transient error (rate
+		// limit, Cloudflare block, timeout) must not stop a live recording.
+		return coordinator.LivenessUnknown
 	}
 
-	// Treat hidden (limitcam) as live — the model is streaming.
-	return status == site.StatusPublic || status == site.StatusPrivate || status == site.StatusHidden
+	switch status {
+	case site.StatusPublic, site.StatusPrivate, site.StatusHidden:
+		// Treat hidden (limitcam) as live — the model is streaming.
+		return coordinator.LivenessLive
+	case site.StatusOffline, site.StatusAway:
+		return coordinator.LivenessOffline
+	}
+	// Empty or unrecognized status (e.g. room not found, stripchat's "unknown")
+	// is ambiguous — never a reason to stop recording.
+	return coordinator.LivenessUnknown
 }
 
 func startTunnel(port string) {
