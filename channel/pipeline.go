@@ -281,6 +281,9 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 
 	var results []uploader.UploadResult
 	var success []uploader.UploadResult
+	// success is reassigned by the retry worker (below) while the per-host
+	// uploader goroutines' progress callback reads it — guard both sides.
+	var successMu sync.Mutex
 
 	// Set up per-upload progress callback for live UI tracking.
 	// The callback is called from each uploader's goroutine as bytes are sent.
@@ -313,11 +316,13 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 		hostProgress[host] = hp
 		hostMu.Unlock()
 
+		successMu.Lock()
 		hostCount := len(success)
 		uploadedHosts := make(map[string]bool)
 		for _, r := range success {
 			uploadedHosts[r.Host] = true
 		}
+		successMu.Unlock()
 
 		// Build per-host entries
 		hostMu.Lock()
@@ -397,7 +402,9 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 			}
 		}
 
+		successMu.Lock()
 		success = uploader.GetSuccessfulUploads(results)
+		successMu.Unlock()
 		if len(success) >= len(allHosts) {
 			return nil
 		}

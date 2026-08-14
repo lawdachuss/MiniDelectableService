@@ -10,11 +10,11 @@ import (
 // main pipeline or recording goroutines. It respects the global UploadSem
 // for upload-type jobs and provides graceful shutdown.
 type RetryManager struct {
-	mu       sync.Mutex
-	queue    chan *retryJob
-	workers  sync.WaitGroup
-	stopCh   chan struct{}
-	stopped  bool
+	mu         sync.Mutex
+	queue      chan *retryJob
+	workers    sync.WaitGroup
+	stopCh     chan struct{}
+	stopped    bool
 	numWorkers int
 }
 
@@ -78,23 +78,50 @@ func (rm *RetryManager) Stop() error {
 	}
 	rm.stopped = true
 	close(rm.queue)
+	close(rm.stopCh)
 	rm.mu.Unlock()
 
 	rm.workers.Wait()
 	return nil
 }
 
+// enqueue adds a job to the queue unless the manager has been stopped.
+// The stopped check and the channel send happen under the same lock that
+// Stop() holds while closing the queue, so a send can never race the close —
+// a send racing Stop() would panic with "send on closed channel".
+func (rm *RetryManager) enqueue(job *retryJob) bool {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if rm.stopped {
+		return false
+	}
+	select {
+	case rm.queue <- job:
+		return true
+	case <-rm.stopCh:
+		return false
+	}
+}
+
+// failResult delivers an error to a job's result channel (if any) without
+// blocking, then closes it.  The result channel is buffered with capacity 1,
+// so the send never blocks; the default case guards against double delivery.
+func (rm *RetryManager) failResult(job *retryJob, err error) {
+	if job.resultCh == nil {
+		return
+	}
+	select {
+	case job.resultCh <- err:
+	default:
+	}
+	close(job.resultCh)
+}
+
 // Schedule adds a job to the retry queue. The job will be executed in the
 // background with up to maxAttempts retries and exponential backoff.
 // If requiresSem is true, the job will acquire UploadSem before running.
+// Jobs scheduled after Stop() are silently dropped.
 func (rm *RetryManager) Schedule(id string, fn func() error, opts ...RetryOption) {
-	rm.mu.Lock()
-	if rm.stopped {
-		rm.mu.Unlock()
-		return
-	}
-	rm.mu.Unlock()
-
 	job := &retryJob{
 		id:          id,
 		fn:          fn,
@@ -107,10 +134,7 @@ func (rm *RetryManager) Schedule(id string, fn func() error, opts ...RetryOption
 		opt(job)
 	}
 
-	select {
-	case rm.queue <- job:
-	case <-rm.stopCh:
-	}
+	rm.enqueue(job)
 }
 
 // RetryOption configures a retry job.
@@ -136,19 +160,18 @@ func WithPriority(p int) RetryOption {
 	return func(j *retryJob) { j.priority = p }
 }
 
+// worker runs a single retry worker goroutine.  Workers exit only when the
+// queue is closed AND drained, so Stop() reliably finishes every already-
+// queued job (drain semantics) before returning.
 func (rm *RetryManager) worker(id int) {
 	defer rm.workers.Done()
 
 	for {
-		select {
-		case job, ok := <-rm.queue:
-			if !ok {
-				return
-			}
-			rm.executeJob(job)
-		case <-rm.stopCh:
+		job, ok := <-rm.queue
+		if !ok {
 			return
 		}
+		rm.executeJob(job)
 	}
 }
 
@@ -184,26 +207,22 @@ func (rm *RetryManager) executeJob(job *retryJob) {
 		backoff = maxBackoff
 	}
 
-	// Re-queue with delay
+	// Re-queue with delay.  The re-queue goes through enqueue(), which
+	// re-checks stopped under the same lock Stop() uses to close the queue,
+	// so a timer firing in the instant before Stop() can no longer panic
+	// with "send on closed channel".  A job aborted by Stop() is reported
+	// to its result channel so DoWithRetry callers never hang at shutdown.
 	go func() {
 		timer := time.NewTimer(backoff)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			rm.mu.Lock()
-			stopped := rm.stopped
-			rm.mu.Unlock()
-			if !stopped {
-				select {
-				case rm.queue <- job:
-				case <-rm.stopCh:
-				}
-			}
 		case <-rm.stopCh:
-			if job.resultCh != nil {
-				job.resultCh <- fmt.Errorf("retry manager stopped")
-				close(job.resultCh)
-			}
+			rm.failResult(job, fmt.Errorf("retry manager stopped"))
+			return
+		}
+		if !rm.enqueue(job) {
+			rm.failResult(job, fmt.Errorf("retry manager stopped"))
 		}
 	}()
 }
@@ -248,9 +267,7 @@ func (rm *RetryManager) DoWithRetry(id string, fn func() error, opts ...RetryOpt
 		opt(job)
 	}
 
-	select {
-	case rm.queue <- job:
-	case <-rm.stopCh:
+	if !rm.enqueue(job) {
 		return fmt.Errorf("retry manager stopped")
 	}
 

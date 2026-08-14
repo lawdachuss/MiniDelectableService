@@ -101,6 +101,26 @@ func TestRetryManagerDoWithRetry_StopDrainsQueue(t *testing.T) {
 	}
 }
 
+func TestRetryManagerDoWithRetry_AfterStopReturnsErrorNotPanic(t *testing.T) {
+	rm := NewRetryManager()
+	rm.Start()
+	rm.Stop()
+
+	// DoWithRetry after Stop must return an error — never panic with
+	// "send on closed channel" (the pre-fix behavior).
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("DoWithRetry after Stop panicked: %v", r)
+		}
+	}()
+	err := rm.DoWithRetry("post-stop", func() error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected error after Stop, got nil")
+	}
+}
+
 func TestRetryManagerDoWithRetry_UploadSem(t *testing.T) {
 	rm := NewRetryManager()
 	rm.Start()

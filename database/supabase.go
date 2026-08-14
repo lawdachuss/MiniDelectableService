@@ -507,6 +507,26 @@ func (c *Client) GetRecording(filename string) (*Recording, error) {
 	return &recordings[0], nil
 }
 
+// HasUploadedLinks returns true when the recording identified by filename has
+// at least one persisted upload_link.  The recordings row is created at enqueue
+// time (SaveRecordingBasics) — BEFORE any upload — so "row exists" is not proof
+// that the file's content reached a host.  Disk cleanup must only delete local
+// files whose content is actually safe in the cloud.
+func (c *Client) HasUploadedLinks(filename string) (bool, error) {
+	var recordings []struct {
+		UploadLinks []UploadLink `json:"upload_links"`
+	}
+	err := c.getN(fmt.Sprintf("/recordings?filename=eq.%s&select=upload_links(host)&limit=1",
+		url.QueryEscape(filename)), &recordings, metadataSaveMaxRetries)
+	if err != nil {
+		return false, err
+	}
+	if len(recordings) == 0 {
+		return false, nil
+	}
+	return len(recordings[0].UploadLinks) > 0, nil
+}
+
 // GetRecordingsByUsername retrieves all recordings for a username
 func (c *Client) GetRecordingsByUsername(username string) ([]Recording, error) {
 	var recordings []Recording
@@ -869,6 +889,7 @@ func (c *Client) GetAllPreviewImages() ([]PreviewImage, error) {
 
 type DiskUsage struct {
 	ID          string `json:"id,omitempty"`
+	NodeID      string `json:"node_id,omitempty"`
 	TotalBytes  int64  `json:"total_bytes"`
 	UsedBytes   int64  `json:"used_bytes"`
 	FreeBytes   int64  `json:"free_bytes"`

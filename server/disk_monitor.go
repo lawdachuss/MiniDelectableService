@@ -112,6 +112,7 @@ func saveDiskUsageToDB(info *entity.DiskInfo) {
 		return
 	}
 	_ = client.SaveDiskUsage(&database.DiskUsage{
+		NodeID:      NodeID(),
 		TotalBytes:  int64(info.TotalGB * 1024 * 1024 * 1024),
 		UsedBytes:   int64(info.UsedGB * 1024 * 1024 * 1024),
 		FreeBytes:   int64((info.TotalGB - info.UsedGB) * 1024 * 1024 * 1024),
@@ -236,14 +237,19 @@ func freeDiskSpace(targetPercent int, diskInfo *entity.DiskInfo) (int, error) {
 	return deleted, nil
 }
 
-// isRecordingUploaded returns true if the file has been recorded in Supabase.
+// isRecordingUploaded returns true only when the file's recording has at least
+// one successful upload link in Supabase.  The recordings row itself is created
+// at ENQUEUE time (SaveRecordingBasics), before any upload, so checking only
+// that the row exists would let the disk cleanup delete files whose uploads
+// never succeeded — permanent data loss.  Only the presence of a persisted
+// upload_link proves the content is safe in the cloud.
 func isRecordingUploaded(filename string) bool {
 	client := GetDBClient()
 	if client == nil {
 		return false
 	}
-	rec, err := client.GetRecording(filename)
-	return err == nil && rec != nil && rec.Filename == filename
+	ok, err := client.HasUploadedLinks(filename)
+	return err == nil && ok
 }
 
 // deleteOldLocalFiles removes local video files that are older than maxAgeDays
