@@ -313,6 +313,33 @@ function Update-NodeWebUrl {
   }
   if (-not $ok) { Write-Warning "(WARN) Failed to update web_url after all attempts" }
 }
+# Clear-NodeStatus flips a node row to the given status and blanks web_url so a
+# dead session's stale tunnel link stops pointing at a vanished tunnel. Called
+# on dark-run bailout; best-effort (Supabase may be unreachable — the reaper on
+# other nodes marks the node offline after 180s anyway).
+function Clear-NodeStatus {
+  param($NodeId, $Status)
+  if ([string]::IsNullOrWhiteSpace($NodeId)) { return }
+  $sbUrl = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_URL)) { $env:SUPABASE_URL.Trim() } else { $null }
+  $sbKey = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_SERVICE_ROLE_KEY)) { $env:SUPABASE_SERVICE_ROLE_KEY.Trim() } else { $null }
+  if (-not $sbUrl -or -not $sbKey) {
+    $sb = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
+    if ($sb) {
+      if (-not $sbUrl -and ($sb -match '(?m)^SUPABASE_URL=(.+)$')) { $sbUrl = $matches[1].Trim() }
+      if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_SERVICE_ROLE_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
+      if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_API_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
+    }
+  }
+  if ([string]::IsNullOrWhiteSpace($sbUrl) -or [string]::IsNullOrWhiteSpace($sbKey)) { return }
+  if ($sbUrl -notmatch '^https?://') { $sbUrl = 'https://' + $sbUrl }
+  $sbUrl = $sbUrl.TrimEnd('/')
+  $apiUrl = "$sbUrl/rest/v1/nodes?node_id=eq.$NodeId"
+  $body = @{ status = "$Status"; web_url = "" } | ConvertTo-Json -Compress
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  try {
+    & "curl.exe" -s -o NUL -w "%{http_code}" -X PATCH $apiUrl -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" -H "Content-Type: application/json" -d $body --noproxy "*" --tlsv1.2 --doh-url "https://cloudflare-dns.com/dns-query" -m 20 2>&1 | Out-Null
+  } catch {}
+}
 $myNodeId = Get-NodeId
 Write-Host "(OK) Node ID: $myNodeId"; $null = [System.Console]::Out.Flush()
 $cachedShortUrl = $null; $lastTunnelUrl = $null; $shortUrlJob = $null
@@ -410,6 +437,16 @@ $notifyCooldown = 300
 # create yet.
 $script:lastDvrRestart = 0
 $script:heartbeatGraceSec = 240
+# Dark-run bailout: when THIS VM can't reach Supabase AT ALL (heartbeat probe
+# returns $null continuously) for this long, the session cannot heartbeat,
+# record or recover — the runner's network path is effectively dead. The Go
+# watchdog and keep-alive both correctly stand down during an outage (fenced
+# skip / probe-null skip), so without this the node sits dark until GitHub
+# force-fails the run ~45 min later and the watchman re-dispatches. Bouncing
+# the run from inside keep-alive gives a fresh runner + fresh trycloudflare
+# tunnel + fresh network path within minutes instead.
+$script:darkBailoutSec = 900
+$script:darkSince = $null
 
 function Send-Notify {
   param($level, $msg)
@@ -461,6 +498,36 @@ while ($true) {
         $dvr = Start-Process -FilePath $dvrExe -ArgumentList $dvrArgs -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
         Write-Host "(WATCHDOG) restarted DVR (PID $($dvr.Id))"; $null = [System.Console]::Out.Flush()
         if ($lastLogs) { Write-Host "--- DVR stderr tail before restart ---"; $lastLogs | ForEach-Object { Write-Host "  $_" }; Write-Host "--- end ---" }
+      }
+      # Dark-run bailout. A $null probe means Supabase is unreachable from THIS
+      # VM (the DVR is fenced and the Go watchdog is standing down by design), so
+      # no in-session recovery is possible — only a fresh run (new runner, new
+      # network path) can help. Bail out before GitHub force-fails us.
+      if ($hbAge -eq $null) {
+        $nowTs = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if (-not $script:darkSince) {
+          $script:darkSince = $nowTs
+          Write-Host "(WATCHDOG) Supabase probe unreachable — starting dark-run timer"; $null = [System.Console]::Out.Flush()
+        }
+        $darkSec = $nowTs - $script:darkSince
+        # Near the natural end of the session, prefer the normal end path (which
+        # waits for pending uploads) over a bailout.
+        if ($darkSec -ge $script:darkBailoutSec -and ($targetDuration - $elapsed) -gt 600) {
+          Write-Host "(FATAL) No Supabase connectivity for $([Math]::Round($darkSec/60,1)) min — bouncing run for a fresh runner/tunnel"; $null = [System.Console]::Out.Flush()
+          Send-Notify "critical" "Session dead: no Supabase connectivity for $([Math]::Round($darkSec/60,1)) min. Bouncing run (fresh tunnel)."
+          try { $dvr.Kill() } catch {}
+          try { $dvr.WaitForExit(5000) } catch {}
+          try { if ($tun) { $tun.Kill() } } catch {}
+          Clear-NodeStatus -NodeId $myNodeId -Status "offline"
+          Write-Host "(FATAL) Dispatching fresh run..."; $null = [System.Console]::Out.Flush()
+          gh workflow run secure-rdp.yml --repo $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME 2>$null
+          exit 1
+        }
+      } else {
+        if ($script:darkSince) {
+          Write-Host "(WATCHDOG) Supabase reachable again (heartbeat age ${hbAge}s) — clearing dark-run timer"; $null = [System.Console]::Out.Flush()
+          $script:darkSince = $null
+        }
       }
     }
   }
