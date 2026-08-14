@@ -587,25 +587,27 @@ func SaveRecordingsToDB(data []byte) error {
 
 	// Parse the JSON data
 	type RecordingEntry struct {
-		Filename     string            `json:"filename"`
-		Timestamp    string            `json:"timestamp"`
-		RoomTitle    string            `json:"room_title"`
-		Tags         []string          `json:"tags"`
-		Viewers      int               `json:"viewers"`
-		Resolution   string            `json:"resolution"`
-		Framerate    int               `json:"framerate"`
-		Links        map[string]string `json:"links"`
-		ThumbnailURL string            `json:"thumbnail_url"`
-		SpriteURL    string            `json:"sprite_url"`
-		PreviewURL   string            `json:"preview_url"`
-		EmbedURL     string            `json:"embed_url"`
-		Filesize     int64             `json:"filesize"`
-	}
+			Filename     string            `json:"filename"`
+			Timestamp    string            `json:"timestamp"`
+			RoomTitle    string            `json:"room_title"`
+			Tags         []string          `json:"tags"`
+			Viewers      int               `json:"viewers"`
+			Resolution   string            `json:"resolution"`
+			Framerate    int               `json:"framerate"`
+			Links        map[string]string `json:"links"`
+			ThumbnailURL string            `json:"thumbnail_url"`
+			SpriteURL    string            `json:"sprite_url"`
+			PreviewURL   string            `json:"preview_url"`
+			EmbedURL     string            `json:"embed_url"`
+			Filesize     int64             `json:"filesize"`
+			EndReason    string            `json:"end_reason,omitempty"`
+		}
 
-	type ChannelRecordings struct {
-		Gender     string           `json:"gender"`
-		Recordings []RecordingEntry `json:"recordings"`
-	}
+		type ChannelRecordings struct {
+			Gender     string           `json:"gender"`
+			Recordings []RecordingEntry `json:"recordings"`
+		}
+
 
 	type RecordingsDB struct {
 		Version  int                           `json:"version"`
@@ -692,25 +694,27 @@ func LoadRecordingsFromDB() []byte {
 
 	// Convert to the old JSON format for compatibility
 	type RecordingEntry struct {
-		Filename     string            `json:"filename"`
-		Timestamp    string            `json:"timestamp"`
-		RoomTitle    string            `json:"room_title"`
-		Tags         []string          `json:"tags"`
-		Viewers      int               `json:"viewers"`
-		Resolution   string            `json:"resolution"`
-		Framerate    int               `json:"framerate"`
-		Links        map[string]string `json:"links"`
-		ThumbnailURL string            `json:"thumbnail_url"`
-		SpriteURL    string            `json:"sprite_url"`
-		PreviewURL   string            `json:"preview_url"`
-		EmbedURL     string            `json:"embed_url"`
-		Filesize     int64             `json:"filesize"`
-	}
+			Filename     string            `json:"filename"`
+			Timestamp    string            `json:"timestamp"`
+			RoomTitle    string            `json:"room_title"`
+			Tags         []string          `json:"tags"`
+			Viewers      int               `json:"viewers"`
+			Resolution   string            `json:"resolution"`
+			Framerate    int               `json:"framerate"`
+			Links        map[string]string `json:"links"`
+			ThumbnailURL string            `json:"thumbnail_url"`
+			SpriteURL    string            `json:"sprite_url"`
+			PreviewURL   string            `json:"preview_url"`
+			EmbedURL     string            `json:"embed_url"`
+			Filesize     int64             `json:"filesize"`
+			EndReason    string            `json:"end_reason,omitempty"`
+		}
 
-	type ChannelRecordings struct {
-		Gender     string           `json:"gender"`
-		Recordings []RecordingEntry `json:"recordings"`
-	}
+		type ChannelRecordings struct {
+			Gender     string           `json:"gender"`
+			Recordings []RecordingEntry `json:"recordings"`
+		}
+
 
 	type RecordingsDB struct {
 		Version  int                           `json:"version"`
@@ -766,6 +770,7 @@ func LoadRecordingsFromDB() []byte {
 			PreviewURL:   rec.PreviewURL,
 			EmbedURL:     rec.EmbedURL,
 			Filesize:     rec.Filesize,
+			EndReason:    rec.EndReason,
 		}
 
 		chanData.Recordings = append(chanData.Recordings, entry)
@@ -804,7 +809,7 @@ func SaveChannelProfile(p *database.ChannelProfile) error {
 // SaveRecordingWithLinks saves a recording and its upload links directly to Supabase.
 // Preview URLs should be saved separately via SavePreviewLinks before calling this.
 // This function only saves the recording metadata and upload links.
-func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tags []string, viewers int, resolution string, framerate int, filesize int64, duration float64, gender, embedURL, thumbnailURL, spriteURL, previewURL string, links map[string]string) error {
+func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tags []string, viewers int, resolution string, framerate int, filesize int64, duration float64, gender, endReason, embedURL, thumbnailURL, spriteURL, previewURL string, links map[string]string) error {
 	client := GetDBClient()
 	if client == nil {
 		return fmt.Errorf("Supabase not configured")
@@ -823,6 +828,7 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 		Filesize:     filesize,
 		Duration:     duration,
 		Gender:       gender,
+		EndReason:    endReason,
 		EmbedURL:     embedURL,
 		ThumbnailURL: thumbnailURL,
 		SpriteURL:    spriteURL,
@@ -832,11 +838,19 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 	// and the FK would point to the wrong instance's row.
 	// Recordings are uniquely identified by filename, so channel_id is cosmetic.
 
-	// Save recording first (try with duration, fall back without if column missing)
+	// Save recording first, falling back gracefully when a column is missing
+	// (the schema may not have duration/end_reason yet). Retry by dropping the
+	// newest column first, then the older duration column.
 	if err := client.SaveRecording(rec); err != nil && strings.Contains(err.Error(), "PGRST204") {
-		fmt.Printf("[WARN] duration column missing in Supabase — saving without duration: %v\n", err)
-		rec.Duration = 0
-		if err := client.SaveRecording(rec); err != nil {
+		fmt.Printf("[WARN] end_reason column missing in Supabase — saving without it: %v\n", err)
+		rec.EndReason = ""
+		if err := client.SaveRecording(rec); err != nil && strings.Contains(err.Error(), "PGRST204") {
+			fmt.Printf("[WARN] duration column missing in Supabase — saving without duration: %v\n", err)
+			rec.Duration = 0
+			if err := client.SaveRecording(rec); err != nil {
+				return fmt.Errorf("save recording (fallback): %w", err)
+			}
+		} else if err != nil {
 			return fmt.Errorf("save recording (fallback): %w", err)
 		}
 	} else if err != nil {
@@ -873,7 +887,7 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 // This ensures the recording is never lost even if the process is killed
 // during upload. The full metadata (thumbnails, upload links) is saved
 // later by stageSaveMetadata via the upsert on filename.
-func SaveRecordingBasics(username, filename, timestamp, roomTitle string, tags []string, viewers int, gender, resolution string, framerate int, filesize int64, duration float64) error {
+func SaveRecordingBasics(username, filename, timestamp, roomTitle string, tags []string, viewers int, gender, endReason, resolution string, framerate int, filesize int64, duration float64) error {
 	client := GetDBClient()
 	if client == nil {
 		return fmt.Errorf("Supabase not configured")
@@ -886,12 +900,20 @@ func SaveRecordingBasics(username, filename, timestamp, roomTitle string, tags [
 		Tags:       tags,
 		Viewers:    viewers,
 		Gender:     gender,
+		EndReason:  endReason,
 		Resolution: resolution,
 		Framerate:  framerate,
 		Filesize:   filesize,
 		Duration:   duration,
 	}
-	if err := client.SaveRecording(rec); err != nil {
+	// Fall back gracefully when the end_reason column does not exist yet.
+	if err := client.SaveRecording(rec); err != nil && strings.Contains(err.Error(), "PGRST204") {
+		fmt.Printf("[WARN] end_reason column missing in Supabase — saving basics without it: %v\n", err)
+		rec.EndReason = ""
+		if err := client.SaveRecording(rec); err != nil {
+			return err
+		}
+	} else if err != nil {
 		return err
 	}
 	return nil

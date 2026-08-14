@@ -181,11 +181,11 @@ func (ch *Channel) processPendingFile(pf pendingFile) {
 		if ch.handleMinDurationAndMerge(finalPath) {
 			return
 		}
-		ch.CompressFile(finalPath)
+		ch.CompressFile(finalPath, pf.endReason)
 	} else if ch.handleMinDurationAndMerge(finalPath) {
 		return
 	} else {
-		ch.MoveToOutputDir(finalPath)
+		ch.MoveToOutputDir(finalPath, pf.endReason)
 	}
 
 	// Refresh the disk-usage counter after finalization changes file sizes.
@@ -216,10 +216,15 @@ func (ch *Channel) cleanupLocked() error {
 		return nil
 	}
 	filename := ch.File.Name()
+	endReason := ch.closeReason
+	if endReason == "" {
+		endReason = "unknown"
+	}
 
 	defer func() {
 		ch.Filesize = 0
 		ch.Duration = 0
+		ch.closeReason = "" // consumed; next file starts with a fresh reason
 	}()
 
 	// Sync the file to ensure data is written to disk.
@@ -246,9 +251,11 @@ func (ch *Channel) cleanupLocked() error {
 		ch.cleanupMu.Lock()
 		ch.pendingFiles = append(ch.pendingFiles, pendingFile{
 			videoPath: filename,
+			endReason: endReason,
 		})
 		ch.cleanupMu.Unlock()
-		ch.Info("cleanup: queued %s for post-processing", filepath.Base(filename))
+		ch.Info("cleanup: queued %s for post-processing (ended: %s, duration: %s, size: %s)",
+			filepath.Base(filename), endReason, internal.FormatDuration(ch.Duration), internal.FormatFilesize(ch.Filesize))
 	}
 
 	return nil
@@ -630,7 +637,9 @@ func qualityArgsForEncoder(encoder string, quality int) []string {
 
 // MoveToOutputDir relocates a finalized recording into server.Config.OutputDir.
 // Errors are non-fatal: the recording is already safely written at srcPath.
-func (ch *Channel) MoveToOutputDir(srcPath string) string {
+// endReason (why the recording stopped) is forwarded to the pipeline so it is
+// persisted to the recordings row in Supabase.
+func (ch *Channel) MoveToOutputDir(srcPath, endReason string) string {
 	// Enqueue the file into the pipeline for thumbnail → upload → metadata → cleanup.
 	// The pipeline handles all lifecycle (semaphore, waitgroup, state persistence).
 	//
@@ -640,7 +649,7 @@ func (ch *Channel) MoveToOutputDir(srcPath string) string {
 	// drop the enqueue as a "duplicate" — leaving the freshly moved recording
 	// permanently stuck, never uploaded until the next restart.
 	enqueue := func(filePath string) {
-		ch.PipelineQueue.EnqueueFileClaimed(filePath)
+		ch.PipelineQueue.EnqueueFileClaimed(filePath, endReason)
 	}
 
 	if server.Config == nil || server.Config.OutputDir == "" {
@@ -1619,7 +1628,7 @@ func saveOrphanMetadataAndCleanup(filePath, filename, fileHash, embedURL string,
 	dbSaved := false
 	if err := server.SaveRecordingWithLinks(
 		extractUsernameFromFilename(filename), filename, timestamp,
-		"", nil, 0, "", 0, filesize, dur, "", embedURL, thumbURL, spriteURL, previewURL, links,
+		"", nil, 0, "", 0, filesize, dur, "", "", embedURL, thumbURL, spriteURL, previewURL, links,
 	); err != nil {
 		// Keep the local journal on DB failure: it holds the dedup record AND
 		// the download links, so the next scan can retry metadata recovery
@@ -2303,10 +2312,10 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 
 		if ch.Config.Compress {
 			ch.Info("min-duration: merged -> %s (%.1fs), compressing before upload", filepath.Base(mergedPath), mergedDur)
-			ch.CompressFile(mergedPath)
+			ch.CompressFile(mergedPath, "")
 		} else {
 			ch.Info("min-duration: merged -> %s (%.1fs), proceeding with upload", filepath.Base(mergedPath), mergedDur)
-			ch.MoveToOutputDir(mergedPath)
+			ch.MoveToOutputDir(mergedPath, "")
 		}
 		return true
 	}
@@ -2391,9 +2400,9 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 				mergedPath = stablePath
 			}
 			if ch.Config.Compress {
-				ch.CompressFile(mergedPath)
+				ch.CompressFile(mergedPath, "")
 			} else {
-				ch.MoveToOutputDir(mergedPath)
+				ch.MoveToOutputDir(mergedPath, "")
 			}
 		} else {
 			// Keep pending under the stable name so the next merge dedupes it.

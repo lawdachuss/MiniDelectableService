@@ -109,7 +109,7 @@ func TestEnqueueFileClaimedSkipsInFlightEarlyOut(t *testing.T) {
 	// enqueueing it.  EnqueueFileClaimed must STILL accept it.
 	MarkUploadInFlight(path)
 	t.Cleanup(func() { MarkUploadDone(path) })
-	pq.EnqueueFileClaimed(path)
+	pq.EnqueueFileClaimed(path, "")
 
 	if got := pq.EnqueuedCount(); got != 1 {
 		t.Fatalf("EnqueueFileClaimed: expected 1 accepted pipeline for a pre-marked file, got %d", got)

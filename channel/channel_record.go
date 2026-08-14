@@ -148,6 +148,30 @@ func (ch *Channel) Monitor(runID uint64) {
 		}
 	}
 
+	// Classify the final error so the cleanup log explains WHY the recording
+	// ended. Skip the canceled case — pause/stop already set a precise reason
+	// (manual / handoff) before canceling the context.
+	if err != nil && !errors.Is(err, context.Canceled) {
+		switch {
+		case errors.Is(err, internal.ErrChannelOffline):
+			ch.setCloseReason("channel went offline")
+		case errors.Is(err, internal.ErrPrivateStream):
+			ch.setCloseReason("channel entered a private show")
+		case errors.Is(err, internal.ErrStreamStalled):
+			ch.setCloseReason("stream session expired (no new segments)")
+		case errors.Is(err, internal.ErrNotFound):
+			ch.setCloseReason("channel not found (deleted/renamed)")
+		case errors.Is(err, internal.ErrAgeVerification):
+			ch.setCloseReason("age verification required")
+		case errors.Is(err, internal.ErrCloudflareBlocked):
+			ch.setCloseReason("cloudflare blocked")
+		case errors.Is(err, internal.ErrRoomPasswordRequired):
+			ch.setCloseReason("room password required")
+		default:
+			ch.setCloseReason(fmt.Sprintf("record stream error: %v", err))
+		}
+	}
+
 	// Always cleanup when monitor exits, regardless of error.
 	// On stop/pause the file is queued for processing by Stop(); on an
 	// error-exit it is finalized and uploaded immediately.
@@ -281,9 +305,19 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 		ch.Info("status: room title: %s", title)
 	}
 
-	return playlist.WatchSegments(ctx, func(b []byte, duration float64) error {
+	watchErr := playlist.WatchSegments(ctx, func(b []byte, duration float64) error {
 		return ch.handleSegmentForMonitor(runID, b, duration)
 	})
+	if watchErr != nil {
+		if errors.Is(watchErr, internal.ErrStreamStalled) {
+			ch.setCloseReason("stream session expired (no new segments)")
+		} else if errors.Is(watchErr, context.Canceled) {
+			// Paused or stopped — the pause/stop path already set a reason.
+		} else {
+			ch.setCloseReason(fmt.Sprintf("HLS stream ended: %v", watchErr))
+		}
+	}
+	return watchErr
 }
 
 // scrapeProfileOnDemand fetches the model's full public profile via the site
@@ -368,6 +402,7 @@ func (ch *Channel) handleSegmentForMonitor(runID uint64, b []byte, duration floa
 
 	var newFilename string
 	if shouldSwitch {
+		ch.closeReason = "max duration or filesize reached"
 		if err := ch.cleanupLocked(); err != nil {
 			ch.fileMu.Unlock()
 			return fmt.Errorf("next file: %w", err)

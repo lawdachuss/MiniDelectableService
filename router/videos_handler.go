@@ -68,6 +68,7 @@ type RecordingEntry struct {
 	PreviewURL   string            `json:"preview_url"`
 	EmbedURL     string            `json:"embed_url"`
 	Filesize     int64             `json:"filesize"`
+	EndReason    string            `json:"end_reason,omitempty"`
 }
 
 type ChannelRecordings struct {
@@ -98,6 +99,7 @@ type VideoEntry struct {
 	Gender       string
 	Resolution   string
 	Framerate    int
+	EndReason    string
 }
 
 type VideoGroup struct {
@@ -226,6 +228,7 @@ func scanVideos() []*VideoEntry {
 						e.Gender = chanData.Gender
 						e.Resolution = rec.Resolution
 						e.Framerate = rec.Framerate
+						e.EndReason = rec.EndReason
 						if rec.ThumbnailURL != "" {
 							e.ThumbnailURL = rec.ThumbnailURL
 						}
@@ -284,6 +287,7 @@ func scanVideos() []*VideoEntry {
 				ThumbnailURL: thumbURL,
 				SpriteURL:    spriteURL,
 				PreviewURL:   previewURL,
+				EndReason:    rec.EndReason,
 			})
 		}
 	}

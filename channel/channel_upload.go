@@ -218,6 +218,7 @@ func (ch *Channel) uploadFile(filePath string, thumbURL, spriteURL, previewURL s
 			filesize,
 			dur,
 			ch.Gender,
+			"", // end_reason unknown for orphan uploads
 			embedURL,
 			thumbURL,
 			spriteURL,

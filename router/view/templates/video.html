@@ -1021,6 +1021,12 @@
             <div class="meta-value">{{ .Framerate }} fps</div>
         </div>
         {{ end }}
+        {{ if .EndReason }}
+        <div class="meta-cell">
+            <div class="meta-label">Ended</div>
+            <div class="meta-value">{{ .EndReason }}</div>
+        </div>
+        {{ end }}
     </div>
 
     {{ if or .RoomTitle .Tags }}

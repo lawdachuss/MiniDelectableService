@@ -67,7 +67,9 @@ func getEncoder() videoEncoder {
 // CompressFile compresses a video file (.ts or .mp4) to .mkv format using ffmpeg in the background.
 // Uses hardware GPU encoding if available, falls back to CPU (libx264).
 // After successful compression, the original file is deleted.
-func (ch *Channel) CompressFile(srcPath string) {
+// endReason (why the recording stopped) is forwarded to the pipeline so it is
+// persisted to the recordings row in Supabase.
+func (ch *Channel) CompressFile(srcPath, endReason string) {
 	ch.UploadWg.Add(1)
 	go func() {
 		defer ch.UploadWg.Done()
@@ -119,7 +121,7 @@ func (ch *Channel) CompressFile(srcPath string) {
 				ch.Error("compress: ffmpeg: %s", outStr)
 			}
 			ch.Info("compress: compression failed — moving uncompressed %s into pipeline instead of abandoning it", srcFilename)
-			ch.MoveToOutputDir(srcPath)
+			ch.MoveToOutputDir(srcPath, endReason)
 			return
 		}
 
@@ -144,6 +146,6 @@ func (ch *Channel) CompressFile(srcPath string) {
 
 		ch.Info("compress: done %s -> %s (%s, %.1f%%)", srcFilename, mkvFilename, internal.FormatFilesize(int(mkvSize)), ratio)
 
-		ch.MoveToOutputDir(mkvPath)
+		ch.MoveToOutputDir(mkvPath, endReason)
 	}()
 }

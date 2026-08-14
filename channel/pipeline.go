@@ -95,6 +95,9 @@ type Pipeline struct {
 	Gender     string   `json:"gender"`
 	Resolution string   `json:"resolution"`
 	Framerate  int      `json:"framerate"`
+	// EndReason is why the recording stopped (captured from closeReason at
+	// file-close time); persisted to the recordings row in Supabase.
+	EndReason string `json:"end_reason,omitempty"`
 
 	// Results populated by stages, consumed by downstream stages
 	ThumbURL   string            `json:"thumb_url"`
@@ -116,6 +119,15 @@ func newPipeline(filePath, fileHash, filename, username string, fileSize int64) 
 		CurrentStage: StageThumbnailUpload,
 		Links:        make(map[string]string),
 	}
+}
+
+// setEndReason records why the recording stopped. Called right after creation
+// (and on resume when persisted state carries it) so stageSaveMetadata can
+// persist it to the recordings row.
+func (p *Pipeline) setEndReason(reason string) {
+	p.mu.Lock()
+	p.EndReason = reason
+	p.mu.Unlock()
 }
 
 // advanceTo moves the pipeline to a new stage.
@@ -534,6 +546,7 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 		p.FileSize,
 		dur,
 		p.Gender,
+		p.EndReason,
 		p.EmbedURL,
 		p.ThumbURL,
 		p.SpriteURL,
@@ -1000,7 +1013,7 @@ func (pq *PipelineQueue) containsHash(fileHash string) bool {
 
 // EnqueueFile creates a pipeline for a finalized video file and adds it to the queue.
 func (pq *PipelineQueue) EnqueueFile(filePath string) {
-	pq.enqueueFile(filePath, false)
+	pq.enqueueFile(filePath, false, "")
 }
 
 // EnqueueFileClaimed enqueues a file whose in-flight marker has ALREADY been
@@ -1010,11 +1023,13 @@ func (pq *PipelineQueue) EnqueueFile(filePath string) {
 // is safe because the marker was set by us moments ago and no pipeline for
 // this brand-new path can exist yet; the queue's hash-based duplicate check
 // (containsHash) still drops genuine duplicates.
-func (pq *PipelineQueue) EnqueueFileClaimed(filePath string) {
-	pq.enqueueFile(filePath, true)
+// endReason is why the recording stopped; it is persisted with the recording
+// metadata in Supabase.
+func (pq *PipelineQueue) EnqueueFileClaimed(filePath, endReason string) {
+	pq.enqueueFile(filePath, true, endReason)
 }
 
-func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool) {
+func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool, endReason string) {
 	base := filepath.Base(filePath)
 	if !videoExt(base) || isSidecar(base) {
 		return
@@ -1084,6 +1099,7 @@ func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool) {
 
 	pq.ch.UploadWg.Add(1)
 	p := newPipeline(filePath, fileHash, base, pq.ch.Config.Username, fileSize)
+	p.setEndReason(endReason)
 
 	// Snapshot channel metadata under stateMu, then pq.mu — safe lock ordering.
 	pq.ch.stateMu.Lock()
@@ -1128,7 +1144,7 @@ func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool) {
 		if saveErr := server.SaveRecordingBasics(
 			pq.ch.Config.Username, base, timestamp,
 			roomTitle, tags, viewers,
-			gender, resolution, framerate,
+			gender, p.EndReason, resolution, framerate,
 			fileSize, dur,
 		); saveErr != nil {
 			pq.ch.Warn("pipeline: could not save early metadata for %s: %v", base, saveErr)

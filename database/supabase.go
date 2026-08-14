@@ -467,6 +467,10 @@ type Recording struct {
 	Filesize     int64    `json:"filesize"`
 	Duration     float64  `json:"duration,omitempty"`
 	Gender       string   `json:"gender,omitempty"`
+	// EndReason records why the recording stopped (model went offline, stream
+	// session expired, max duration/filesize rotation, paused/stopped, session
+	// boundary). Empty when unknown (e.g. orphan-recovery uploads).
+	EndReason    string   `json:"end_reason,omitempty"`
 	ThumbnailURL string   `json:"thumbnail_url,omitempty"`
 	SpriteURL    string   `json:"sprite_url,omitempty"`
 	PreviewURL   string   `json:"preview_url,omitempty"`

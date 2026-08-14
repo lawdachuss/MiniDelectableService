@@ -20,6 +20,9 @@ import (
 // (finalize → move to output dir → thumbnail → upload → DB save → deletion).
 type pendingFile struct {
 	videoPath string
+	// endReason is why the recording stopped (captured from closeReason before
+	// cleanupLocked consumes it); persisted to the recordings row in Supabase.
+	endReason string
 }
 
 // Channel represents a channel instance.
@@ -78,6 +81,12 @@ type Channel struct {
 	Config         *entity.ChannelConfig
 
 	fileMu     sync.RWMutex // protects File, mp4InitSegment, Duration, Filesize, TotalDiskUsageBytes
+
+	// closeReason records why the current recording is ending (model offline,
+	// stream session expired, max duration/filesize rotation, pause/stop,
+	// session boundary). Set before cleanupLocked closes the file so the
+	// end-reason can be logged with the final duration.
+	closeReason string
 	profileMu  sync.Mutex
 	lastProfileScrape time.Time // when the full profile was last fetched (on-demand only)
 	monitorMu  sync.Mutex
@@ -437,14 +446,17 @@ func (ch *Channel) PauseWithReason(reason entity.PauseReason) {
 	ch.monitorRestartRequested = false
 	ch.monitorMu.Unlock()
 
+	// Record WHY before canceling: the monitor's deferred cleanup closes the
+	// file the moment the context is canceled, and cleanupLocked logs this
+	// reason. Log the EFFECTIVE reason — for a manually-paused channel
+	// re-paused by an automatic boundary, the sticky rule keeps "manual" and
+	// that is what the log should say.
+	ch.setCloseReason(fmt.Sprintf("paused (%s)", ch.PauseReason()))
 	ch.Config.IsPaused.Store(true)
 	ch.cancelMu.Lock()
 	ch.CancelFunc()
 	ch.cancelMu.Unlock()
 	ch.Update()
-	// Log the EFFECTIVE reason — for a manually-paused channel re-paused by an
-	// automatic boundary, the sticky rule keeps "manual" and that is what the
-	// log should say.
 	ch.Info("channel paused (%s)", ch.PauseReason())
 
 	// Finalize any in-progress files immediately so they can be uploaded
@@ -469,6 +481,15 @@ func (ch *Channel) Cancel() {
 	ch.cancelMu.Unlock()
 }
 
+// setCloseReason records why the current recording is ending so cleanupLocked
+// can log it when it closes the file. Callers should set it BEFORE invoking
+// Cleanup/cleanupLocked (or before canceling the context that triggers them).
+func (ch *Channel) setCloseReason(reason string) {
+	ch.fileMu.Lock()
+	ch.closeReason = reason
+	ch.fileMu.Unlock()
+}
+
 // Stop stops the channel and cancels the context. The pause reason is recorded
 // as "handoff" (the channel is being torn down for reassignment or deletion).
 func (ch *Channel) Stop() {
@@ -478,6 +499,7 @@ func (ch *Channel) Stop() {
 	ch.setPauseReason(entity.PauseReasonHandoff)
 	ch.monitorMu.Unlock()
 
+	ch.setCloseReason("channel stopped (handoff)")
 	ch.cancelMu.Lock()
 	ch.CancelFunc()
 	ch.PauseCancelFunc()

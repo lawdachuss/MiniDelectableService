@@ -738,6 +738,7 @@ func VideoDetail(c *gin.Context) {
 						ThumbnailURL: rec.ThumbnailURL,
 						SpriteURL:    rec.SpriteURL,
 						PreviewURL:   rec.PreviewURL,
+						EndReason:    rec.EndReason,
 					})
 					if len(related) >= 8 {
 						break
