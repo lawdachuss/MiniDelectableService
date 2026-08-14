@@ -601,6 +601,13 @@ while ($true) {
   if ($tun -and $tun.HasExited) {
     Write-Host "(WARN) Tunnel exited - restarting..."
     $null = [System.Console]::Out.Flush()
+    # A quick tunnel's hostname dies with its process — the restarted cloudflared
+    # gets a NEW random hostname, so forget the old URL. Clearing it makes the
+    # main-loop retry block above re-extract the fresh URL from the new
+    # tunnel-stderr.log and push it to Supabase; otherwise the 5-min web_url
+    # refresh keeps advertising the dead hostname (Error 1033 on the Visit link).
+    $tunnelUrl = $null
+    $lastTunnelUrl = $null
     $stderr = "$repoDir\tunnel-stderr.log"
     if (Test-Path $stderr) { Remove-Item $stderr -Force }
     $tun = Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel --url http://localhost:8080 --protocol http2" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardError $stderr -PassThru
@@ -679,4 +686,9 @@ $waitStart = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 while (-not (Test-Path $uploadFlag) -and ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $waitStart) -lt 240) { Start-Sleep -Seconds 15 }
 if (Test-Path $uploadFlag) { Remove-Item $uploadFlag -Force }
 
+# This run's cloudflared is about to die with the runner, taking its quick-tunnel
+# hostname with it. Blank web_url NOW so the admin Visit link stops pointing at a
+# vanished tunnel (Error 1033) during the handoff; the next run re-upserts with
+# its fresh URL. Same cleanup the dark-run bailout path performs.
+Clear-NodeStatus -NodeId $myNodeId -Status "offline"
 gh workflow run secure-rdp.yml --repo $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME
