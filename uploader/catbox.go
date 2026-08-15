@@ -188,9 +188,14 @@ func isRetryableCatboxError(err error) bool {
 		return true
 	}
 
-	// "Invalid uploader" (HTTP 412) is often a transient IP block or
-	// rate-limit from Catbox's abuse prevention. Retry with backoff.
-	if strings.Contains(errStr, "Invalid uploader") {
+	// HTTP 412 from Catbox is a blanket rejection whose body varies
+	// ("Invalid uploader", "Not signed in", ...). It is often a transient IP
+	// block or rate-limit from Catbox's abuse prevention — observed fleet-wide
+	// as a short burst of "Not signed in!" rejections that resolved minutes
+	// later. Treat any 412 (and 429 rate limits) as retryable so a brief
+	// rejection window doesn't abort after one attempt and cascade into
+	// "all hosts failed" + ImgBB rate-limit. 5xx stays covered below.
+	if strings.Contains(errStr, "status 412") || strings.Contains(errStr, "status 429") {
 		return true
 	}
 
