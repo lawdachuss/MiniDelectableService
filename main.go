@@ -675,6 +675,15 @@ func start(c *cli.Context) error {
 	// uploads at the same time, even with no env set.
 	server.ApplyCentralSessionDuration()
 
+	// Log the resolved session config so /api/logs shows at a glance whether
+	// this node will stop recording at a deadline (and when) or run
+	// continuously — the key diagnostic for unexplained short recordings.
+	if d := server.Config.SessionDurationParsed; d > 0 {
+		fmt.Printf("[startup] session duration resolved: %s — next stop at %s\n", d.Round(time.Second), time.Now().Add(d).Format(time.RFC3339))
+	} else {
+		fmt.Println("[startup] session duration resolved: none — continuous recording (no deadline, no migration chop)")
+	}
+
 	// Route disk-threshold alerts through the notifier (Discord/ntfy).
 	server.DiskAlert = notifier.Notify
 

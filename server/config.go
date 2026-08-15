@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -209,6 +211,44 @@ func validPersistedValue(s string) string {
 	return s
 }
 
+// Session-deadline stagger. Nodes that start at the same time with the same
+// session duration end up with session_deadlines only minutes apart, so every
+// node enters its 15-minute pre-deadline migration window at roughly the same
+// moment. With the whole fleet imminent at once, the deadline-migration cycle
+// has NO healthy non-imminent node to move channels to, so channels flap
+// between imminent nodes — every hop force-splits the in-progress recording
+// (the fleet-wide "channel stopped (handoff)" pattern). The stagger gives each
+// node a deterministic, node-ID-derived offset so deadlines are spread across
+// the fleet and migration always has healthy targets.
+const (
+	// ciSessionStaggerSpread bounds the offset on CI runners, which have a
+	// hard 6h kill and a 348m self-cancel: the offset must stay tiny so no
+	// node's staggered duration crosses the buffer and gets killed mid-file.
+	ciSessionStaggerSpread = 10 * time.Minute
+	// permanentSessionStaggerSpread bounds the offset on permanent nodes (no
+	// hard kill). 240 minutes spreads the 15-minute migration windows of a
+	// ~16-node fleet so they essentially never overlap, keeping healthy
+	// migration targets available at all times.
+	permanentSessionStaggerSpread = 240 * time.Minute
+)
+
+// staggerSessionDuration returns d plus a deterministic per-node offset derived
+// from the node ID (fnv hash mod the spread). The offset is stable across
+// restarts and session cycles, so the fleet's relative deadline spacing never
+// collapses back to synchronized. On CI runners the spread is capped small to
+// respect the workflow's hard kill; on permanent nodes it can be large enough
+// to keep migration windows disjoint.
+func staggerSessionDuration(d time.Duration) time.Duration {
+	spread := permanentSessionStaggerSpread
+	if os.Getenv("GITHUB_RUN_ID") != "" {
+		spread = ciSessionStaggerSpread
+	}
+	h := fnv.New32a()
+	h.Write([]byte(detectNodeID()))
+	offset := time.Duration(h.Sum32()%uint32(spread/time.Minute)) * time.Minute
+	return d + offset
+}
+
 // ApplyCentralSessionDuration reconciles the session length so every node
 // follows the same value. Precedence:
 //  1. A locally-set SESSION_DURATION (env/flag) always wins — per-node override.
@@ -217,26 +257,40 @@ func validPersistedValue(s string) string {
 //  3. If neither is set, a CI runner (GITHUB_RUN_ID) falls back to a ~5m-35m
 //     buffer (5h35m) before the workflow's hard kill so it still stops,
 //     processes and uploads instead of being force-flushed mid-recording.
+//
+// Finally, the resolved duration is staggered per node (see
+// staggerSessionDuration). Both the manager's session stop and the
+// coordinator's persisted session_deadline read SessionDurationParsed, so a
+// single stagger here keeps them in agreement.
 func ApplyCentralSessionDuration() {
 	ConfigMu.Lock()
 	defer ConfigMu.Unlock()
 
-	// Local env value already parsed — keep it.
-	if Config.SessionDurationParsed > 0 || Config.SessionDuration != "" {
-		return
-	}
+	// Local env value already parsed — keep it (per-node override).
+	if Config.SessionDurationParsed <= 0 && Config.SessionDuration == "" {
+		if central := LoadSessionDurationFromDB(); central != "" {
+			if parsed, err := time.ParseDuration(central); err == nil && parsed > 0 {
+				Config.SessionDuration = central
+				Config.SessionDurationParsed = parsed
+			}
+		}
 
-	if central := LoadSessionDurationFromDB(); central != "" {
-		if parsed, err := time.ParseDuration(central); err == nil && parsed > 0 {
-			Config.SessionDuration = central
-			Config.SessionDurationParsed = parsed
-			return
+		if Config.SessionDurationParsed <= 0 && os.Getenv("GITHUB_RUN_ID") != "" {
+			Config.SessionDuration = "335m"
+			Config.SessionDurationParsed = 335 * time.Minute
 		}
 	}
 
-	if os.Getenv("GITHUB_RUN_ID") != "" {
-		Config.SessionDuration = "335m"
-		Config.SessionDurationParsed = 335 * time.Minute
+	// Stagger whatever duration was resolved (env, central, or CI fallback)
+	// so fleet deadlines desynchronize instead of collapsing into one window.
+	if Config.SessionDurationParsed > 0 {
+		staggered := staggerSessionDuration(Config.SessionDurationParsed)
+		if staggered != Config.SessionDurationParsed {
+			log.Printf("[startup] session duration staggered for node %q: %s -> %s (offset %s)",
+				detectNodeID(), Config.SessionDurationParsed, staggered, staggered-Config.SessionDurationParsed)
+			Config.SessionDurationParsed = staggered
+			Config.SessionDuration = staggered.String()
+		}
 	}
 }
 

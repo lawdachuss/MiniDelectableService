@@ -458,7 +458,11 @@ func (c *Coordinator) Register() {
 	if err := c.Client.UpsertNode(node); err != nil {
 		log.Printf("[coordinator] WARNING: failed to register node: %v", err)
 	} else {
-		log.Printf("[coordinator] registered as node %q on %s", c.NodeID, host)
+		if deadline != nil {
+			log.Printf("[coordinator] registered as node %q on %s (session deadline: %s)", c.NodeID, host, deadline.Format(time.RFC3339))
+		} else {
+			log.Printf("[coordinator] registered as node %q on %s (no session deadline — permanent node)", c.NodeID, host)
+		}
 	}
 }
 

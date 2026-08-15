@@ -28,4 +28,14 @@ var (
 	// loop treats it as a soft error: it finalises the current file and
 	// re-fetches a fresh HLS URL so recording resumes immediately.
 	ErrStreamStalled = errors.New("no new segments downloaded — stream session may have expired; reconnecting")
+	// ErrMediaForbidden is returned when a CDN media endpoint (HLS playlist,
+	// segment, thumbnail) answers with a bare 403 that carries no Cloudflare
+	// challenge. Unlike the site API — where a bare 403 means the room is in
+	// a private show — a CDN 403 is ambiguous: it can be a private show (the
+	// public stream stopped) OR an expired HLS session token / dead edge.
+	// Treating every CDN 403 as a private show ended live recordings after a
+	// handful of failed polls and pushed the channel into the slow offline
+	// retry, so recordings rarely reached max duration. The recorder now
+	// probes the site API (which knows the room's true state) before deciding.
+	ErrMediaForbidden = errors.New("media endpoint forbidden (session expired or stream stopped)")
 )

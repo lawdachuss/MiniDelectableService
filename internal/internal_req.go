@@ -214,6 +214,14 @@ func (h *Req) GetBytes(ctx context.Context, url string) ([]byte, error) {
 	}
 
 	if resp.StatusCode == http.StatusForbidden {
+		// A bare 403 from a CDN media endpoint is ambiguous (private show vs
+		// expired HLS session token), so it must not be reported as a private
+		// show — the recorder would end a live recording and bench the channel
+		// for the full offline interval. Only the site API (which knows the
+		// room's true room_status) may classify a 403 as a private show.
+		if h.isMedia {
+			return nil, fmt.Errorf("forbidden: %w", ErrMediaForbidden)
+		}
 		return nil, fmt.Errorf("forbidden: %w", ErrPrivateStream)
 	}
 
@@ -291,6 +299,9 @@ func (h *Req) GetBytesWithTimeout(ctx context.Context, url string, timeout time.
 	}
 
 	if resp.StatusCode == http.StatusForbidden {
+		if h.isMedia {
+			return nil, fmt.Errorf("forbidden: %w", ErrMediaForbidden)
+		}
 		return nil, fmt.Errorf("forbidden: %w", ErrPrivateStream)
 	}
 

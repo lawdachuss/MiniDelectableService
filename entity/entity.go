@@ -65,9 +65,11 @@ func (c *ChannelConfig) Sanitize() {
 	if c.Resolution == 0 {
 		c.Resolution = 2160
 	}
-	if c.MaxDuration == 0 {
-		c.MaxDuration = 160
-	}
+	// MaxDuration 0 means "no rotation" (the web UI shows ∞ and the
+	// --max-duration flag help says '0 to disable'). Previously this was
+	// silently overridden to 160, so channels configured unbounded actually
+	// rotated every 160 minutes — the recordings table shows 704 of 924
+	// assignments carrying that phantom 160. Keep 0 as 0.
 	if c.Pattern == "" {
 		c.Pattern = "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"
 	}

@@ -2,12 +2,14 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/teacat/chaturbate-dvr/entity"
 )
@@ -172,6 +174,91 @@ func TestPerNodeCookieSaveLoadRoundTrip(t *testing.T) {
 	}
 	if Config.AffiliateWM != "wm-123" {
 		t.Errorf("after load affiliate_wm = %q, want wm-123", Config.AffiliateWM)
+	}
+}
+
+// TestStaggerSessionDurationDeterministic verifies the offset is stable for a
+// given node ID and stays within [0, spread).
+func TestStaggerSessionDurationDeterministic(t *testing.T) {
+	t.Setenv("NODE_ID", "node-7")
+	t.Setenv("GITHUB_RUN_ID", "")
+	base := 320 * time.Minute
+	a := staggerSessionDuration(base)
+	b := staggerSessionDuration(base)
+	if a != b {
+		t.Fatalf("stagger not deterministic: %s vs %s", a, b)
+	}
+	if a < base || a >= base+permanentSessionStaggerSpread {
+		t.Fatalf("staggered %s out of [%s, %s)", a, base, base+permanentSessionStaggerSpread)
+	}
+}
+
+// TestStaggerSessionDurationSpreadsNodes verifies distinct node IDs get spread
+// across the stagger range instead of all landing on the same offset.
+func TestStaggerSessionDurationSpreadsNodes(t *testing.T) {
+	t.Setenv("GITHUB_RUN_ID", "")
+	base := 320 * time.Minute
+	seen := map[time.Duration]bool{}
+	for i := 1; i <= 24; i++ {
+		t.Setenv("NODE_ID", fmt.Sprintf("node-%d", i))
+		seen[staggerSessionDuration(base)-base] = true
+	}
+	if len(seen) < 12 {
+		t.Errorf("expected >=12 distinct offsets across 24 node IDs, got %d", len(seen))
+	}
+}
+
+// TestStaggerSessionDurationCI verifies CI runners get only a tiny offset so
+// the staggered duration never crosses the 348m self-cancel / 360m hard kill.
+func TestStaggerSessionDurationCI(t *testing.T) {
+	t.Setenv("NODE_ID", "node-7")
+	t.Setenv("GITHUB_RUN_ID", "12345")
+	base := 335 * time.Minute
+	d := staggerSessionDuration(base)
+	if d-base >= ciSessionStaggerSpread {
+		t.Fatalf("CI offset %s exceeds spread %s", d-base, ciSessionStaggerSpread)
+	}
+	if d > 348*time.Minute {
+		t.Fatalf("CI staggered duration %s crosses the 348m self-cancel buffer", d)
+	}
+}
+
+// TestApplyCentralSessionDurationStaggers verifies the resolved duration (from
+// env, central, or CI fallback) gets staggered and the string field stays
+// consistent with the parsed value.
+func TestApplyCentralSessionDurationStaggers(t *testing.T) {
+	t.Setenv("NODE_ID", "node-3")
+	t.Setenv("GITHUB_RUN_ID", "")
+	oldConfig := Config
+	defer func() { Config = oldConfig }()
+	Config = &entity.Config{SessionDuration: "5h20m", SessionDurationParsed: 320 * time.Minute}
+
+	ApplyCentralSessionDuration()
+
+	if Config.SessionDurationParsed <= 320*time.Minute {
+		t.Fatalf("expected staggered duration > 5h20m, got %s", Config.SessionDurationParsed)
+	}
+	if Config.SessionDurationParsed >= 320*time.Minute+permanentSessionStaggerSpread {
+		t.Fatalf("staggered duration %s exceeds base+spread", Config.SessionDurationParsed)
+	}
+	if got, _ := time.ParseDuration(Config.SessionDuration); got != Config.SessionDurationParsed {
+		t.Fatalf("SessionDuration string %q != parsed %s", Config.SessionDuration, Config.SessionDurationParsed)
+	}
+}
+
+// TestApplyCentralSessionDurationContinuous verifies a node with no session
+// duration stays continuous (0) — never staggered into a deadline.
+func TestApplyCentralSessionDurationContinuous(t *testing.T) {
+	t.Setenv("NODE_ID", "node-3")
+	t.Setenv("GITHUB_RUN_ID", "")
+	oldConfig := Config
+	defer func() { Config = oldConfig }()
+	Config = &entity.Config{}
+
+	ApplyCentralSessionDuration()
+
+	if Config.SessionDurationParsed != 0 {
+		t.Fatalf("no-duration node got %s, want 0 (continuous)", Config.SessionDurationParsed)
 	}
 }
 
