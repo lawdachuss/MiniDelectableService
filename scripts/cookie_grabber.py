@@ -96,6 +96,46 @@ GRAB_TOTAL_TIMEOUT = int(os.environ.get("GRAB_TOTAL_TIMEOUT", "480"))
 SCRAPLING_BUDGET = int(os.environ.get("SCRAPLING_BUDGET", "150"))
 
 
+def is_cf_challenge(status, body):
+    """Mirror of Go's internal.IsCloudflareChallenge (internal_req.go).
+
+    A response is a Cloudflare challenge/block page when it comes back on the
+    status codes CF uses for challenge/rate-limit pages (429/503/410) or its
+    body carries the challenge HTML markers. A markerless 403 (private show),
+    a 404 (bad probe path), or a 401 are all NORMAL responses that prove the
+    request already passed the Turnstile WAF — never a blocked clearance.
+    """
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return False
+    if status in (429, 503, 410):
+        return True
+    snippet = (body or "")[:4096].lower()
+    markers = (
+        "just a moment",
+        "attention required",
+        "cf-chl",
+        "challenge-platform",
+        "cf-chl-box",
+        "enable javascript",
+    )
+    return any(m in snippet for m in markers)
+
+
+def _verify_clearance(status, body):
+    """A freshly-minted cf_clearance is VALID when the request got through the
+    WAF — i.e. the response is NOT a Cloudflare challenge page, whatever its
+    HTTP status. Requiring exactly 200 discarded good clearances whenever the
+    probe endpoint answered 404/403/401 (the probe user was offline or moved),
+    which surfaced as a false 'failed to extract cookies' and kept stale
+    cookies in Supabase instead of saving the fresh, working set.
+    """
+    if not status:
+        return False
+    return not is_cf_challenge(status, body)
+
+
 def install_watchdog():
     """Force-exit the whole process after GRAB_TOTAL_TIMEOUT seconds.
 
@@ -345,8 +385,12 @@ def on_real_site(page):
 
 def verify_api_via_browser(page):
     """Fetch a real API endpoint from inside the browser context (which carries
-    the fresh cookies incl. cf_clearance). Returns True if it gets HTTP 200,
-    which proves the clearance is valid for this IP."""
+    the fresh cookies incl. cf_clearance). Returns True when the response got
+    through the WAF — i.e. it is NOT a Cloudflare challenge page. Matches Go's
+    internal.IsCloudflareChallenge: a 404/401/markerless-403 is a NORMAL
+    response that proves the clearance is valid for this IP (the strict ==200
+    check discarded good clearances whenever the probe endpoint answered 404,
+    producing false 'failed to extract cookies')."""
     try:
         result = page.evaluate(
             """async () => {
@@ -355,14 +399,19 @@ def verify_api_via_browser(page):
                         headers: {'Accept': 'application/json'}
                     });
                     const t = await r.text();
-                    return {status: r.status, bytes: t.length};
+                    return {status: r.status, snippet: t.slice(0, 300)};
                 } catch (e) {
-                    return {status: 0, error: String(e)};
+                    return {status: 0, snippet: '', error: String(e)};
                 }
             }"""
         )
-        print(f"  API verify (biocontext): {result}")
-        return isinstance(result, dict) and result.get("status") == 200
+        if isinstance(result, dict):
+            print(f"  API verify (biocontext): HTTP {result.get('status')}")
+        else:
+            print(f"  API verify (biocontext): {result}")
+        return isinstance(result, dict) and _verify_clearance(
+            result.get("status"), result.get("snippet", "")
+        )
     except Exception as e:
         print(f"  [WARN] API verify failed: {e}")
         return False
@@ -378,19 +427,27 @@ def solve_challenge(page, ctx, timeout):
     while time.time() < deadline:
         state = "real" if on_real_site(page) else "challenge"
         if state != last_state:
-            print(f"  page state: {state} (title='{(page.title() or '')[:50]}')")
+            try:
+                title = (page.title() or "")[:50]
+            except Exception:
+                title = "(unavailable)"
+            print(f"  page state: {state} (title='{title}')")
             last_state = state
         if state == "challenge" and _is_managed_challenge(page):
             print("  [FAIL] Managed Turnstile challenge detected — manual checkbox clicking can never clear it; abandoning early")
             print("  [INFO] Keeping the stored cookie set in Supabase - NOT overwriting with unverified cookies")
             sys.stdout.flush()
             return False
-        has_cf = any(c.get("name") == "cf_clearance" for c in ctx.cookies())
+        try:
+            ctx_cookies = ctx.cookies()
+        except Exception:
+            ctx_cookies = []
+        has_cf = any(c.get("name") == "cf_clearance" for c in ctx_cookies)
         if has_cf and state == "real":
             # Give the proof-of-work a moment to settle, then verify for real.
             time.sleep(3)
             if verify_api_via_browser(page):
-                print("  [OK] cf_clearance verified - API returned HTTP 200")
+                print("  [OK] cf_clearance verified - API request passed the WAF")
                 return True
             print("  [WARN] cf_clearance present but API still challenged - waiting...")
         if not clicked:
@@ -480,14 +537,18 @@ def _scrapling_attempt(site_domain, user_agent, timeout, executable):
         print(f"  [SCRAPLING] Page loaded (HTTP {status}) - collecting cookies...")
 
         cookies = {}
-        if isinstance(resp.cookies, tuple):
-            for c in resp.cookies:
-                if isinstance(c, dict) and "name" in c:
-                    cookies[c["name"]] = c["value"]
-                elif isinstance(c, dict):
-                    cookies.update(c)
-        elif isinstance(resp.cookies, dict):
-            cookies = dict(resp.cookies)
+        raw_cookies = getattr(resp, "cookies", None)
+        if isinstance(raw_cookies, dict):
+            cookies = dict(raw_cookies)
+        else:
+            for c in (raw_cookies or ()):
+                if isinstance(c, dict):
+                    if "name" in c:
+                        cookies[c["name"]] = c.get("value", "")
+                    else:
+                        cookies.update(c)
+                elif isinstance(c, (tuple, list)) and len(c) >= 2:
+                    cookies[c[0]] = c[1]
         print(f"  [SCRAPLING] Got {len(cookies)} cookies")
 
         if "cf_clearance" not in cookies or not cookies["cf_clearance"]:
@@ -496,15 +557,21 @@ def _scrapling_attempt(site_domain, user_agent, timeout, executable):
         print(f"  [SCRAPLING] cf_clearance found! length={len(cookies['cf_clearance'])}")
 
         # Verify the clearance actually works from inside the same session
-        # (it carries the fresh cookies). HTTP 200 = the Go client with the
-        # same cookies will pass too.
+        # (it carries the fresh cookies). Any response that is NOT a Cloudflare
+        # challenge page proves the clearance passes the WAF — the Go client
+        # with the same cookies will pass too. (Requiring exactly 200 discarded
+        # valid clearances whenever the probe endpoint answered 404/403.)
         verify_url = site_domain.rstrip("/") + "/api/biocontext/kittengirlxo/"
         try:
             vresp = session.fetch(verify_url, timeout=30000)
             vstatus = getattr(vresp, "status", None)
+            vbody = getattr(vresp, "text", "") or ""
             print(f"  [SCRAPLING] API verify: HTTP {vstatus}")
-            if vstatus != 200:
-                print("  [SCRAPLING] API verify failed - cf_clearance not valid for this IP")
+            if vstatus is None or vstatus == 0:
+                print("  [SCRAPLING] API verify got no usable response")
+                return None
+            if is_cf_challenge(vstatus, vbody):
+                print("  [SCRAPLING] API verify failed - cf_clearance still blocked by Cloudflare")
                 return None
         except Exception as e:
             print(f"  [SCRAPLING] API verify threw: {e}")
@@ -758,4 +825,16 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\n  [ERROR] Cookie grab interrupted")
+        sys.exit(1)
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        print("\n  [ERROR] Cookie grab crashed with an unhandled exception - keeping existing cookies in Supabase")
+        sys.exit(1)

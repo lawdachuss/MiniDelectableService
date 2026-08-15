@@ -178,11 +178,11 @@ func (ch *Channel) processPendingFile(pf pendingFile) {
 	}
 
 	if ch.Config.Compress {
-		if ch.handleMinDurationAndMerge(finalPath) {
+		if ch.handleMinDurationAndMerge(finalPath, pf.endReason) {
 			return
 		}
 		ch.CompressFile(finalPath, pf.endReason)
-	} else if ch.handleMinDurationAndMerge(finalPath) {
+	} else if ch.handleMinDurationAndMerge(finalPath, pf.endReason) {
 		return
 	} else {
 		ch.MoveToOutputDir(finalPath, pf.endReason)
@@ -2161,7 +2161,15 @@ func mergeVideos(inputs []string, outputPath string) error {
 // so the caller should stop processing it.  Returns false when the caller
 // should proceed with its normal upload logic (only when the feature is
 // disabled or the video meets the threshold with no pending segments).
-func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
+func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
+	// The fragment's end reason is only knowable right now — once a short
+	// fragment is parked in .pending (and later merged) the reason would be
+	// discarded, hiding WHY the recording was dropped. Log it on every park
+	// so the node logs expose the real drop cause instead of the merged
+	// recording's empty end_reason in Supabase.
+	if endReason == "" {
+		endReason = "unknown"
+	}
 	// Serialize this channel's merges against processAllPendingSegments (which
 	// runs at startup/periodic orphan cleanup) so the shared stable merged-*
 	// name can never be renamed out from under a concurrent upload. The unique
@@ -2187,13 +2195,13 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 
 	dur, err := VideoDurationSeconds(videoPath)
 	if err != nil {
-		ch.Warn("min-duration: could not probe %s: %v — deferring to pending", filepath.Base(videoPath), err)
 		// On probe failure, keep the video pending rather than uploading a corrupt/short file
 		pendingDir := pendingSegmentsDir(ch.Config.Username)
 		if mErr := os.MkdirAll(pendingDir, 0777); mErr == nil {
 			destPath := filepath.Join(pendingDir, filepath.Base(videoPath))
 			if rErr := os.Rename(videoPath, destPath); rErr == nil {
 				mu.Unlock()
+				ch.Warn("min-duration: could not probe %s (%v) — deferred to pending (ended: %s)", filepath.Base(videoPath), err, endReason)
 				return true
 			}
 		}
@@ -2239,7 +2247,7 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 		allInputs := append(mergeInputs, videoPath)
 		stableName := mergedPendingName(allInputs)
 		mergedPath := filepath.Join(pendingDir, fmt.Sprintf(".merging-%d-%s", time.Now().UnixNano(), stableName))
-		ch.Info("min-duration: merging %d pending segment(s) with %s", len(mergeInputs), filepath.Base(videoPath))
+		ch.Info("min-duration: merging %d pending segment(s) with %s (ended: %s)", len(mergeInputs), filepath.Base(videoPath), endReason)
 		mu.Unlock()
 		mErr := mergeVideos(allInputs, mergedPath)
 		if mErr != nil {
@@ -2335,7 +2343,7 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 		ch.Error("min-duration: cannot move %s to pending: %v — keeping it in place, NOT uploading short video", filepath.Base(videoPath), err)
 		return true
 	}
-	ch.Info("min-duration: %s is %.1fs (< %ds) — deferred to pending", filepath.Base(videoPath), dur, minDur)
+	ch.Info("min-duration: %s is %.1fs (< %ds) — deferred to pending (ended: %s)", filepath.Base(videoPath), dur, minDur, endReason)
 
 	// If multiple segments have now accumulated, merge them and check the
 	// combined duration. Only upload if the merged result meets the threshold.
@@ -2351,7 +2359,7 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 		mergedPath := filepath.Join(pendingDir, fmt.Sprintf(".merging-%d-%s", time.Now().UnixNano(), stableName))
 		mergeInputs := make([]string, len(segments))
 		copy(mergeInputs, segments)
-		ch.Info("min-duration: merging %d pending segment(s)", len(mergeInputs))
+		ch.Info("min-duration: merging %d pending segment(s) (ended: %s)", len(mergeInputs), endReason)
 		mu.Unlock()
 		mErr := mergeVideos(mergeInputs, mergedPath)
 		if mErr != nil {

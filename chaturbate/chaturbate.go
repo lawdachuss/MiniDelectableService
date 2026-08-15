@@ -690,6 +690,15 @@ func (p *Playlist) WatchSegments(ctx context.Context, handler WatchHandler) erro
 	return p.watchVideoOnlySegments(ctx, handler)
 }
 
+// streamStallPolls is the number of consecutive watch-loop polls that return no
+// new HLS segments before the session is treated as stalled (ErrStreamStalled).
+// Polls run at ~1s each, so this is roughly 30s of silence — long enough to
+// ride out the CDN's natural segment cadence (2-4s) plus minor lag, short
+// enough to notice an expired session token quickly. The Monitor loop treats
+// ErrStreamStalled as a soft error: it finalises the current file and re-fetches
+// a fresh HLS URL so recording resumes immediately.
+var streamStallPolls = 30
+
 // safeDecodeFrom wraps m3u8.DecodeFrom with a recover so that library panics
 // (e.g. nil-pointer on unknown LL-HLS tags) are returned as errors instead of
 // crashing the process.
@@ -809,6 +818,7 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 	lastSegURI := ""
 	lastMapURI := ""
 	consecutiveErrors := 0
+	stalledPolls := 0
 
 	// For fMP4 streams, normalise tfdt timestamps so the recording starts
 	// at 0:00 instead of the CDN's absolute stream uptime. Always attempt
@@ -816,6 +826,7 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 	var trackBaseTimes map[uint32]uint64
 
 	for {
+		sawNewSegment := false
 		resp, err := client.Get(ctx, p.PlaylistURL)
 		if err != nil {
 			if consecutiveErrors++; consecutiveErrors >= 5 {
@@ -824,6 +835,7 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 			<-time.After(2 * time.Second)
 			continue
 		}
+
 		pl, _, err := safeDecodeFrom(strings.NewReader(normalizeM3U8(decodeMouflon(resp, p.MouflonPDKey))))
 		if err != nil {
 			if server.Config.Debug {
@@ -868,6 +880,7 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 				}
 			}
 			lastSegURI = v.URI
+			sawNewSegment = true
 			if v.Map != nil && v.Map.URI != lastMapURI {
 				mapURL := resolveHLSURL(p.RootURL, v.Map.URI)
 				initBytes, err := client.GetBytes(ctx, mapURL)
@@ -917,6 +930,15 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 			}
 		}
 
+		if !sawNewSegment {
+			stalledPolls++
+			if stalledPolls >= streamStallPolls {
+				return fmt.Errorf("stream stalled: %w", internal.ErrStreamStalled)
+			}
+		} else {
+			stalledPolls = 0
+		}
+
 		<-time.After(1 * time.Second)
 	}
 }
@@ -942,6 +964,7 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 	var audioInitBytes []byte
 	initWritten := false
 	consecutiveErrors := 0
+	stalledPolls := 0
 
 	// Per-track tfdt base times captured from the first segment of each track.
 	// Subtracting these normalises timestamps to start from zero.
@@ -1050,6 +1073,14 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 			initWritten = true
 		}
 		if !initWritten {
+			// Never got a usable combined init (e.g. playlists without
+			// EXT-X-MAP, or a stalled session whose maps rotated away). This
+			// used to spin forever without recording — count it as a stall so
+			// the Monitor can re-fetch a fresh HLS URL instead of hanging.
+			stalledPolls++
+			if stalledPolls >= streamStallPolls {
+				return fmt.Errorf("stream stalled: %w", internal.ErrStreamStalled)
+			}
 			<-time.After(1 * time.Second)
 			continue
 		}
@@ -1107,6 +1138,15 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 
 		if server.Config.Debug {
 			fmt.Printf("[DEBUG] muxed: cycle video=%d audio=%d\n", len(newVideoSegs), len(newAudioSegs))
+		}
+
+		if len(newVideoSegs) == 0 && len(newAudioSegs) == 0 {
+			stalledPolls++
+			if stalledPolls >= streamStallPolls {
+				return fmt.Errorf("stream stalled: %w", internal.ErrStreamStalled)
+			}
+		} else {
+			stalledPolls = 0
 		}
 
 		isStripchatMux := strings.Contains(p.PlaylistURL, "doppiocdn") || strings.Contains(p.AudioPlaylistURL, "doppiocdn")

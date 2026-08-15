@@ -2,6 +2,7 @@ package chaturbate
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/grafov/m3u8"
 	"github.com/teacat/chaturbate-dvr/entity"
+	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
 )
 
@@ -66,6 +68,126 @@ func TestAlternateEdgeURLsPreservesLLHLSToken(t *testing.T) {
 		if !strings.Contains(got, "/llhls.m3u8?token=abc.def") {
 			t.Fatalf("alternateEdgeURLs() did not preserve path/token: %q", got)
 		}
+	}
+}
+
+// TestWatchSegmentsDetectsStalledStream guards the ErrStreamStalled wiring: a
+// playlist that keeps returning 200 with the SAME segments (a silently expired
+// CDN session token, or a model whose broadcast froze without the playlist
+// disappearing) must make the watch loop give up after streamStallPolls polls
+// instead of hanging forever. This is the dead-code path that previously kept
+// such recordings open indefinitely.
+func TestWatchSegmentsDetectsStalledStream(t *testing.T) {
+	if server.Config == nil {
+		server.Config = &entity.Config{}
+	}
+	server.Config.Debug = false
+
+	// The playlist stays static: only the first poll ever sees new segments.
+	playlistBody := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:3",
+		"#EXT-X-TARGETDURATION:2",
+		"#EXT-X-MEDIA-SEQUENCE:100",
+		"#EXTINF:2.000,",
+		"seg_1_100_video_abc.m4s",
+		"",
+	}, "\n")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/playlist.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(playlistBody))
+	})
+	mux.HandleFunc("/seg_1_100_video_abc.m4s", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("seg-100-data"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	pl := &Playlist{
+		PlaylistURL: srv.URL + "/playlist.m3u8",
+		RootURL:     srv.URL + "/",
+	}
+
+	handler := func(_ []byte, _ float64) error {
+		return nil
+	}
+
+	// Lower the threshold so the test finishes in seconds instead of ~30s.
+	prev := streamStallPolls
+	streamStallPolls = 3
+	t.Cleanup(func() { streamStallPolls = prev })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	err := pl.WatchSegments(ctx, handler)
+	if err == nil {
+		t.Fatal("WatchSegments returned nil for a static playlist; want ErrStreamStalled")
+	}
+	if !errors.Is(err, internal.ErrStreamStalled) {
+		t.Fatalf("WatchSegments error = %v, want internal.ErrStreamStalled", err)
+	}
+}
+
+// TestWatchMuxedSegmentsStallsWithoutInit guards the muxed init path: when
+// video/audio playlists parse but never expose an EXT-X-MAP, the combined init
+// can never be written and the loop used to spin forever without recording.
+// It must give up with ErrStreamStalled so the Monitor re-fetches a fresh URL.
+func TestWatchMuxedSegmentsStallsWithoutInit(t *testing.T) {
+	if server.Config == nil {
+		server.Config = &entity.Config{}
+	}
+	server.Config.Debug = false
+
+	videoBody := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		"#EXT-X-TARGETDURATION:2",
+		"#EXT-X-MEDIA-SEQUENCE:100",
+		"#EXTINF:2.000,",
+		"seg_1_100_video_abc.m4s",
+		"",
+	}, "\n")
+	audioBody := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		"#EXT-X-TARGETDURATION:2",
+		"#EXT-X-MEDIA-SEQUENCE:100",
+		"#EXTINF:2.000,",
+		"seg_1_100_audio_abc.m4s",
+		"",
+	}, "\n")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/video.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(videoBody))
+	})
+	mux.HandleFunc("/audio.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(audioBody))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	pl := &Playlist{
+		PlaylistURL:      srv.URL + "/video.m3u8",
+		AudioPlaylistURL: srv.URL + "/audio.m3u8",
+		RootURL:          srv.URL + "/",
+	}
+
+	prev := streamStallPolls
+	streamStallPolls = 3
+	t.Cleanup(func() { streamStallPolls = prev })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	err := pl.WatchSegments(ctx, func(_ []byte, _ float64) error { return nil })
+	if err == nil {
+		t.Fatal("WatchSegments returned nil for a muxed playlist with no EXT-X-MAP; want ErrStreamStalled")
+	}
+	if !errors.Is(err, internal.ErrStreamStalled) {
+		t.Fatalf("WatchSegments error = %v, want internal.ErrStreamStalled", err)
 	}
 }
 
