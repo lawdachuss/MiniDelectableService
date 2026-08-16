@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/server"
@@ -31,9 +33,19 @@ type Channel struct {
 	PauseCancelFunc context.CancelFunc
 	cancelMu        sync.Mutex // guards CancelFunc and PauseCancelFunc writes
 	LogCh           chan string
-	UpdateCh        chan bool
-	done            chan struct{} // closed when channel is torn down
-	closeDone       sync.Once     // ensures done is closed exactly once
+	// VerboseCh carries high-frequency per-segment status lines (duration,
+	// filesize). They are shown in the UI exactly like LogCh lines but are NOT
+	// forwarded to Supabase channel_logs — persisting them would flood the
+	// table thousands of rows per channel per hour.
+	VerboseCh chan string
+	UpdateCh  chan bool
+	done      chan struct{} // closed when channel is torn down
+	closeDone sync.Once     // ensures done is closed exactly once
+
+	// logPersistLast is the last time an INFO log line was persisted to
+	// Supabase, used to rate-limit them. Written only from the Publisher
+	// goroutine (single-threaded), so it needs no lock.
+	logPersistLast time.Time
 
 	IsOnline     bool
 	IsConnecting bool   // true during retry/reconnect, shown as "Reconnecting..." in UI
@@ -123,6 +135,7 @@ type Channel struct {
 func New(conf *entity.ChannelConfig) *Channel {
 	ch := &Channel{
 		LogCh:           make(chan string, 256),
+		VerboseCh:       make(chan string, 256),
 		UpdateCh:        make(chan bool, 64),
 		done:            make(chan struct{}),
 		Config:          conf,
@@ -160,13 +173,12 @@ func (ch *Channel) Publisher() {
 	for {
 		select {
 		case v := <-ch.LogCh:
-			ch.logsMu.Lock()
-			ch.Logs = append(ch.Logs, v)
-			if len(ch.Logs) > 100 {
-				ch.Logs = ch.Logs[len(ch.Logs)-100:]
-			}
-			ch.logsMu.Unlock()
-			server.Manager.PublishLog(ch.Config.Username, v)
+			ch.publishLine(v)
+			ch.persistLog(v)
+
+		case v := <-ch.VerboseCh:
+			// UI-only: never persisted (per-segment status would flood Supabase).
+			ch.publishLine(v)
 
 		case <-ch.UpdateCh:
 			if !pendingUpdate {
@@ -181,6 +193,116 @@ func (ch *Channel) Publisher() {
 			return
 		}
 	}
+}
+
+// publishLine appends a log line to the channel's in-memory ring buffer and
+// broadcasts it over SSE so the web UI shows it. Called only from Publisher.
+func (ch *Channel) publishLine(v string) {
+	ch.logsMu.Lock()
+	ch.Logs = append(ch.Logs, v)
+	if len(ch.Logs) > 100 {
+		ch.Logs = ch.Logs[len(ch.Logs)-100:]
+	}
+	ch.logsMu.Unlock()
+	server.Manager.PublishLog(ch.Config.Username, v)
+}
+
+// persistLogInfoInterval rate-limits INFO lines persisted to Supabase per
+// channel. WARN/ERROR lines always pass; diagnostic INFO lines (cleanup/end
+// reasons, session/reconnect events) pass when not rate-limited. This bounds
+// the channel_logs table to a few rows per minute per channel even while a
+// node is chatty, so bursts stay queryable without flooding the table.
+const persistLogInfoInterval = 15 * time.Second
+
+// diagnosticLogMarkers are the INFO-line substrings worth persisting. They
+// capture the artifacts that make recording bursts diagnosable from the
+// channel_logs table: why each recording ended, session/CF/reconnect events,
+// and stop/handoff transitions.
+var diagnosticLogMarkers = []string{
+	"cleanup:", "ended:", "session", "reconnect", "expired", "stalled",
+	"blocked", "cloudflare", "handoff", "paused", "stopped", "stalled",
+	"403", "404", "max duration", "private show", "went offline",
+}
+
+// shouldPersistLog decides whether a channel log line should be persisted to
+// Supabase. It returns the parsed log level and the message with the time
+// prefix stripped. lastPersist/now drive the INFO rate limit (pure, so the
+// filter is unit-testable; the Publisher owns the actual state).
+func shouldPersistLog(line string, lastPersist time.Time, now time.Time) (level, message string, ok bool) {
+	// Message format: "15:04 [LEVEL] message".
+	level = "info"
+	message = line
+	if open := strings.Index(line, "["); open >= 0 {
+		if close := strings.Index(line[open:], "]"); close > 1 {
+			lvl := strings.ToLower(line[open+1 : open+close])
+			switch lvl {
+			case "error", "warn", "info":
+				level = lvl
+			}
+			if rest := line[open+close+1:]; rest != "" {
+				message = strings.TrimSpace(strings.TrimPrefix(rest, ": "))
+				message = strings.TrimSpace(strings.TrimPrefix(message, " "))
+			}
+		}
+	}
+
+	// WARN/ERROR always persist — they are rare and always diagnostic.
+	if level != "info" {
+		return level, message, true
+	}
+
+	// INFO persists only when it carries a diagnostic marker AND is not
+	// rate-limited. High-frequency INFO (e.g. per-segment status) never
+	// matches a marker and is dropped entirely.
+	marker := false
+	lower := strings.ToLower(message)
+	for _, m := range diagnosticLogMarkers {
+		if strings.Contains(lower, m) {
+			marker = true
+			break
+		}
+	}
+	if !marker {
+		return level, message, false
+	}
+	if now.Sub(lastPersist) < persistLogInfoInterval {
+		return level, message, false
+	}
+	return level, message, true
+}
+
+// persistLog forwards a channel log line to Supabase channel_logs so bursts
+// (synchronized HLS 404s, CF blocks, handoffs) are diagnosable from the DB
+// instead of being lost with the node's rotating in-memory log buffer. The
+// write is fire-and-forget and never blocks the Publisher; failures just drop
+// the line. Called only from Publisher.
+func (ch *Channel) persistLog(line string) {
+	if ch.Config == nil || ch.Config.Username == "" {
+		return
+	}
+	now := time.Now()
+	level, msg, ok := shouldPersistLog(line, ch.logPersistLast, now)
+	if !ok {
+		return
+	}
+	ch.logPersistLast = now
+
+	username := ch.Config.Username
+	go func() {
+		db := server.GetDBClient()
+		if db == nil {
+			return // Supabase not configured (local/isolated mode) — nothing to do
+		}
+		logEntry := &database.ChannelLog{
+			Username:   username,
+			LogLevel:   level,
+			Message:    msg,
+			InstanceID: server.NodeID(),
+		}
+		if err := db.SaveLogBestEffort(logEntry); err != nil && server.Config != nil && server.Config.Debug {
+			log.Printf(" WARN [%s] persist log to Supabase failed (dropped): %v", username, err)
+		}
+	}()
 }
 
 // WithCancel creates a new context with a cancel function,
@@ -208,10 +330,12 @@ func (ch *Channel) Info(format string, a ...any) {
 
 // Verbose logs a message to the browser log always, and to stdout only when --debug is enabled.
 // Use this for high-frequency events (e.g. per-segment updates) that would clutter the console.
+// Verbose lines are routed through VerboseCh (UI-only) so they are never
+// persisted to Supabase channel_logs.
 func (ch *Channel) Verbose(format string, a ...any) {
 	msg := fmt.Sprintf("%s [INFO] %s", time.Now().Format("15:04"), fmt.Sprintf(format, a...))
 	select {
-	case ch.LogCh <- msg:
+	case ch.VerboseCh <- msg:
 	default:
 	}
 	if server.Config != nil && server.Config.Debug {

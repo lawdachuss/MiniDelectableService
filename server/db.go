@@ -41,6 +41,26 @@ func syncNodeEnvironment() {
 	channelPoolMode = detectPoolMode()
 }
 
+// DBInstanceID returns the value stamped on Supabase rows for per-node
+// attribution. An explicit INSTANCE_ID env var wins; otherwise the
+// auto-detected node ID (node-1..node-N) is used instead of the generic
+// "default", so recordings / upload links / previews / tunnel / journal rows
+// can be attributed to the node that produced them.
+//
+// NOTE: this deliberately does NOT change the package-level instanceID var —
+// channelsKey() derives the local channel-list blob key from it, and silently
+// switching that to a per-node value would orphan every node's existing
+// "channels_default" config. Attribution stamps use DBInstanceID instead.
+func DBInstanceID() string {
+	if instanceID != "" && instanceID != "default" {
+		return instanceID
+	}
+	if id := NodeID(); id != "" {
+		return id
+	}
+	return instanceID
+}
+
 // detectPoolMode auto-detects pooled mode:
 // 1. CHANNEL_POOL_MODE env var (explicit override)
 // 2. GITHUB_REPOSITORY env var — auto-enable if path contains "node-"
@@ -833,6 +853,7 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 		ThumbnailURL: thumbnailURL,
 		SpriteURL:    spriteURL,
 		PreviewURL:   previewURL,
+		InstanceID:   DBInstanceID(),
 	}
 	// Skip channel_id lookup — the channels table is shared across instances
 	// and the FK would point to the wrong instance's row.
@@ -871,6 +892,7 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 			RecordingID: savedRec.ID,
 			Host:        host,
 			URL:         url,
+			InstanceID:  DBInstanceID(),
 		})
 	}
 	if len(uploadLinks) > 0 {
@@ -905,6 +927,7 @@ func SaveRecordingBasics(username, filename, timestamp, roomTitle string, tags [
 		Framerate:  framerate,
 		Filesize:   filesize,
 		Duration:   duration,
+		InstanceID: DBInstanceID(),
 	}
 	// Fall back gracefully when the end_reason column does not exist yet.
 	if err := client.SaveRecording(rec); err != nil && strings.Contains(err.Error(), "PGRST204") {
@@ -957,14 +980,14 @@ func SaveTunnelToDB(tunnelURL string, runID int) error {
 		return fmt.Errorf("Supabase not configured")
 	}
 
-	if err := client.DeactivateOldTunnels(instanceID); err != nil {
+	if err := client.DeactivateOldTunnels(DBInstanceID()); err != nil {
 		fmt.Printf("[WARN] failed to deactivate old tunnels: %v\n", err)
 	}
 
 	tunnel := &database.Tunnel{
 		URL:        tunnelURL,
 		RunID:      runID,
-		InstanceID: instanceID,
+		InstanceID: DBInstanceID(),
 		IsActive:   true,
 	}
 
@@ -996,7 +1019,7 @@ func LoadCurrentTunnel() (string, error) {
 		return "", nil
 	}
 
-	tunnel, err := client.GetActiveTunnel(instanceID)
+	tunnel, err := client.GetActiveTunnel(DBInstanceID())
 	if err == nil && tunnel != nil && tunnel.URL != "" {
 		return tunnel.URL, nil
 	}
@@ -1026,6 +1049,7 @@ func SavePreviewLinks(filename, thumbnailURL, spriteURL, previewURL string) erro
 		SpriteURL:    spriteURL,
 		PreviewURL:   previewURL,
 		UploadedAt:   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		InstanceID:   DBInstanceID(),
 	}
 
 	if err := client.SavePreviewImage(img); err != nil {
@@ -1199,7 +1223,7 @@ func SaveJournalEntry(fileHash, filename, host, status, link string, fileSize in
 		Status:     status,
 		ErrorMsg:   errMsg,
 		FileSize:   fileSize,
-		InstanceID: instanceID,
+		InstanceID: DBInstanceID(),
 	}
 
 	return client.SaveJournalEntry(entry)

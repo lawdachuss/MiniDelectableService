@@ -570,6 +570,7 @@ type UploadLink struct {
 	Host        string `json:"host"`
 	URL         string `json:"url"`
 	UploadedAt  string `json:"uploaded_at,omitempty"`
+	InstanceID  string `json:"instance_id,omitempty"`
 }
 
 // SaveUploadLink creates or updates an upload link.
@@ -815,18 +816,44 @@ func (c *Client) DeactivateOldTunnels(instanceID string) error {
 // ============================================================================
 
 type ChannelLog struct {
-	ID        string `json:"id,omitempty"`
-	ChannelID string `json:"channel_id,omitempty"`
-	Username  string `json:"username"`
-	LogLevel  string `json:"log_level"`
-	Message   string `json:"message"`
-	CreatedAt string `json:"created_at,omitempty"`
+	ID         string `json:"id,omitempty"`
+	ChannelID  string `json:"channel_id,omitempty"`
+	Username   string `json:"username"`
+	LogLevel   string `json:"log_level"`
+	Message    string `json:"message"`
+	InstanceID string `json:"instance_id,omitempty"`
+	CreatedAt  string `json:"created_at,omitempty"`
 }
 
 // SaveLog creates a new log entry
 func (c *Client) SaveLog(log *ChannelLog) error {
 	var result []ChannelLog
 	return c.post("/channel_logs", log, &result)
+}
+
+// SaveLogBestEffort persists a channel log line with a single HTTP attempt
+// (no retries), so the log forwarder can fire-and-forget without spawning
+// long-lived goroutines during a Supabase outage. Log lines are diagnostics,
+// not durability-critical: a dropped line is fine. When the instance_id
+// column does not exist yet (migration not applied), it retries once without
+// that field so the line still lands.
+func (c *Client) SaveLogBestEffort(log *ChannelLog) error {
+	resp, err := c.request("POST", "/channel_logs", log)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyStr := string(bodyBytes)
+		if strings.Contains(bodyStr, "PGRST204") && log.InstanceID != "" {
+			log.InstanceID = ""
+			return c.SaveLogBestEffort(log)
+		}
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, bodyStr)
+	}
+	return nil
 }
 
 // GetLogs retrieves logs for a channel
