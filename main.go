@@ -540,6 +540,12 @@ func main() {
 				Value:   5,
 			},
 			&cli.IntFlag{
+				Name:    "cf-session-cut-threshold",
+				Usage:   "Distinct channels hitting the session-cut signature (CDN 403/404 + failing site probe) within the window before the node re-mints cookies early (default 3; 0 = use default)",
+				EnvVars: []string{"CF_SESSION_CUT_THRESHOLD"},
+				Value:   3,
+			},
+			&cli.IntFlag{
 				Name:    "cf-refresh-min",
 				Usage:   "Minimum minutes between automatic cookie refresh attempts after persistent Cloudflare blocks (default 10)",
 				EnvVars: []string{"CF_REFRESH_MIN"},

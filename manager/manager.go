@@ -125,6 +125,15 @@ type Manager struct {
 	cfBlocked        map[string]struct{}
 	cfGlobalNotified bool
 
+	// session-cut tracking: channels that recently hit the node-wide
+	// session-cut signature (CDN HLS 403/404 whose site-API probe also
+	// failed) with their last report time. When several distinct channels
+	// report within sessionCutWindow the node's Chaturbate session is likely
+	// invalidated — trigger a cookie re-mint before the rest of the channels
+	// 404 and split their recordings.
+	sessionCutMu sync.Mutex
+	sessionCutAt map[string]time.Time
+
 	// cfRefreshFn is the registered cookie re-mint function (runs the cookie
 	// scripts + reloads cookies from Supabase). Fired by RequestCookieRefresh
 	// when the node is Cloudflare-starved, rate-limited by cfRefreshLast so a
@@ -189,6 +198,7 @@ func New() (*Manager, error) {
 		renderCache:   make(map[string]*renderCacheEntry),
 		WatcherDone:   make(chan struct{}),
 		cfBlocked:     make(map[string]struct{}),
+		sessionCutAt:  make(map[string]time.Time),
 	}, nil
 }
 
@@ -1311,6 +1321,50 @@ func (m *Manager) cfStarvedThreshold() int {
 		return server.Config.CFStarvedThreshold
 	}
 	return 5
+}
+
+// sessionCutWindow is how long a channel's session-cut report stays
+// relevant. The observed bursts die within minutes, so a 2-minute window
+// separates a genuine node-wide cut from unrelated single-channel deaths.
+// Overridable in tests.
+var sessionCutWindow = 2 * time.Minute
+
+// sessionCutThreshold returns how many distinct channels must report the
+// session-cut signature within the window before the node re-mints cookies
+// (default 3, configurable via CF_SESSION_CUT_THRESHOLD; 0 disables the
+// detector).
+func (m *Manager) sessionCutThreshold() int {
+	if server.Config != nil && server.Config.CFSessionCutThreshold > 0 {
+		return server.Config.CFSessionCutThreshold
+	}
+	return 3
+}
+
+// ReportSessionCut records that a channel hit the node-wide session-cut
+// signature: its CDN HLS playlist/segment 403/404 could not be disambiguated
+// because the site-API probe ALSO failed. A single channel doing this is a
+// normal session rotation, but when several distinct channels report within
+// sessionCutWindow the node's Chaturbate session (cookies/cf_clearance) is
+// likely invalidated — the CDN tokens die (404s) and the site API rejects the
+// node at the same moment. Kick off a cookie re-mint right away so the rest
+// of the channels never 404 and the current recordings keep flowing.
+func (m *Manager) ReportSessionCut(username string) {
+	m.sessionCutMu.Lock()
+	now := time.Now()
+	for u, t := range m.sessionCutAt {
+		if now.Sub(t) > sessionCutWindow {
+			delete(m.sessionCutAt, u)
+		}
+	}
+	m.sessionCutAt[username] = now
+	count := len(m.sessionCutAt)
+	m.sessionCutMu.Unlock()
+
+	if threshold := m.sessionCutThreshold(); count >= threshold {
+		log.Printf("[manager] %d channel(s) hit a session cut in the last %s (threshold %d) — re-minting cookies before the whole node 404s",
+			count, sessionCutWindow, threshold)
+		m.RequestCookieRefresh()
+	}
 }
 
 // ResetCFBlock marks a channel as no longer blocked by Cloudflare, re-arming

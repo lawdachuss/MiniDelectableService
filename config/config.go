@@ -476,6 +476,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		CFGlobalThreshold:   c.Int("cf-global-threshold"),
 		CFRetryMinutes:      c.Int("cf-retry-minutes"),
 		CFStarvedThreshold:  c.Int("cf-starved-threshold"),
+		CFSessionCutThreshold: c.Int("cf-session-cut-threshold"),
 		CFRefreshMin:        c.Int("cf-refresh-min"),
 		NotifyCooldownHours: c.Int("notify-cooldown-hours"),
 		NotifyStreamOnline:  c.Bool("notify-stream-online"),

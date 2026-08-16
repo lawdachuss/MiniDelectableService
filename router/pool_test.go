@@ -75,8 +75,9 @@ func (s *stubManager) TriggerSessionStop()                {}
 func (s *stubManager) UploadEntries() *entity.UploadsResponse {
 	return &entity.UploadsResponse{}
 }
-func (s *stubManager) ReportCFBlock(username string) {}
-func (s *stubManager) ResetCFBlock(username string)  {}
+func (s *stubManager) ReportCFBlock(username string)     {}
+func (s *stubManager) ResetCFBlock(username string)      {}
+func (s *stubManager) ReportSessionCut(username string)  {}
 
 func setStubManager(t *testing.T, m *stubManager) {
 	t.Helper()

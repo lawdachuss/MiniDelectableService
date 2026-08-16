@@ -3,6 +3,7 @@ package manager
 import (
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,7 +53,18 @@ func TestCreateChannelFromAssignmentResumesPausedChannel(t *testing.T) {
 	// the resumed monitor loop reads server.Config — point both at safe test
 	// values so no nil deref can crash the test binary.
 	oldMgr, oldCfg := server.Manager, server.Config
-	defer func() { server.Manager, server.Config = oldMgr, oldCfg }()
+	var m *Manager
+	defer func() {
+		// Best-effort cancel of the resumed monitor. Do NOT wait for it: an
+		// in-flight HTTP attempt through httpcloak can ignore the cancel for
+		// many seconds, so waiting would hang the suite. Leaked goroutines
+		// may still read the globals, so restore to safe non-nil values
+		// instead of nil (see restoreTestGlobalsSafe).
+		if m != nil {
+			m.StopAllChannels()
+		}
+		restoreTestGlobalsSafe(oldMgr, oldCfg, m)
+	}()
 
 	m, err := New()
 	if err != nil {
@@ -116,12 +128,107 @@ func TestCreateChannelFromAssignmentResumesPausedChannel(t *testing.T) {
 	}
 }
 
+// restoreTestGlobalsSafe restores server.Manager/server.Config to their
+// pre-test values, falling back to safe non-nil substitutes when the originals
+// were nil. Channel Monitor/Publisher goroutines spawned by a test can outlive
+// the test body and keep reading these globals; restoring to nil lets a
+// late-scheduled goroutine nil-deref and crash the whole test binary.
+func restoreTestGlobalsSafe(oldMgr server.IManager, oldCfg *entity.Config, m *Manager) {
+	server.Manager = oldMgr
+	if server.Manager == nil {
+		server.Manager = m
+	}
+	server.Config = oldCfg
+	if server.Config == nil {
+		server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/"}
+	}
+}
+
+// TestReportSessionCut verifies the early session-cut detector: a handful of
+// distinct channels reporting the CDN-403/404 + failing-probe signature within
+// the window triggers a cookie re-mint (so the rest of the node's channels
+// never 404), while isolated or expired reports do not.
+func TestReportSessionCut(t *testing.T) {
+	oldMgr, oldCfg := server.Manager, server.Config
+	var m *Manager
+	defer func() { restoreTestGlobalsSafe(oldMgr, oldCfg, m) }()
+
+	newManager := func() (*Manager, *int32) {
+		m, err := New()
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		var calls int32
+		m.SetCookieRefreshFunc(func() { atomic.AddInt32(&calls, 1) })
+		return m, &calls
+	}
+
+	waitForRefresh := func(calls *int32, want int32) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if atomic.LoadInt32(calls) >= want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := atomic.LoadInt32(calls); got != want {
+			t.Fatalf("cookie refresh calls = %d, want %d", got, want)
+		}
+	}
+
+	t.Run("isolated reports below threshold do not refresh", func(t *testing.T) {
+		m, calls := newManager()
+		m.ReportSessionCut("a")
+		m.ReportSessionCut("b")
+		time.Sleep(100 * time.Millisecond)
+		if got := atomic.LoadInt32(calls); got != 0 {
+			t.Fatalf("cookie refresh calls = %d, want 0 (below threshold)", got)
+		}
+	})
+
+	t.Run("threshold of distinct channels triggers refresh once", func(t *testing.T) {
+		m, calls := newManager()
+		m.ReportSessionCut("a")
+		m.ReportSessionCut("b")
+		m.ReportSessionCut("c") // 3rd distinct channel -> re-mint
+		waitForRefresh(calls, 1)
+		// Duplicate reports and more channels stay bounded by the refresh
+		// rate limit (10 min), so the recorder must not fire again.
+		m.ReportSessionCut("a")
+		m.ReportSessionCut("d")
+		m.ReportSessionCut("e")
+		time.Sleep(100 * time.Millisecond)
+		if got := atomic.LoadInt32(calls); got != 1 {
+			t.Fatalf("cookie refresh calls = %d, want 1 (rate-limited)", got)
+		}
+	})
+
+	t.Run("expired reports are pruned and do not count", func(t *testing.T) {
+		m, calls := newManager()
+		m.ReportSessionCut("a")
+		m.ReportSessionCut("b")
+		// Age the reports out of the window: a later report from a single
+		// channel must not combine with stale ones to cross the threshold.
+		m.sessionCutMu.Lock()
+		m.sessionCutAt["a"] = time.Now().Add(-10 * time.Minute)
+		m.sessionCutAt["b"] = time.Now().Add(-10 * time.Minute)
+		m.sessionCutMu.Unlock()
+		m.ReportSessionCut("c")
+		time.Sleep(100 * time.Millisecond)
+		if got := atomic.LoadInt32(calls); got != 0 {
+			t.Fatalf("cookie refresh calls = %d, want 0 (stale reports pruned)", got)
+		}
+	})
+}
+
 // TestCreateChannelFromAssignmentLeavesManualPause verifies the claim/reconcile
 // path NEVER overrides a user's explicit UI pause: a channel paused with a
 // MANUAL reason stays paused even when it is re-claimed from an assignment.
 func TestCreateChannelFromAssignmentLeavesManualPause(t *testing.T) {
 	oldMgr, oldCfg := server.Manager, server.Config
-	defer func() { server.Manager, server.Config = oldMgr, oldCfg }()
+	var m *Manager
+	defer func() { restoreTestGlobalsSafe(oldMgr, oldCfg, m) }()
 
 	m, err := New()
 	if err != nil {
@@ -161,7 +268,8 @@ func TestCreateChannelFromAssignmentLeavesManualPause(t *testing.T) {
 // automatic (boundary) pauses but leaves channels the user explicitly paused.
 func TestResumeAllChannelsSkipsManualPause(t *testing.T) {
 	oldMgr, oldCfg := server.Manager, server.Config
-	defer func() { server.Manager, server.Config = oldMgr, oldCfg }()
+	var m *Manager
+	defer func() { restoreTestGlobalsSafe(oldMgr, oldCfg, m) }()
 
 	m, err := New()
 	if err != nil {

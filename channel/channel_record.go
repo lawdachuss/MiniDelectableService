@@ -308,43 +308,83 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 	watchErr := playlist.WatchSegments(ctx, func(b []byte, duration float64) error {
 		return ch.handleSegmentForMonitor(runID, b, duration)
 	})
-	if watchErr != nil {
-		if errors.Is(watchErr, internal.ErrStreamStalled) {
-			ch.setCloseReason("stream session expired (no new segments)")
-		} else if errors.Is(watchErr, context.Canceled) {
-			// Paused or stopped — the pause/stop path already set a reason.
-		} else if errors.Is(watchErr, internal.ErrMediaForbidden) || errors.Is(watchErr, internal.ErrNotFound) {
-			// A CDN 403/404 mid-recording is ambiguous: the public stream may
-			// have really ended (private show / offline) OR the HLS session
-			// token may have expired while the model is still live. The CDN
-			// cannot tell us, so probe the site API — it knows the room's
-			// true room_status — instead of blindly labeling every CDN
-			// rejection a private show (which ended live recordings and
-			// benched the channel for the whole offline interval).
-			if _, err := s.FetchStream(ctx, req, ch.Config.Username); err != nil {
-				switch {
-				case errors.Is(err, internal.ErrPrivateStream):
-					ch.setCloseReason("channel entered a private show")
-				case errors.Is(err, internal.ErrChannelOffline), errors.Is(err, internal.ErrNotFound):
-					ch.setCloseReason("channel went offline")
-				case errors.Is(err, context.Canceled):
-					// paused/stopped — the pause/stop path already set a reason.
-				default:
-					ch.setCloseReason(fmt.Sprintf("HLS stream ended: %v", watchErr))
-				}
-			} else {
-				// Model is STILL live — the CDN session/token expired or the
-				// edge hiccuped. Treat it like a stalled session so the
-				// Monitor reconnects with a fresh HLS URL in seconds instead
-				// of ending the session and waiting out the offline interval.
-				ch.setCloseReason("stream session expired (HLS session/token) — reconnecting")
-				watchErr = internal.ErrStreamStalled
-			}
-		} else {
-			ch.setCloseReason(fmt.Sprintf("HLS stream ended: %v", watchErr))
-		}
+	return ch.resolveWatchEnd(ctx, s, req, watchErr)
+}
+
+// resolveWatchEnd classifies the error returned by WatchSegments, sets the
+// channel's closeReason so the cleanup log explains why the recording ended,
+// and returns the error RecordStream should propagate to the Monitor loop.
+//
+// Soft session deaths — the HLS session/token died (CDN 403/404, no new
+// segments) while the model may still be live — are mapped to ErrStreamStalled
+// so the Monitor reconnects with a fresh HLS URL in seconds instead of ending
+// the recording and benching the channel for the full offline interval.
+func (ch *Channel) resolveWatchEnd(ctx context.Context, s site.Site, req *internal.Req, watchErr error) error {
+	if watchErr == nil {
+		return nil
 	}
-	return watchErr
+	if errors.Is(watchErr, internal.ErrStreamStalled) {
+		ch.setCloseReason("stream session expired (no new segments)")
+		return watchErr
+	}
+	if errors.Is(watchErr, context.Canceled) {
+		// Paused or stopped — the pause/stop path already set a reason.
+		return watchErr
+	}
+	if !errors.Is(watchErr, internal.ErrMediaForbidden) && !errors.Is(watchErr, internal.ErrNotFound) {
+		ch.setCloseReason(fmt.Sprintf("HLS stream ended: %v", watchErr))
+		return watchErr
+	}
+
+	// A CDN 403/404 mid-recording is ambiguous: the public stream may have
+	// really ended (private show / offline) OR the HLS session token may have
+	// expired while the model is still live. The CDN cannot tell us, so probe
+	// the site API — it knows the room's true room_status — instead of blindly
+	// labeling every CDN rejection a private show (which ended live recordings
+	// and benched the channel for the whole offline interval).
+	if _, err := s.FetchStream(ctx, req, ch.Config.Username); err != nil {
+		switch {
+		case errors.Is(err, internal.ErrPrivateStream):
+			ch.setCloseReason("channel entered a private show")
+		case errors.Is(err, internal.ErrChannelOffline), errors.Is(err, internal.ErrNotFound):
+			ch.setCloseReason("channel went offline")
+		case errors.Is(err, context.Canceled):
+			// paused/stopped — the pause/stop path already set a reason.
+		default:
+			// The probe failed for an unknown reason (rate limit, CF
+			// challenge, transient API error, node-wide edge/session cut).
+			// We cannot confirm the model went offline, so do NOT end the
+			// recording with a bench: treat it like a stalled session and
+			// let the Monitor reconnect with a fresh HLS URL in seconds. A
+			// false "ended" here would finalize the recording and bench the
+			// channel for the full offline interval while the model keeps
+			// streaming. The probe error is persisted in the close reason
+			// so a synchronized burst of these is instantly diagnosable
+			// from the recordings table (was the probe CF-blocked, breaker-
+			// open, or a plain network failure?).
+			probeErr := err.Error()
+			if len(probeErr) > 140 {
+				probeErr = probeErr[:140]
+			}
+			ch.setCloseReason(fmt.Sprintf("stream session expired (HLS session/token) — reconnecting (site probe failed: %s)", probeErr))
+			// The CDN died AND the site probe failed — the signature of a
+			// node-wide session cut (cookies/cf_clearance invalidated).
+			// Report it so the manager can re-mint cookies before the rest
+			// of the node's channels 404.
+			if server.Manager != nil {
+				server.Manager.ReportSessionCut(ch.Config.Username)
+			}
+			return internal.ErrStreamStalled
+		}
+		return watchErr
+	}
+
+	// Model is STILL live — the CDN session/token expired or the edge
+	// hiccuped. Treat it like a stalled session so the Monitor reconnects
+	// with a fresh HLS URL in seconds instead of ending the session and
+	// waiting out the offline interval.
+	ch.setCloseReason("stream session expired (HLS session/token) — reconnecting")
+	return internal.ErrStreamStalled
 }
 
 // scrapeProfileOnDemand fetches the model's full public profile via the site
