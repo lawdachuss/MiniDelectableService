@@ -35,9 +35,10 @@ type IManager interface {
 	ReportCFBlock(username string)
 	ResetCFBlock(username string)
 	// ReportSessionCut records that a channel hit the node-wide session-cut
-	// signature (CDN HLS 403/404 whose site-API probe also failed). When
-	// enough distinct channels report within a short window the manager
-	// re-mints cookies early, before the whole node's HLS sessions 404.
+	// signature (CDN HLS 403/404 whose site-API probe also failed). It shares
+	// the manager's early re-mint detector with ReportCFBlock: when enough
+	// distinct channels report either signature within a short window the
+	// manager re-mints cookies early, before the whole node's HLS sessions 404.
 	ReportSessionCut(username string)
 
 	// CFBlockedCount returns how many channels are currently in a

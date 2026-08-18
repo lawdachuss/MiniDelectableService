@@ -273,12 +273,12 @@ type Config struct {
 	// claiming new channels, sheds its excess claims back to the pool (so
 	// healthy nodes can record them), and triggers a cookie re-mint.
 	CFStarvedThreshold int
-	// CFSessionCutThreshold is how many distinct channels must hit the
-	// session-cut signature (CDN HLS 403/404 with a failing site-API probe)
-	// within the detection window before the node re-mints cookies (default
-	// 3). This catches a node-wide Chaturbate session invalidation — which
-	// shows up as synchronized 404s, not CF blocks — before every channel
-	// 404s and the recordings split.
+	// CFSessionCutThreshold is how many distinct channels must hit a
+	// node-wide session-failure signature within the detection window before
+	// the node re-mints cookies (default 3). Both signatures feed the SAME
+	// detector: a session cut (CDN HLS 403/404 with a failing site-API probe)
+	// or a Cloudflare-block burst. This catches a node-wide Chaturbate
+	// session invalidation before every channel 404s and the recordings split.
 	CFSessionCutThreshold int
 	// CFRefreshMin is the minimum minutes between automatic cookie refresh
 	// attempts triggered by persistent Cloudflare blocks (default 10).

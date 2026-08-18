@@ -152,6 +152,10 @@ func TestReportSessionCut(t *testing.T) {
 	oldMgr, oldCfg := server.Manager, server.Config
 	var m *Manager
 	defer func() { restoreTestGlobalsSafe(oldMgr, oldCfg, m) }()
+	// ReportCFBlock reads server.Config.CFGlobalThreshold unconditionally,
+	// so the test must install a non-nil Config (other tests leave a
+	// fallback behind, but this test must stand alone).
+	server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/", CFChannelThreshold: 5}
 
 	newManager := func() (*Manager, *int32) {
 		m, err := New()
@@ -218,6 +222,48 @@ func TestReportSessionCut(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		if got := atomic.LoadInt32(calls); got != 0 {
 			t.Fatalf("cookie refresh calls = %d, want 0 (stale reports pruned)", got)
+		}
+	})
+
+	t.Run("CF-block bursts feed the shared detector", func(t *testing.T) {
+		m, calls := newManager()
+		// Two CF-blocked channels alone are below the threshold.
+		m.ReportCFBlock("a")
+		m.ReportCFBlock("b")
+		time.Sleep(100 * time.Millisecond)
+		if got := atomic.LoadInt32(calls); got != 0 {
+			t.Fatalf("cookie refresh calls = %d, want 0 (below threshold)", got)
+		}
+		// A third distinct CF-blocked channel crosses it.
+		m.ReportCFBlock("c")
+		waitForRefresh(calls, 1)
+	})
+
+	t.Run("session cuts and CF blocks combine in one detector", func(t *testing.T) {
+		m, calls := newManager()
+		m.ReportSessionCut("a")
+		m.ReportCFBlock("b")
+		time.Sleep(100 * time.Millisecond)
+		if got := atomic.LoadInt32(calls); got != 0 {
+			t.Fatalf("cookie refresh calls = %d, want 0 (below threshold)", got)
+		}
+		// Third distinct channel via the OTHER signature -> same detector fires.
+		m.ReportCFBlock("c")
+		waitForRefresh(calls, 1)
+	})
+
+	t.Run("ResetCFBlock prunes the shared window", func(t *testing.T) {
+		m, calls := newManager()
+		m.ReportCFBlock("a")
+		m.ReportCFBlock("b")
+		m.ResetCFBlock("a")
+		m.ResetCFBlock("b")
+		// A single new report must not combine with the pruned ones to
+		// cross the threshold.
+		m.ReportCFBlock("c")
+		time.Sleep(100 * time.Millisecond)
+		if got := atomic.LoadInt32(calls); got != 0 {
+			t.Fatalf("cookie refresh calls = %d, want 0 (reset pruned window)", got)
 		}
 	})
 }

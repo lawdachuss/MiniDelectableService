@@ -1312,6 +1312,12 @@ func (m *Manager) ReportCFBlock(username string) {
 	if starved {
 		m.RequestCookieRefresh()
 	}
+
+	// A CF-block burst is the same node-wide session-failure signature as a
+	// session cut (the node's Chaturbate session/cookies died) — feed it into
+	// the SHARED windowed detector so both paths use one early re-mint
+	// trigger instead of two independent thresholds.
+	m.noteSessionFailure(username)
 }
 
 // cfStarvedThreshold returns how many simultaneously-blocked channels mark
@@ -1349,6 +1355,19 @@ func (m *Manager) sessionCutThreshold() int {
 // node at the same moment. Kick off a cookie re-mint right away so the rest
 // of the channels never 404 and the current recordings keep flowing.
 func (m *Manager) ReportSessionCut(username string) {
+	m.noteSessionFailure(username)
+}
+
+// noteSessionFailure is the SHARED early re-mint detector. Both session cuts
+// (CDN 403/404 whose site-API probe also failed) and Cloudflare-block bursts
+// are the same underlying event — the node's Chaturbate session
+// (cookies/cf_clearance) was invalidated — so both signatures report into
+// this one windowed counter. A single channel doing either is normal (session
+// rotation / one blocked channel), but when sessionCutThreshold distinct
+// channels report within sessionCutWindow the node-wide session is likely
+// dead: re-mint cookies early, before the rest of the channels 404 and split
+// their recordings.
+func (m *Manager) noteSessionFailure(username string) {
 	m.sessionCutMu.Lock()
 	now := time.Now()
 	for u, t := range m.sessionCutAt {
@@ -1361,7 +1380,7 @@ func (m *Manager) ReportSessionCut(username string) {
 	m.sessionCutMu.Unlock()
 
 	if threshold := m.sessionCutThreshold(); count >= threshold {
-		log.Printf("[manager] %d channel(s) hit a session cut in the last %s (threshold %d) — re-minting cookies before the whole node 404s",
+		log.Printf("[manager] %d channel(s) hit a session-failure signature (session cut or CF block) in the last %s (threshold %d) — re-minting cookies before the whole node 404s",
 			count, sessionCutWindow, threshold)
 		m.RequestCookieRefresh()
 	}
@@ -1369,6 +1388,8 @@ func (m *Manager) ReportSessionCut(username string) {
 
 // ResetCFBlock marks a channel as no longer blocked by Cloudflare, re-arming
 // the global alert once the blocked-channel count drops below the threshold.
+// The shared session-failure detector window is pruned too, so a recovered
+// channel's earlier CF-block report cannot combine with a later burst.
 func (m *Manager) ResetCFBlock(username string) {
 	m.cfMu.Lock()
 	delete(m.cfBlocked, username)
@@ -1376,6 +1397,10 @@ func (m *Manager) ResetCFBlock(username string) {
 		m.cfGlobalNotified = false
 	}
 	m.cfMu.Unlock()
+
+	m.sessionCutMu.Lock()
+	delete(m.sessionCutAt, username)
+	m.sessionCutMu.Unlock()
 }
 
 // SetCookieRefreshFunc registers the function that re-mints this node's
