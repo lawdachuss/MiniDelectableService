@@ -227,9 +227,10 @@ type Config struct {
 	CatboxProxyURL  string
 
 	// Upload throughput tuning.
-	UploadMaxConcurrent   int // max video files uploading concurrently (0 = default 100)
-	UploadHostConcurrency int // max concurrent uploads per host (0 = default 8)
-	PipelineWorkers       int // concurrent pipelines per channel queue (0 = default 3)
+	UploadMaxConcurrent   int // max video files uploading concurrently (0 = auto, VM-sized)
+	UploadHostConcurrency int // max concurrent uploads per host (0 = auto, VM-sized; GoFile gets 1.5×)
+	PipelineWorkers       int // concurrent pipelines per channel queue (0 = auto, VM-sized)
+	RetryWorkers          int // concurrent upload jobs in the retry pool (0 = auto, VM-sized)
 
 	SupabaseURL            string
 	SupabaseAPIKey         string

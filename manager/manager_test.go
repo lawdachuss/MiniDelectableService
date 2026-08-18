@@ -1,7 +1,9 @@
 package manager
 
 import (
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -345,3 +347,148 @@ func TestResumeAllChannelsSkipsManualPause(t *testing.T) {
 		t.Fatal("ResumeAllChannels must resume an automatic (boundary) pause")
 	}
 }
+
+// TestResolveRunDeadline verifies the RUN_DEADLINE env parsing: unset and
+// unparsable values yield the zero time (restarts unrestricted, e.g. local
+// dev), while valid Unix seconds resolve to that exact instant.
+func TestResolveRunDeadline(t *testing.T) {
+	t.Setenv("RUN_DEADLINE", "")
+	if !resolveRunDeadline().IsZero() {
+		t.Fatal("expected zero deadline when RUN_DEADLINE unset")
+	}
+	t.Setenv("RUN_DEADLINE", "garbage")
+	if !resolveRunDeadline().IsZero() {
+		t.Fatal("expected zero deadline for unparsable RUN_DEADLINE")
+	}
+	t.Setenv("RUN_DEADLINE", "0")
+	if !resolveRunDeadline().IsZero() {
+		t.Fatal("expected zero deadline for non-positive RUN_DEADLINE")
+	}
+	want := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	t.Setenv("RUN_DEADLINE", strconv.FormatInt(want.Unix(), 10))
+	if got := resolveRunDeadline(); !got.Equal(want) {
+		t.Fatalf("deadline = %s, want %s", got, want)
+	}
+}
+
+// TestStartSessionRefusesPastRunDeadline verifies the final-drain rule: with
+// RUN_DEADLINE set, StartSession must refuse a session whose full duration
+// would overrun the runner's hard deadline (the VM dies at run end, so the
+// recordings would be lost), and accept one that fits before it.
+func TestStartSessionRefusesPastRunDeadline(t *testing.T) {
+	oldMgr, oldCfg := server.Manager, server.Config
+	var m *Manager
+	defer func() {
+		if m != nil {
+			m.StopSession()
+		}
+		os.Remove("upload-complete.flag") // sessionLoop writes this in cwd
+		restoreTestGlobalsSafe(oldMgr, oldCfg, m)
+	}()
+
+	// Refuse: a 2h session starting now would overrun a deadline 1h away.
+	t.Setenv("RUN_DEADLINE", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+	m, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	server.Manager = m
+	server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/", CFChannelThreshold: 5}
+
+	m.StartSession(2 * time.Hour)
+	if _, active := m.SessionInfo(); active {
+		t.Fatal("StartSession must refuse a session that would overrun RUN_DEADLINE")
+	}
+
+	// Accept: a 1h session fits before a deadline 3h away. The deadline is
+	// published by the session loop goroutine, so poll briefly for it.
+	t.Setenv("RUN_DEADLINE", strconv.FormatInt(time.Now().Add(3*time.Hour).Unix(), 10))
+	m.StartSession(time.Hour)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, active := m.SessionInfo(); active {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("StartSession should start a session that fits before RUN_DEADLINE")
+}
+
+// TestCreateChannelFromAssignmentDeclinesAfterFinalDrain verifies that once
+// the session is stopped (final drain on an ephemeral runner, or graceful
+// shutdown), the manager declines new assignments instead of creating channels
+// that would record into a doomed tail killed with the VM.
+func TestCreateChannelFromAssignmentDeclinesAfterFinalDrain(t *testing.T) {
+	oldMgr, oldCfg := server.Manager, server.Config
+	var m *Manager
+	defer func() {
+		if m != nil {
+			m.StopAllChannels()
+		}
+		restoreTestGlobalsSafe(oldMgr, oldCfg, m)
+	}()
+
+	m, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	server.Manager = m
+	server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/", CFChannelThreshold: 5}
+
+	// Control: before the stop, an assignment creates the channel.
+	ca := &database.ChannelAssignment{
+		Username: "early_claim", Site: "chaturbate", Status: "claimed",
+		Framerate: 60, Resolution: 1080,
+	}
+	if err := m.CreateChannelFromAssignment(ca); err != nil {
+		t.Fatalf("CreateChannelFromAssignment: %v", err)
+	}
+	if _, ok := m.Channels.Load("early_claim"); !ok {
+		t.Fatal("assignment before the stop should create the channel")
+	}
+
+	// Stop the session permanently (final-drain state) and re-claim.
+	m.StopSession()
+	ca2 := &database.ChannelAssignment{
+		Username: "late_claim", Site: "chaturbate", Status: "claimed",
+		Framerate: 60, Resolution: 1080,
+	}
+	if err := m.CreateChannelFromAssignment(ca2); err != nil {
+		t.Fatalf("CreateChannelFromAssignment: %v", err)
+	}
+	if _, ok := m.Channels.Load("late_claim"); ok {
+		t.Fatal("channel must NOT be created when the session is stopped (final drain)")
+	}
+}
+
+// TestShouldTriggerEarlyFinalDrain verifies the early-drain decision: a
+// multi-GB backlog that can't finish before the run deadline must trigger,
+// while a small backlog, no deadline, or no pending bytes never does.
+func TestShouldTriggerEarlyFinalDrain(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(30 * time.Minute)
+
+	// 10 GB pending, no throughput signal yet → default 10 MB/s → ETA ~17 min
+	// + 20 min margin = 37 min > 30 min remaining → trigger.
+	if !shouldTriggerEarlyFinalDrain(now, deadline, 10_000_000_000, 0) {
+		t.Fatal("multi-GB backlog near the deadline must trigger the early drain")
+	}
+	// Same backlog with healthy real throughput (50 MB/s → ETA ~3.3 min + 20
+	// min margin = 23 min < 30 min) → no trigger.
+	if shouldTriggerEarlyFinalDrain(now, deadline, 10_000_000_000, 50_000_000) {
+		t.Fatal("backlog draining at healthy throughput must not trigger")
+	}
+	// Small backlog fits easily.
+	if shouldTriggerEarlyFinalDrain(now, deadline, 100_000_000, 10_000_000) {
+		t.Fatal("small backlog must not trigger")
+	}
+	// No run deadline (local dev) → never trigger.
+	if shouldTriggerEarlyFinalDrain(now, time.Time{}, 10_000_000_000, 0) {
+		t.Fatal("no run deadline must not trigger")
+	}
+	// No pending bytes → never trigger.
+	if shouldTriggerEarlyFinalDrain(now, deadline, 0, 0) {
+		t.Fatal("no pending bytes must not trigger")
+	}
+}
+

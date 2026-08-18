@@ -269,6 +269,16 @@ func (ch *Channel) GenerateFilename() (string, error) {
 	return ch.generateFilenameLocked()
 }
 
+// LiveFileSize returns the current size of the active recording file in bytes
+// (0 when nothing is being recorded).  Used by the session loop's early-drain
+// estimate so live recordings — which close and join the upload queue the
+// moment the drain stops channels — are counted.
+func (ch *Channel) LiveFileSize() int64 {
+	ch.fileMu.RLock()
+	defer ch.fileMu.RUnlock()
+	return int64(ch.Filesize)
+}
+
 // CurrentRecordingPath returns the absolute path of the file this channel is
 // currently recording, or "" when no recording is active.  The orphan scan
 // walks the same directory (videos/ and OutputDir) and must never treat a

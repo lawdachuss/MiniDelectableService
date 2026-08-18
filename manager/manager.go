@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/r3labs/sse/v2"
 	"github.com/teacat/chaturbate-dvr/channel"
 	"github.com/teacat/chaturbate-dvr/coordinator"
+	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/notifier"
@@ -431,6 +433,19 @@ func (m *Manager) LoadPooledConfig() error {
 // CreateChannelFromAssignment implements coordinator.ChannelManager.
 // Creates a channel from a channel_assignments row (claimed by coordinator).
 func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) error {
+	// After the final session drain (sessionStopped, also set during graceful
+	// shutdown) this node must not take new recording work: any channel created
+	// now would record until the runner VM dies at the run deadline and its
+	// files would never be finalized. The boundary rebalance already released
+	// this node's claims — other nodes pick them up.
+	m.sessionMu.Lock()
+	stopped := m.sessionStopped
+	m.sessionMu.Unlock()
+	if stopped {
+		log.Printf("[manager] session stopped (final drain/shutdown) — declining new assignment %s/%s", ca.Site, ca.Username)
+		return nil
+	}
+
 	conf := coordinator.ConfigFromAssignment(ca)
 	conf.Sanitize()
 
@@ -1004,12 +1019,37 @@ func (m *Manager) StopWithProcessingQueue(workers int) {
 	m.PublishUploadState()
 }
 
+// resolveRunDeadline returns the hard end of this runner's workflow window,
+// read from RUN_DEADLINE (Unix seconds, set by keep-alive.ps1). Returns the
+// zero time when unset (local dev / non-CI), in which case session restarts
+// are unrestricted. On ephemeral CI runners the VM is destroyed at this
+// moment, so a session whose next full cycle would overrun it must not
+// resume — the files would die with the VM.
+func resolveRunDeadline() time.Time {
+	raw := os.Getenv("RUN_DEADLINE")
+	if raw == "" {
+		return time.Time{}
+	}
+	secs, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || secs <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(secs, 0)
+}
+
 // StartSession begins the automatic recording-session lifecycle.
 // If duration is <= 0 this is a no-op (continuous recording).
 // The session loop: record for duration → cancel all channels →
 // wait for mux/upload/Supabase → resume all channels → repeat.
 func (m *Manager) StartSession(d time.Duration) {
 	if d <= 0 {
+		return
+	}
+	// Never start a session that would overrun the runner's hard deadline:
+	// on ephemeral CI runners the VM dies at RUN_DEADLINE and any recording
+	// still in progress at that moment is lost with it.
+	if rd := resolveRunDeadline(); !rd.IsZero() && time.Now().Add(d).After(rd) {
+		log.Printf("[session] refusing to start %s session — would overrun run deadline %s (runner VM dies at run end)", d, rd.Format(time.RFC3339))
 		return
 	}
 	m.sessionMu.Lock()
@@ -1022,6 +1062,70 @@ func (m *Manager) StartSession(d time.Duration) {
 	m.sessionStopped = false
 	m.sessionMu.Unlock()
 	go m.sessionLoop(d)
+}
+
+// earlyDrainMargin is the safety buffer added to the upload ETA before the
+// session loop decides the final drain must start early.  It covers finalize
+// delays (close/merge/enqueue), throughput-estimate error, and the
+// keep-alive's exit grace.
+const earlyDrainMargin = 20 * time.Minute
+
+// defaultUploadThroughput is used when no upload has been observed yet (or
+// uploads are stalled): a conservative aggregate rate so a freshly-queued
+// multi-GB backlog still triggers the early drain instead of waiting for the
+// natural session boundary.
+const defaultUploadThroughput = 10_000_000 // 10 MB/s
+
+// shouldTriggerEarlyFinalDrain reports whether stopping the session NOW is
+// required for the pending upload backlog to finish before the run deadline.
+// On ephemeral GitHub runners the VM is destroyed at the deadline, so files
+// still uploading at that moment are lost.
+func shouldTriggerEarlyFinalDrain(now, runDeadline time.Time, pendingBytes int64, throughput float64) bool {
+	if runDeadline.IsZero() || pendingBytes <= 0 {
+		return false
+	}
+	if throughput < 1_000_000 {
+		throughput = defaultUploadThroughput
+	}
+	eta := time.Duration(float64(pendingBytes) / throughput * float64(time.Second))
+	return now.Add(eta + earlyDrainMargin).After(runDeadline)
+}
+
+// PendingUploadBytes returns the total bytes waiting to be uploaded across
+// all channels: queued pipelines + in-flight processing + live recordings
+// (which close and join the queue the moment the drain stops channels).
+func (m *Manager) PendingUploadBytes() int64 {
+	var total int64
+	m.Channels.Range(func(key, value interface{}) bool {
+		if c, ok := value.(*channel.Channel); ok && c.PipelineQueue != nil {
+			total += c.PipelineQueue.PendingBytes()
+			total += c.LiveFileSize()
+		}
+		return true
+	})
+	return total
+}
+
+// checkEarlyFinalDrain starts the final drain early when the pending upload
+// backlog can't finish before the runner's hard deadline.  On ephemeral
+// GitHub runners the VM is destroyed at RUN_DEADLINE, so a multi-GB file
+// still uploading at that moment is lost; stopping the session early hands
+// the drain the time the big files need.  No-op when there is no deadline
+// (local dev) or the backlog fits comfortably.
+func (m *Manager) checkEarlyFinalDrain() {
+	rd := resolveRunDeadline()
+	if rd.IsZero() {
+		return
+	}
+	pending := m.PendingUploadBytes()
+	if pending <= 0 {
+		return
+	}
+	if shouldTriggerEarlyFinalDrain(time.Now(), rd, pending, channel.EstimatedUploadThroughput()) {
+		log.Printf("[session] starting final drain early: %s of uploads pending and the run deadline %s is too close to finish them — stopping channels now",
+			internal.FormatFilesize(int(pending)), rd.Format(time.RFC3339))
+		m.TriggerSessionStop()
+	}
 }
 
 func (m *Manager) sessionLoop(d time.Duration) {
@@ -1039,7 +1143,10 @@ func (m *Manager) sessionLoop(d time.Duration) {
 	m.sessionStopMu.Unlock()
 
 	timer := time.NewTimer(d)
-	progress := time.NewTicker(30 * time.Minute)
+	// 15-minute cadence: logs progress AND re-evaluates whether the upload
+	// backlog needs the final drain to start early (big files need more
+	// drain time than the natural boundary leaves).
+	progress := time.NewTicker(15 * time.Minute)
 
 sessionWait:
 	for {
@@ -1059,6 +1166,7 @@ sessionWait:
 			if remaining > 0 {
 				log.Printf("[session] %s remaining in recording session", remaining.Round(time.Second))
 			}
+			m.checkEarlyFinalDrain()
 		}
 	}
 
@@ -1090,6 +1198,20 @@ sessionWait:
 		log.Printf("[session] WARNING: could not write upload-complete.flag: %v", err)
 	} else {
 		log.Println("[session] upload-complete.flag written")
+	}
+
+	// Final-drain rule: if the next full session would overrun the runner's
+	// hard deadline, do NOT resume. The workflow tears the VM down at the
+	// deadline, so channels resumed now would record straight into a doomed
+	// tail whose files die with the VM. Stay stopped instead; the boundary
+	// rebalance above already released this node's claims.
+	if rd := resolveRunDeadline(); !rd.IsZero() && time.Now().Add(d).After(rd) {
+		log.Printf("[session] next session would overrun run deadline %s — staying stopped after final drain", rd.Format(time.RFC3339))
+		m.sessionMu.Lock()
+		m.sessionStarted = false
+		m.sessionStopped = true
+		m.sessionMu.Unlock()
+		return
 	}
 
 	// Restart the session: resume channels and begin the next recording cycle.

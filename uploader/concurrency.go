@@ -53,3 +53,26 @@ func SetHostConcurrency(perHost int) {
 		hostSems[h] = make(chan struct{}, perHost)
 	}
 }
+
+// SetHostConcurrencyTiered replaces the per-host upload semaphores with
+// distinct capacities: GoFile (whose fleet tolerates more parallel uploads)
+// gets goFile slots, every other host gets other.  Used by the VM-sized
+// startup tuning (config.VMSizedConcurrency); an operator who sets
+// --upload-host-concurrency explicitly uses SetHostConcurrency instead.
+// Call at startup before any upload goroutines are running.
+func SetHostConcurrencyTiered(goFile, other int) {
+	if goFile <= 0 {
+		goFile = defaultGoFileConcurrency
+	}
+	if other <= 0 {
+		other = defaultHostConcurrency
+	}
+	hostSemMu.Lock()
+	defer hostSemMu.Unlock()
+	hostSems["GoFile"] = make(chan struct{}, goFile)
+	for h := range hostSems {
+		if h != "GoFile" {
+			hostSems[h] = make(chan struct{}, other)
+		}
+	}
+}

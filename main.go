@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -380,21 +381,27 @@ func main() {
 			},
 			&cli.IntFlag{
 				Name:    "upload-max-concurrent",
-				Usage:   "Maximum number of video files uploading at once (0 = default 100)",
+				Usage:   "Maximum number of video files uploading at once (0 = auto, VM-sized)",
 				EnvVars: []string{"UPLOAD_MAX_CONCURRENT"},
-				Value:   100,
+				Value:   0,
 			},
 			&cli.IntFlag{
 				Name:    "upload-host-concurrency",
-				Usage:   "Maximum concurrent uploads per file host (0 = default 8)",
+				Usage:   "Maximum concurrent uploads per file host (0 = auto, VM-sized)",
 				EnvVars: []string{"UPLOAD_HOST_CONCURRENCY"},
-				Value:   8,
+				Value:   0,
 			},
 			&cli.IntFlag{
 				Name:    "pipeline-workers",
-				Usage:   "Concurrent upload pipelines per channel queue (0 = default 3)",
+				Usage:   "Concurrent upload pipelines per channel queue (0 = auto, VM-sized)",
 				EnvVars: []string{"PIPELINE_WORKERS"},
-				Value:   3,
+				Value:   0,
+			},
+			&cli.IntFlag{
+				Name:    "retry-workers",
+				Usage:   "Concurrent upload jobs in the retry pool (0 = auto, VM-sized)",
+				EnvVars: []string{"RETRY_WORKERS"},
+				Value:   0,
 			},
 
 			&cli.StringFlag{
@@ -588,15 +595,31 @@ func start(c *cli.Context) error {
 	fmt.Printf("[startup] config loaded in %v\n", time.Since(started).Round(time.Millisecond))
 
 	// Apply upload throughput tuning before any upload goroutines start.
-	// SetUploadHostConcurrency also reconfigures per-host upload semaphores
-	// so an operator can raise/lower concurrency per host without a rebuild.
-	channel.SetUploadConcurrency(server.Config.UploadMaxConcurrent)
-	uploader.SetHostConcurrency(server.Config.UploadHostConcurrency)
-	channel.SetPipelineWorkers(server.Config.PipelineWorkers)
-	if server.Config.UploadMaxConcurrent > 0 {
-		fmt.Printf("[startup] upload concurrency: %d files max, %d per host, %d pipelines/channel\n",
-			server.Config.UploadMaxConcurrent, server.Config.UploadHostConcurrency, server.Config.PipelineWorkers)
+	// Every pool is VM-sized: derived from this runner's vCPU count
+	// (GitHub-hosted VMs come in fixed sizes — standard windows-latest is
+	// 2 vCPU, larger runners are 4/8/16/32/64), so a 2-core runner gets the
+	// tuned baseline and larger runners scale up.  An explicit flag/env
+	// value (non-zero) always wins over the auto value.
+	retryW, uploadSem, goFile, other, pipelineW := config.VMSizedConcurrency()
+	if server.Config.RetryWorkers > 0 {
+		retryW = server.Config.RetryWorkers
 	}
+	if server.Config.UploadMaxConcurrent > 0 {
+		uploadSem = server.Config.UploadMaxConcurrent
+	}
+	if server.Config.UploadHostConcurrency > 0 {
+		goFile = server.Config.UploadHostConcurrency
+		other = server.Config.UploadHostConcurrency
+	}
+	if server.Config.PipelineWorkers > 0 {
+		pipelineW = server.Config.PipelineWorkers
+	}
+	channel.SetRetryWorkers(retryW)
+	channel.SetUploadConcurrency(uploadSem)
+	uploader.SetHostConcurrencyTiered(goFile, other)
+	channel.SetPipelineWorkers(pipelineW)
+	fmt.Printf("[startup] upload concurrency (VM-sized, %d vCPU): %d files max, %d/%d per host (GoFile/other), %d retry workers, %d pipelines/channel\n",
+		runtime.NumCPU(), uploadSem, goFile, other, retryW, pipelineW)
 
 	// Refresh cookies from the site before loading settings so every start
 	// begins with fresh cookies (best-effort; requires Python + curl_cffi).

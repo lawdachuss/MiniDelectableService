@@ -454,6 +454,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		UploadMaxConcurrent:     c.Int("upload-max-concurrent"),
 		UploadHostConcurrency:   c.Int("upload-host-concurrency"),
 		PipelineWorkers:         c.Int("pipeline-workers"),
+		RetryWorkers:            c.Int("retry-workers"),
 
 		SupabaseURL:            c.String("supabase-url"),
 		SupabaseAPIKey:         c.String("supabase-api-key"),

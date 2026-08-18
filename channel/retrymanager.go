@@ -34,17 +34,31 @@ const (
 	defaultMaxAttempts = 3
 	defaultBaseBackoff = 5 * time.Second
 	maxBackoff         = 10 * time.Minute
-	// numWorkers is how many retry jobs execute concurrently.  The global
-	// UploadSem (cap 100) and the per-host upload semaphores (cap 8/host) are
-	// the real throughput governors, so the worker pool must be large enough
-	// to actually saturate them — a 2-worker pool serialized every video
-	// upload on a node behind a massive backlog, which delayed stageSaveMetadata
-	// (and therefore thumbnail persistence) for hours while the queue drained.
-	// 8 workers fills the per-host caps (8 files × ~5 hosts each) without
-	// exceeding UploadSem; DoWithRetry callers still wait on their result
-	// channel, so jobs simply queue when the pool is busy.
-	numWorkers = 8
 )
+
+var (
+	// numWorkers is how many retry jobs execute concurrently.  The global
+	// UploadSem and the per-host upload semaphores are the real throughput
+	// governors, so the worker pool must be large enough to actually
+	// saturate them — a 2-worker pool serialized every video upload on a
+	// node behind a massive backlog, which delayed stageSaveMetadata (and
+	// therefore thumbnail persistence) for hours while the queue drained.
+	// VM-sized at startup via SetRetryWorkers (config.VMSizedConcurrency);
+	// this default is the 2-vCPU GitHub-hosted runner baseline, which fills
+	// both per-host tiers — GoFile's higher 12-slot cap and the 8-slot cap
+	// of the other hosts.  DoWithRetry callers still wait on their result
+	// channel, so jobs simply queue when the pool is busy.
+	numWorkers = 12
+)
+
+// SetRetryWorkers overrides the retry worker pool size.  Call at startup
+// before any upload jobs are scheduled — the global RetryManager is created
+// lazily on first use, so this always applies.
+func SetRetryWorkers(n int) {
+	if n > 0 {
+		numWorkers = n
+	}
+}
 
 // NewRetryManager creates a new RetryManager.
 func NewRetryManager() *RetryManager {

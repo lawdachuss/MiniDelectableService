@@ -76,6 +76,11 @@ type Pipeline struct {
 	Username string `json:"username"`
 	FileSize int64  `json:"file_size"`
 
+	// Duration is the video length in seconds, captured at enqueue time so
+	// stageSaveMetadata can reuse it instead of spawning a second ffprobe.
+	// Not persisted (PipelineState has no column); resumed pipelines re-probe.
+	Duration float64 `json:"-"`
+
 	CurrentStage Stage  `json:"current_stage"`
 	Failed       bool   `json:"failed"`
 	LastError    string `json:"last_error"`
@@ -323,6 +328,11 @@ ch.Info("upload: %d/%d hosts already have this file — uploading to %d remainin
 				speed = float64(current-hp.bytes) / dt
 			}
 		}
+		// Feed the node-wide throughput estimate (early final-drain decision).
+		// Delta must be captured BEFORE hp.bytes is overwritten below.
+		if delta := current - hp.bytes; delta > 0 {
+			RecordUploadBytes(delta)
+		}
 		hp.bytes = current
 		hp.lastTime = now
 		hostProgress[host] = hp
@@ -528,10 +538,16 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 		}
 	}
 
-	// Extract real duration from the video file.
-	dur, probeErr := VideoDurationSeconds(p.FilePath)
-	if probeErr != nil {
-		ch.Warn("upload: could not probe duration for %s: %v", p.Filename, probeErr)
+	// Reuse the duration probed at enqueue time — no second ffprobe spawn
+	// (each holds a global ffmpeg slot).  Only re-probe when it wasn't
+	// captured, e.g. a pipeline resumed from persisted state.
+	dur := p.Duration
+	if dur <= 0 {
+		var probeErr error
+		dur, probeErr = VideoDurationSeconds(p.FilePath)
+		if probeErr != nil {
+			ch.Warn("upload: could not probe duration for %s: %v", p.Filename, probeErr)
+		}
 	}
 
 	if err := server.SaveRecordingWithLinks(
@@ -618,7 +634,9 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 // PipelineQueue manages a per-channel ordered queue of pipelines.
 // Pipelines are processed concurrently by a small worker pool so a channel
 // with a backlog uploads several files in parallel.  Order within a channel is
-// best-effort FIFO (workers may finish out of order).
+// largest-file-first: the queue stays sorted by FileSize descending, so
+// workers always pick up the biggest recording next (workers may finish out
+// of order).
 type PipelineQueue struct {
 	pipelines []*Pipeline
 	mu        sync.Mutex
@@ -628,6 +646,11 @@ type PipelineQueue struct {
 	started   bool           // tracks whether the worker goroutine has been launched
 	stopCh    chan struct{}  // closed on Stop() to cancel pending retry timers
 	enqueued  int            // total pipelines accepted (after dedup), incl. currently processing
+
+	// processingBytes is the FileSize of the pipeline currently being worked
+	// by each worker (popped but not finished).  PendingBytes() sums this with
+	// the queued sizes so the session loop can estimate remaining upload time.
+	processingBytes int64
 
 	ch      *Channel
 	history []entity.PendingEntry // last 50 completed/failed pipelines
@@ -725,7 +748,7 @@ func (pq *PipelineQueue) scheduleRetry(p *Pipeline) bool {
 			return
 		}
 		MarkUploadInFlight(p.FilePath)
-		pq.pipelines = append(pq.pipelines, p)
+		pq.enqueueByPriority(p)
 		pq.cond.Broadcast()
 		pq.mu.Unlock()
 	}()
@@ -747,10 +770,25 @@ func (pq *PipelineQueue) processLoop() {
 		}
 		p := pq.pipelines[0]
 		pq.pipelines = pq.pipelines[1:]
+		pq.processingBytes += p.FileSize
 		pq.mu.Unlock()
 
 		pq.processPipeline(p)
 	}
+}
+
+// PendingBytes returns the total size of files still awaiting upload: queued
+// pipelines plus the file currently being processed.  The session loop uses
+// this to decide when the final drain must start — a multi-GB backlog needs
+// the drain to begin early, before the runner's hard deadline.
+func (pq *PipelineQueue) PendingBytes() int64 {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	var total int64
+	for _, p := range pq.pipelines {
+		total += p.FileSize
+	}
+	return total + pq.processingBytes
 }
 
 // QueuedEntries returns info about all pending pipelines in the queue.
@@ -801,6 +839,14 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 	p.LastError = ""
 	ch.SetUploadProgress(filename, "queued for processing", 0, 0, 0, 0, 0, "", nil)
 	ch.Info("pipeline: processing %s (starting at stage %s)", filename, p.CurrentStage)
+
+	// Release the processing-bytes counter used by the early-drain estimate
+	// once the pipeline fully finishes (success, failure, or panic).
+	defer func() {
+		pq.mu.Lock()
+		pq.processingBytes -= p.FileSize
+		pq.mu.Unlock()
+	}()
 
 	defer func() {
 		// Snapshot whether this is the pipeline's first processing BEFORE any
@@ -983,6 +1029,23 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 	ch.SetUploadProgress("", "", 0, 0, 0, 0, 0, "", nil)
 }
 
+// enqueueByPriority inserts p into the queue keeping it sorted by FileSize
+// descending, so workers always pop the LARGEST pending recording first.  A
+// channel with a backlog then uploads its biggest files first instead of FIFO
+// — multi-GB recordings stop being the stragglers that get killed at the run
+// boundary.  Caller must hold pq.mu.
+func (pq *PipelineQueue) enqueueByPriority(p *Pipeline) {
+	// Linear scan is fine: the per-channel queue holds only that channel's
+	// pending files, typically a handful.
+	i := 0
+	for i < len(pq.pipelines) && pq.pipelines[i].FileSize >= p.FileSize {
+		i++
+	}
+	pq.pipelines = append(pq.pipelines, nil)
+	copy(pq.pipelines[i+1:], pq.pipelines[i:])
+	pq.pipelines[i] = p
+}
+
 // pathQueued returns true if a pipeline for this exact file path is already
 // waiting in the queue (not yet popped by a worker).  Uses the path rather than
 // the hash so the dedup diagnostic can run without hashing a large file.
@@ -1118,7 +1181,7 @@ func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool, endRe
 	framerate := p.Framerate
 	pq.ch.stateMu.Unlock()
 
-	pq.pipelines = append(pq.pipelines, p)
+	pq.enqueueByPriority(p)
 	pq.enqueued++
 	pq.mu.Unlock()
 	pq.cond.Broadcast()
@@ -1135,6 +1198,7 @@ func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool, endRe
 		}
 	}
 	dur, _ := VideoDurationSeconds(filePath)
+	p.Duration = dur // reuse in stageSaveMetadata — skip the second ffprobe
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1217,7 +1281,7 @@ func (pq *PipelineQueue) ResumePending() {
 		MarkUploadInFlight(s.FilePath)
 		pq.ch.UploadWg.Add(1)
 		pq.ch.Info("pipeline: resuming %s at stage %s (retry %d)", s.Filename, s.CurrentStage, s.Retries)
-		pq.pipelines = append(pq.pipelines, p)
+		pq.enqueueByPriority(p)
 		pq.enqueued++
 		pq.mu.Unlock()
 		pq.cond.Broadcast()

@@ -39,6 +39,12 @@ if (Test-Path $cleanScript) {
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
 # SESSION_DURATION, VIDHIDE_API_KEY, STREAMWISH_API_KEY, UPNSHARE_KEY, etc.
 # are passed via the step's env: block from GitHub secrets — $env:XXX works directly.
+# The runner VM is destroyed when this workflow's 355-min keep-alive window ends.
+# Pass that hard deadline to the DVR (Unix seconds) so its session loop stops
+# recording after the final drain instead of resuming into a doomed tail whose
+# files die with the VM at run end.
+$runStartEpoch = if ($env:START_TIME) { [int64]$env:START_TIME } else { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+$env:RUN_DEADLINE = "$($runStartEpoch + (355 * 60))"
 $dvr = Start-Process -FilePath $dvrExe -ArgumentList "--no-tunnel --output-dir `"$videosDir`"" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
 $dvrPid = if ($dvr -and $dvr.Id) { $dvr.Id } else { "?" }
 
