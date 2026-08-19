@@ -55,13 +55,17 @@ type imgbbResponse struct {
 // imgbbKeyRing manages multiple API keys and rotates through them on
 // rate-limit errors.  Keys are read from the IMGBB_API_KEY env var,
 // which may be a comma-separated list (e.g. "key1,key2,key3").
+//
+// The ring is a package-level singleton so that the rotation index persists
+// across NewImgBBUploader instances — every uploader shares the same ring
+// and continues where the previous one left off.
 type imgbbKeyRing struct {
 	mu    sync.Mutex
 	keys  []string
 	index int
 }
 
-func newImgbbKeyRing() *imgbbKeyRing {
+var globalImgbbKeyRing = sync.OnceValue(func() *imgbbKeyRing {
 	raw := os.Getenv("IMGBB_API_KEY")
 	var keys []string
 	for _, k := range strings.Split(raw, ",") {
@@ -71,7 +75,7 @@ func newImgbbKeyRing() *imgbbKeyRing {
 		}
 	}
 	return &imgbbKeyRing{keys: keys}
-}
+})
 
 func (kr *imgbbKeyRing) current() string {
 	kr.mu.Lock()
@@ -105,7 +109,7 @@ type ImgBBUploader struct {
 
 func NewImgBBUploader() *ImgBBUploader {
 	return &ImgBBUploader{
-		keys:   newImgbbKeyRing(),
+		keys:   globalImgbbKeyRing(),
 		client: newNoProxyClient(60 * time.Second),
 	}
 }
@@ -171,8 +175,12 @@ func (u *ImgBBUploader) Upload(filePath string) (string, error) {
 
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("imgbb: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-			// Rotate on rate-limit messages
-			if isRateLimitError(resp.StatusCode, body) {
+			// Rotate on rate-limit messages (429 or body text) or 403
+			// (key-specific "Forbidden" / "Invalid API key").  Do NOT
+			// rotate on generic 400 — that's usually a bad request
+			// (invalid image format, file too large) which fails for
+			// every key and rotating would waste attempts.
+			if isRateLimitError(resp.StatusCode, body) || resp.StatusCode == 403 {
 				u.keys.rotate()
 				continue
 			}
@@ -200,6 +208,12 @@ func (u *ImgBBUploader) Upload(filePath string) (string, error) {
 			err = fmt.Errorf("imgbb: error: %s", msg)
 			lastErr = err
 			if isRateLimitError(result.Status, []byte(msg)) {
+				u.keys.rotate()
+				continue
+			}
+			// Rotate on key-specific errors so the next key gets a chance.
+			lower := strings.ToLower(msg)
+			if strings.Contains(lower, "invalid") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "suspended") {
 				u.keys.rotate()
 				continue
 			}

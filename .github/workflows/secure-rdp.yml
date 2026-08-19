@@ -69,6 +69,7 @@ jobs:
       # HTTP 412 "Invalid uploader" blocks (the whole reason the proxy exists).
       CATBOX_PROXY_URL: ${{ secrets.CATBOX_PROXY_URL }}
       CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
+      IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
 
     steps:
       - uses: actions/checkout@v4
