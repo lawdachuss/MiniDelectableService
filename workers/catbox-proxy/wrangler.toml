@@ -8,4 +8,4 @@ workers_dev = true
 # Catbox's "Invalid uploader" / 412 abuse rejection on datacenter IPs). The Go
 # client also sends this explicitly when CATBOX_USERHASH is set in .env; this
 # [vars] keeps the Worker working for callers that don't.
-CATBOX_USERHASH = "c81dfb89395e73d5335bb65da"
+CATBOX_USERHASH = "546ec521ed78e961bb5385bba"
