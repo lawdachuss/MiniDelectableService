@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -85,6 +86,10 @@ func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFun
 				time.Sleep(uploadBackoff(attempt, err))
 				lastErr = nil
 				continue
+			}
+			// Storage-full is unrecoverable — don't waste time retrying.
+			if isVoeStorageFull(err) {
+				return "", lastErr
 			}
 			if attempt < maxAttempts {
 				continue
@@ -184,4 +189,18 @@ func (u *VoeSXUploader) uploadFile(filePath string, progress ProgressFunc) (stri
 
 	viewURL := fmt.Sprintf("https://voe.sx/%s", uploadResp.File.FileCode)
 	return viewURL, nil
+}
+
+// isVoeStorageFull returns true when the VOE.sx error indicates the account
+// storage is exhausted. This is unrecoverable until the user frees space or
+// provides a new API key, so callers should fail immediately instead of retrying.
+func isVoeStorageFull(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "storage space") ||
+		strings.Contains(msg, "maximum storage") ||
+		strings.Contains(msg, "storage full") ||
+		strings.Contains(msg, "quota")
 }

@@ -48,6 +48,13 @@ func (ch *Channel) Monitor(runID uint64) {
 	// the channel and invoked by Pause/Stop.
 	ctx, _ := ch.WithCancel(context.Background())
 
+	// consecutiveTransient counts how many times in a row a transient / session-
+	// stalled error has occurred without a successful stream in between. After
+	// maxConsecutiveTransients the channel is treated as expected-offline so it
+	// uses the full interval delay instead of hammering every 10 s.
+	const maxConsecutiveTransients = 5
+	var consecutiveTransient int
+
 	var err error
 	for {
 		if err = ctx.Err(); err != nil {
@@ -59,7 +66,7 @@ func (ch *Channel) Monitor(runID uint64) {
 		}
 		// isExpectedOffline returns true for errors where the full interval
 		// delay is appropriate. Transient errors (502, decode errors, network
-		// hiccups) should retry quickly.
+		// hiccups) should retry quickly — until they repeat too many times.
 		isExpectedOffline := func(err error) bool {
 			return errors.Is(err, internal.ErrChannelOffline) ||
 				errors.Is(err, internal.ErrPrivateStream) ||
@@ -67,10 +74,18 @@ func (ch *Channel) Monitor(runID uint64) {
 				errors.Is(err, internal.ErrNotFound) ||
 				errors.Is(err, internal.ErrAgeVerification) ||
 				errors.Is(err, internal.ErrCloudflareBlocked) ||
-				errors.Is(err, internal.ErrRoomPasswordRequired)
+				errors.Is(err, internal.ErrRoomPasswordRequired) ||
+				errors.Is(err, internal.ErrStreamStalled) ||
+				consecutiveTransient >= maxConsecutiveTransients
 		}
 		onRetry := func(_ uint, err error) {
 			ch.UpdateOnlineStatus(false)
+
+			// Clear the transient counter for definitive state changes — the
+			// channel is genuinely offline/private/etc., not stuck in a loop.
+			if isExpectedOffline(err) && !errors.Is(err, internal.ErrStreamStalled) && consecutiveTransient > 0 {
+				consecutiveTransient = 0
+			}
 
 			// Reset the CF block count whenever a non-CF response is received.
 			if !errors.Is(err, internal.ErrCloudflareBlocked) && ch.CFBlockCount > 0 {
@@ -108,11 +123,19 @@ func (ch *Channel) Monitor(runID uint64) {
 				ch.Info("room requires a password, try again in %d min(s)", server.Config.Interval)
 			} else if errors.Is(err, context.Canceled) {
 				// channel stopped/paused — silent
+			} else if errors.Is(err, internal.ErrStreamStalled) {
+				consecutiveTransient++
+				ch.Warn("on retry: stream stalled %d time(s) — backing off to full interval", consecutiveTransient)
 			} else if errors.Is(err, internal.ErrCircuitBreakerOpen) {
 				ch.Info("%s: upstream circuit breaker open (cooldown ~%v), will retry once it cools down",
 					ch.Config.Username, internal.CircuitBreakerCooldown())
 			} else {
-				ch.Error("on retry: %s: retrying in 10s", err.Error())
+				consecutiveTransient++
+				if consecutiveTransient >= maxConsecutiveTransients {
+					ch.Warn("on retry: %s: %d consecutive transient failures — backing off to full interval", err.Error(), consecutiveTransient)
+				} else {
+					ch.Error("on retry: %s: retrying in 10s", err.Error())
+				}
 			}
 		}
 		delayFn := func(_ uint, err error, _ *retry.Config) time.Duration {
@@ -146,6 +169,8 @@ func (ch *Channel) Monitor(runID uint64) {
 		); err != nil {
 			break
 		}
+		// Successful stream ended — reset transient counter.
+		consecutiveTransient = 0
 	}
 
 	// Classify the final error so the cleanup log explains WHY the recording
