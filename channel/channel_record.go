@@ -122,7 +122,13 @@ func (ch *Channel) Monitor(runID uint64) {
 			} else if errors.Is(err, internal.ErrRoomPasswordRequired) {
 				ch.Info("room requires a password, try again in %d min(s)", server.Config.Interval)
 			} else if errors.Is(err, context.Canceled) {
-				// channel stopped/paused — silent
+				// channel stopped/paused — if PauseWithReason already set a
+				// closeReason, that will be captured by cleanupLocked.  If not
+				// (e.g. external cancel without a reason), use a fallback so
+				// the recording's end_reason is never empty in the DB.
+				if ch.closeReason == "" {
+					ch.setCloseReason("channel stopped (context canceled)")
+				}
 			} else if errors.Is(err, internal.ErrStreamStalled) {
 				consecutiveTransient++
 				ch.Warn("on retry: stream stalled %d time(s) — backing off to full interval", consecutiveTransient)
@@ -151,6 +157,13 @@ func (ch *Channel) Monitor(runID uint64) {
 				base := time.Duration(mins) * time.Minute
 				jitter := time.Duration(rand.Int63n(int64(base/5))) - base/10 // ±10% of base
 				return base + jitter
+			}
+			// Stream stalls (token expiry, CDN hiccup) should reconnect
+			// quickly — the model is likely still live.  Only back off to
+			// the full interval after repeated consecutive stalls, which
+			// indicates the model may actually be gone.
+			if errors.Is(err, internal.ErrStreamStalled) && consecutiveTransient < maxConsecutiveTransients {
+				return 10 * time.Second
 			}
 			if isExpectedOffline(err) {
 				base := time.Duration(server.Config.Interval) * time.Minute
