@@ -718,7 +718,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			info("preview: ✓ %s", baseName)
 			previewDone <- remoteURL
 		} else {
-			errFn("preview: all hosts failed for %s: %v", baseName, uploadErr)
+			errFn("preview: all hosts failed for %s: %v (cosmetic — thumbnail+sprite still saved)", baseName, uploadErr)
 			previewDone <- ""
 		}
 	}()
