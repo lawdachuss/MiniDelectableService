@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/avast/retry-go/v4"
@@ -535,11 +534,6 @@ type Playlist struct {
 	FileExt          string        // ".ts" for legacy HLS, ".mp4" for LL-HLS fMP4
 	Client           *internal.Req // reuse the same client that fetched the master playlist
 	MouflonPDKey     string        // Stripchat MOUFLON v2 decryption key; empty for Chaturbate
-
-	// Token refresh: periodically re-fetch the master playlist to get a fresh
-	// session token before the CDN rejects the old one.  mu protects the URLs.
-	mu              sync.Mutex
-	tokenRefreshCtx context.CancelFunc // cancels the background refresh goroutine
 }
 
 // Resolution represents a video resolution and its corresponding framerate.
@@ -683,101 +677,6 @@ func withMouflonParams(u, pkey string) string {
 	return parsed.String()
 }
 
-// tokenRefreshInterval is how often the watch loop re-fetches the master
-// playlist to get a fresh session token before the CDN rejects the old one.
-// Chaturbate tokens typically have a 30-60 minute TTL; refreshing every 25
-// minutes keeps a healthy margin.
-var tokenRefreshInterval = 25 * time.Minute
-
-// startTokenRefresh launches a background goroutine that periodically re-fetches
-// the master playlist and atomically swaps the PlaylistURL / AudioPlaylistURL.
-// The goroutine stops when the parent context is cancelled.  The caller should
-// defer p.StopTokenRefresh() after calling this.
-func (p *Playlist) startTokenRefresh(ctx context.Context) {
-	if p.MasterURL == "" || p.Client == nil {
-		return // nothing to refresh (e.g. Stripchat or missing master URL)
-	}
-	refreshCtx, cancel := context.WithCancel(ctx)
-	p.mu.Lock()
-	p.tokenRefreshCtx = cancel
-	p.mu.Unlock()
-
-	go func() {
-		ticker := time.NewTicker(tokenRefreshInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-refreshCtx.Done():
-				return
-			case <-ticker.C:
-				p.refreshToken(refreshCtx)
-			}
-		}
-	}()
-}
-
-// StopTokenRefresh cancels the background token-refresh goroutine, if any.
-func (p *Playlist) StopTokenRefresh() {
-	p.mu.Lock()
-	if p.tokenRefreshCtx != nil {
-		p.tokenRefreshCtx()
-		p.tokenRefreshCtx = nil
-	}
-	p.mu.Unlock()
-}
-
-// refreshToken re-fetches the master playlist from MasterURL, picks the same
-// resolution/framerate variant, and atomically updates PlaylistURL and
-// AudioPlaylistURL.  Errors are logged but never fatal — the old token will
-// keep working until it expires, at which point the stall detector takes over.
-func (p *Playlist) refreshToken(ctx context.Context) {
-	resp, source, err := fetchPlaylistSource(ctx, p.Client, p.MasterURL)
-	if err != nil {
-		if server.Config.Debug {
-			fmt.Printf("[DEBUG] token refresh: fetch master failed: %v\n", err)
-		}
-		return
-	}
-	newPlaylist, err := ParsePlaylist(resp, source, p.Resolution, p.Framerate)
-	if err != nil {
-		if server.Config.Debug {
-			fmt.Printf("[DEBUG] token refresh: parse playlist failed: %v\n", err)
-		}
-		return
-	}
-	// Preserve Stripchat MOUFLON params if present.
-	if p.MouflonPDKey != "" {
-		pkey := stripchat.ParsePKeyFromMaster(resp)
-		if pkey != "" {
-			newPlaylist.PlaylistURL = withMouflonParams(newPlaylist.PlaylistURL, pkey)
-			if newPlaylist.AudioPlaylistURL != "" {
-				newPlaylist.AudioPlaylistURL = withMouflonParams(newPlaylist.AudioPlaylistURL, pkey)
-			}
-		}
-	}
-	p.mu.Lock()
-	p.PlaylistURL = newPlaylist.PlaylistURL
-	p.AudioPlaylistURL = newPlaylist.AudioPlaylistURL
-	p.RootURL = strings.SplitN(newPlaylist.PlaylistURL, "?", 2)[0]
-	p.mu.Unlock()
-	if server.Config.Debug {
-		fmt.Printf("[DEBUG] token refresh: swapped playlist URL (next refresh in %v)\n", tokenRefreshInterval)
-	}
-}
-
-// getPlaylistURL returns the current PlaylistURL, safe for concurrent use.
-func (p *Playlist) getPlaylistURL() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.PlaylistURL
-}
-
-// getAudioPlaylistURL returns the current AudioPlaylistURL, safe for concurrent use.
-func (p *Playlist) getAudioPlaylistURL() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.AudioPlaylistURL
-}
 
 // WatchHandler is a function type that processes video segments.
 type WatchHandler func(b []byte, duration float64) error
@@ -786,8 +685,6 @@ type WatchHandler func(b []byte, duration float64) error
 // For LL-HLS streams with a separate audio rendition it automatically muxes
 // audio and video into a single fragmented MP4 output stream.
 func (p *Playlist) WatchSegments(ctx context.Context, handler WatchHandler) error {
-	p.startTokenRefresh(ctx)
-	defer p.StopTokenRefresh()
 	if p.AudioPlaylistURL != "" {
 		return p.watchMuxedSegments(ctx, handler)
 	}
@@ -931,7 +828,7 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 
 	for {
 		sawNewSegment := false
-		resp, err := client.Get(ctx, p.getPlaylistURL())
+		resp, err := client.Get(ctx, p.PlaylistURL)
 		if err != nil {
 			if consecutiveErrors++; consecutiveErrors >= 5 {
 				return fmt.Errorf("get playlist: %w", err)
@@ -1079,7 +976,7 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 
 	for {
 		// Fetch video playlist
-		videoResp, err := client.Get(ctx, p.getPlaylistURL())
+		videoResp, err := client.Get(ctx, p.PlaylistURL)
 		if err != nil {
 			if consecutiveErrors++; consecutiveErrors >= 5 {
 				return fmt.Errorf("get video playlist: %w", err)
@@ -1104,7 +1001,7 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 		}
 
 		// Fetch audio playlist
-		audioResp, err := client.Get(ctx, p.getAudioPlaylistURL())
+		audioResp, err := client.Get(ctx, p.AudioPlaylistURL)
 		if err != nil {
 			if consecutiveErrors++; consecutiveErrors >= 5 {
 				return fmt.Errorf("get audio playlist: %w", err)
