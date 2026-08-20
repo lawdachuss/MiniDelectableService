@@ -289,6 +289,11 @@ func (ch *Channel) persistLog(line string) {
 
 	username := ch.Config.Username
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC [%s] persist log: %v", username, r)
+			}
+		}()
 		db := server.GetDBClient()
 		if db == nil {
 			return // Supabase not configured (local/isolated mode) — nothing to do
@@ -586,6 +591,11 @@ func (ch *Channel) PauseWithReason(reason entity.PauseReason) {
 	// Finalize any in-progress files immediately so they can be uploaded
 	// and removed when `DeleteLocalAfterUpload` is enabled.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch.Error("pause cleanup panic recovered: %v", r)
+			}
+		}()
 		if err := ch.Cleanup(CloseProcess); err != nil {
 			ch.Error("cleanup on pause: %s", err.Error())
 		}
@@ -663,6 +673,11 @@ func (ch *Channel) Resume(_ int) {
 	ch.monitorWg.Add(1)
 	go func() {
 		defer ch.monitorWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				ch.Error("monitor panic recovered: %v", r)
+			}
+		}()
 		// Check again right before starting monitor
 		select {
 		case <-ch.done:
@@ -834,6 +849,11 @@ func (ch *Channel) finishMonitor() {
 		ch.monitorWg.Add(1)
 		go func() {
 			defer ch.monitorWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					ch.Error("monitor panic recovered: %v", r)
+				}
+			}()
 			ch.Monitor(runID)
 		}()
 	}

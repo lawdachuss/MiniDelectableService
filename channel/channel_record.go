@@ -359,6 +359,7 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 // the recording and benching the channel for the full offline interval.
 func (ch *Channel) resolveWatchEnd(ctx context.Context, s site.Site, req *internal.Req, watchErr error) error {
 	if watchErr == nil {
+		ch.setCloseReason("stream ended normally")
 		return nil
 	}
 	if errors.Is(watchErr, internal.ErrStreamStalled) {

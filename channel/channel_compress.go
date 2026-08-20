@@ -73,6 +73,11 @@ func (ch *Channel) CompressFile(srcPath, endReason string) {
 	ch.UploadWg.Add(1)
 	go func() {
 		defer ch.UploadWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				ch.Error("compress panic recovered: %v", r)
+			}
+		}()
 
 		// Track active compression jobs so the UI can show the indicator
 		atomic.AddInt32(&ch.CompressingCount, 1)

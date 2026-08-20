@@ -122,6 +122,11 @@ func (ch *Channel) flushPending() {
 	ch.pendingWg.Add(1)
 	go func() {
 		defer ch.pendingWg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				ch.Error("flush pending panic recovered: %v", r)
+			}
+		}()
 		for _, pf := range files {
 			ch.processPendingFile(pf)
 		}
