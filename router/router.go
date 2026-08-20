@@ -94,6 +94,9 @@ func SetupViews(r *gin.Engine) {
 	r.POST("/api/orphans/rescan", RescanOutputDir)
 	r.DELETE("/api/orphans", DeleteOrphans)
 
+	// Node-local disk inventory
+	r.GET("/api/files", ListNodeFiles)
+
 	// Thumbnail proxy API
 	r.GET("/api/thumb/:username", ServeLiveThumb)
 

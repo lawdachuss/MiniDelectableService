@@ -648,7 +648,28 @@ func (m *Manager) ScanThumbnails() {
 
 	for _, dir := range dirs {
 		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() {
+			if err != nil {
+				return nil
+			}
+			if info == nil {
+				return nil
+			}
+			// Skip the entire ".pending" tree — it holds un-merged short
+			// segments, ".merging-*" merge scratch files, and quarantined
+			// corrupt files that the merge/recovery flow owns.  Thumbnailing
+			// them here races an in-flight merge: ffmpeg reads the scratch
+			// mid-write and crashes with exit 0xbebbb1b7 on Windows (observed
+			// fleet-wide), then the same corrupt file is re-hammered on every
+			// scan (thumbRetryCooldown only lasts 45 min).
+			if info.IsDir() {
+				if info.Name() == ".pending" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			// Defensive: never thumbnail a ".merging-*" merge scratch even if
+			// one somehow lands outside .pending.
+			if strings.Contains(info.Name(), ".merging-") {
 				return nil
 			}
 			ext := strings.ToLower(filepath.Ext(path))

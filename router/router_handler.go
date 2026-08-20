@@ -1061,6 +1061,66 @@ func ListOrphans(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"orphans": scanOrphanFiles()})
 }
 
+// fileEntry describes a video file present on the node's disk.
+type fileEntry struct {
+	Path     string `json:"path"`
+	Filename string `json:"filename"`
+	Size     int64  `json:"size"`
+	ModTime  string `json:"modTime"`
+}
+
+// scanAllVideoFiles lists every completed video file (mp4/mkv) in videos/ and
+// the configured OutputDir, excluding sidecar/scratch/pending artifacts.
+// Unlike scanOrphanFiles it does not filter against the recordings table — it
+// reports everything on disk so operators can locate recordings that exist
+// locally but were never thumbnailed (or never uploaded).
+func scanAllVideoFiles() []fileEntry {
+	dirs := []string{"videos"}
+	if server.Config != nil && server.Config.OutputDir != "" {
+		dirs = append(dirs, server.Config.OutputDir)
+	}
+
+	var files []fileEntry
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			ext := strings.ToLower(filepath.Ext(name))
+			if ext != ".mp4" && ext != ".mkv" {
+				continue
+			}
+			if strings.Contains(name, ".video.") || strings.Contains(name, ".audio.") || strings.Contains(name, ".muxed.") {
+				continue
+			}
+			if channel.IsFinalizingTemp(name) || strings.Contains(name, ".deleting.") || strings.Contains(name, ".merging") {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			files = append(files, fileEntry{
+				Path:     filepath.Join(dir, name),
+				Filename: name,
+				Size:     info.Size(),
+				ModTime:  info.ModTime().Format(time.RFC3339),
+			})
+		}
+	}
+	return files
+}
+
+// ListNodeFiles returns every completed video file present on this node's disk.
+func ListNodeFiles(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"files": scanAllVideoFiles()})
+}
+
 // scanOrphanFiles scans videos/ and the configured OutputDir for video files
 // that exist on disk but have no Supabase recording entry (orphans).
 // Sidecar parts (.video./.audio./.muxed.) are excluded — they are handled by
