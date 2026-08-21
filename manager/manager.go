@@ -737,6 +737,17 @@ func (m *Manager) ScanThumbnails() {
 				if err := server.SavePreviewLinks(info.Name(), newThumb, newSprite, newPreview); err != nil {
 					log.Printf("[thumb] failed to save preview links for %s: %v", info.Name(), err)
 				}
+				// Also sync the generated thumbnail onto the recordings row so
+				// the video card can display it.  The upload pipeline already
+				// sets thumbnail_url at save time, but recordings whose
+				// thumbnail was backfilled here (source file still on disk)
+				// never had their recordings row updated — leaving rows with a
+				// preview_images entry but a null thumbnail_url.
+				if newThumb != "" {
+					if err := server.UpdateRecordingThumbnails(info.Name(), newThumb, newSprite, newPreview); err != nil {
+						log.Printf("[thumb] failed to update recording thumbnails for %s: %v", info.Name(), err)
+					}
+				}
 			} else if channel.IsUnreadableVideo(path) {
 				// Generation failed AND the file cannot even be probed — a
 				// permanently-corrupt recording.  Counting every failed scan
