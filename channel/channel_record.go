@@ -278,6 +278,7 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 	_ = server.Manager.SaveConfig()
 	ch.Sequence = 0
 	ch.Viewers = streamInfo.NumUsers
+	ch.Tags = streamInfo.Tags
 	if ch.LiveThumbURL != streamInfo.LiveThumbURL {
 		ch.LiveThumbURL = streamInfo.LiveThumbURL
 		ch.Update()
