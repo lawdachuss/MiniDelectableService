@@ -176,6 +176,29 @@ func isUploadRateLimited(err error) bool {
 		strings.Contains(msg, "too many requests")
 }
 
+// isFailFastError reports whether an upload error means the host is dead
+// (DNS failure, connection refused/reset, timeout) or actively rate-limiting
+// us.  In either case retrying the SAME host is futile and, for rate limits,
+// actually makes things worse (it extends the rate-limit window).  Callers
+// should bail on the current host and let their fallback chain (Pixhost →
+// ImgBB → Catbox, or Catbox → ImgBB) try the next host instead.
+func isFailFastError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isUploadRateLimited(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "eof")
+}
+
 // uploadBackoff returns the appropriate backoff duration based on whether
 // the error was a rate-limit hit. Rate limits get a longer 30s+10s/attempt,
 // while other errors use standard exponential delay.

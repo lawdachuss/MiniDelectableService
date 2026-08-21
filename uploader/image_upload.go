@@ -30,7 +30,10 @@ func NewMultiImageUploader() *MultiImageUploader {
 }
 
 // uploadWithRetries tries fn up to maxAttempts times with exponential
-// backoff and returns the result of the first successful call.
+// backoff and returns the result of the first successful call.  If a single
+// attempt fails because the host is dead or rate-limiting us, it bails
+// immediately (no pointless retries on that host) so the caller's fallback
+// chain can move on to the next host.
 func uploadWithRetries(maxAttempts int, label string, fn func() (string, error)) (url string, err error) {
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -42,6 +45,11 @@ func uploadWithRetries(maxAttempts int, label string, fn func() (string, error))
 			return u, nil
 		}
 		lastErr = e
+		// Dead or rate-limiting host — don't keep hammering it; let the
+		// fallback (Pixhost → ImgBB → Catbox) try the next host now.
+		if isFailFastError(e) {
+			return "", e
+		}
 	}
 	return "", lastErr
 }

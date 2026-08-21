@@ -77,8 +77,10 @@ func (u *CatboxUploader) Upload(filePath string) (string, error) {
 		lastErr = err
 
 		// Only retry on transient errors: network/IO failures or server errors.
-		// Client-side errors (file not found, bad response format) are fatal.
-		if isRetryableCatboxError(err) {
+		// Client-side errors (file not found, bad response format) and a dead
+		// or rate-limiting host are fatal here — bail so the caller's fallback
+		// (Catbox → ImgBB) can try the next host instead of hammering this one.
+		if isRetryableCatboxError(err) && !isFailFastError(err) {
 			continue
 		}
 
