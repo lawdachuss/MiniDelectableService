@@ -226,9 +226,9 @@ func main() {
 				Value: "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}",
 			},
 			&cli.IntFlag{
-				Name:  "max-duration",
-				Usage: "Split video into segments every N minutes ('0' to disable)",
-				Value: 60,
+			Name:  "max-duration",
+			Usage: "Split video into segments every N minutes ('0' to disable)",
+			Value: 90,
 			},
 			&cli.IntFlag{
 				Name:  "max-filesize",
