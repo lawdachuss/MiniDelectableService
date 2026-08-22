@@ -545,6 +545,37 @@ func (c *Client) GetAllRecordings() ([]Recording, error) {
 	return recordings, err
 }
 
+// CountRecordings returns the total number of recording rows in Supabase using
+// PostgREST's exact-count header, so we never have to download every row just
+// to show a tally on the admin panel.
+func (c *Client) CountRecordings() (int, error) {
+	req, err := http.NewRequest("GET", c.URL+"/rest/v1/recordings?select=id", nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("apikey", c.APIKey)
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Prefer", "count=exact")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	// PostgREST returns the total in "Content-Range: <start>-<end>/<total>"
+	// (or "*/<total>" when no rows match).
+	cr := resp.Header.Get("Content-Range")
+	if idx := strings.LastIndex(cr, "/"); idx >= 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(cr[idx+1:])); err == nil {
+			return n, nil
+		}
+	}
+	return 0, fmt.Errorf("could not parse Content-Range: %q", cr)
+}
+
 // DeleteRecording removes a recording
 func (c *Client) DeleteRecording(filename string) error {
 	return c.delete(fmt.Sprintf("/recordings?filename=eq.%s", url.QueryEscape(filename)))

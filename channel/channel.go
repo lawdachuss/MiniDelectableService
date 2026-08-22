@@ -90,6 +90,12 @@ type Channel struct {
 
 	File           *os.File
 	mp4InitSegment []byte
+	// finalizeOnExit gates the deferred cleanup in RecordStream. When a stream
+	// ends in a soft stall (HLS token refresh / CDN hiccup while the model is
+	// still live) we keep the output file open across the reconnect so the
+	// whole live session lands in ONE recording instead of a chain of ~20-min
+	// fragments; finalizeOnExit is cleared in that case.
+	finalizeOnExit bool
 	Config         *entity.ChannelConfig
 
 	fileMu     sync.RWMutex // protects File, mp4InitSegment, Duration, Filesize, TotalDiskUsageBytes

@@ -133,6 +133,119 @@ type AdminData struct {
 	TotalNodeLoad   int
 	PoolMode        string
 	MyNodeID        string
+
+	// Recording reconciliation: on-disk recordings vs Supabase metadata, to
+	// surface recordings that were produced locally but never reached the cloud.
+	Recon *RecordingReconciliation
+}
+
+// RecordingReconciliation compares recordings physically present on THIS node's
+// disk against the persistent Supabase metadata store. It exists to answer the
+// question "are we actually losing recordings?": any on-disk file with no
+// Supabase row that is NOT currently in the upload pipeline is a prime loss
+// candidate (GitHub Actions runner disks are ephemeral and wiped between runs).
+//
+// NOTE: the recordings table is NOT node-scoped (Recording has no node_id), so
+// SupabaseTotal is a GLOBAL count across the whole fleet, while the on-disk
+// numbers are for this node only. The meaningful loss signal is Stuck, not the
+// raw local-vs-global delta.
+type RecordingReconciliation struct {
+	LocalFiles      int    // completed video files currently on this node's disk
+	LocalBytesHuman string // human-readable total size of LocalFiles
+	SupabaseTotal   int    // GLOBAL recording rows in Supabase (all nodes)
+	HasSupabase     bool   // true when the count query succeeded
+	Orphans         int    // on-disk files with no Supabase metadata row
+	OrphanBytesHuman string
+	InFlight        int    // files currently queued/active in the upload pipeline
+	// Stuck = orphan files not in the upload pipeline AND older than the
+	// stuck threshold — the real "permanently lost" candidates.
+	Stuck          int
+	StuckBytesHuman string
+	Verdict        string // "healthy" | "warning" | "critical"
+	VerdictDetail  string
+}
+
+// stuckOrphanThreshold: an orphan younger than this is assumed still working
+// its way through the upload pipeline; older than this with no upload activity
+// is treated as stranded.
+const stuckOrphanThreshold = 30 * time.Minute
+
+// computeRecordingReconciliation builds the RecordingReconciliation for the
+// admin panel from the on-disk scan helpers and the live upload state.
+func computeRecordingReconciliation(uploads *entity.UploadsResponse) *RecordingReconciliation {
+	r := &RecordingReconciliation{}
+
+	local := scanAllVideoFiles()
+	var localBytes int64
+	for _, f := range local {
+		localBytes += f.Size
+	}
+	r.LocalFiles = len(local)
+	r.LocalBytesHuman = humanBytes(localBytes)
+
+	if dbClient := server.GetDBClient(); dbClient != nil {
+		if n, err := dbClient.CountRecordings(); err == nil {
+			r.SupabaseTotal = n
+			r.HasSupabase = true
+		}
+	}
+
+	// in-flight filenames (queued + actively uploading)
+	inFlight := map[string]bool{}
+	if uploads != nil {
+		for _, p := range uploads.Pending {
+			inFlight[p.Filename] = true
+		}
+		for _, a := range uploads.Active {
+			inFlight[a.Filename] = true
+		}
+	}
+	r.InFlight = len(inFlight)
+
+	orphans := scanOrphanFiles()
+	var orphanBytes, stuckBytesAcc int64
+	now := time.Now()
+	for _, o := range orphans {
+		orphanBytes += o.Size
+		mod, err := time.Parse(time.RFC3339, o.ModTime)
+		if err != nil {
+			continue
+		}
+		if !inFlight[o.Filename] && now.Sub(mod) > stuckOrphanThreshold {
+			r.Stuck++
+			stuckBytesAcc += o.Size
+		}
+	}
+	r.Orphans = len(orphans)
+	r.OrphanBytesHuman = humanBytes(orphanBytes)
+	r.StuckBytesHuman = humanBytes(stuckBytesAcc)
+
+	switch {
+	case r.Stuck > 0:
+		r.Verdict = "critical"
+		r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no cloud metadata and are not in the upload pipeline — likely permanent loss.", r.Stuck)
+	case r.Orphans > r.InFlight:
+		r.Verdict = "warning"
+		r.VerdictDetail = fmt.Sprintf("%d orphan file(s) exceed the active upload queue (%d); verify the upload pipeline is draining.", r.Orphans-r.InFlight, r.InFlight)
+	default:
+		r.Verdict = "healthy"
+		r.VerdictDetail = "Every on-disk recording is either in Supabase or currently moving through the upload pipeline."
+	}
+	return r
+}
+
+// humanBytes formats a byte count into a short human-readable string.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // AdminPage renders the admin panel with deep upload/orphan matrices.
@@ -227,6 +340,7 @@ func AdminPage(c *gin.Context) {
 		Disk:     server.GetDiskInfo(),
 		Uploads:  uploads,
 		Orphans:  orphans,
+		Recon:    computeRecordingReconciliation(uploads),
 
 		SessionActive:    sessionActive,
 		SessionRemaining: sessionRemaining,

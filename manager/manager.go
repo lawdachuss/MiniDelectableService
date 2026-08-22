@@ -1077,12 +1077,22 @@ func (m *Manager) StartSession(d time.Duration) {
 	if d <= 0 {
 		return
 	}
-	// Never start a session that would overrun the runner's hard deadline:
-	// on ephemeral CI runners the VM dies at RUN_DEADLINE and any recording
-	// still in progress at that moment is lost with it.
-	if rd := resolveRunDeadline(); !rd.IsZero() && time.Now().Add(d).After(rd) {
-		log.Printf("[session] refusing to start %s session — would overrun run deadline %s (runner VM dies at run end)", d, rd.Format(time.RFC3339))
-		return
+	// On ephemeral CI runners the VM dies at RUN_DEADLINE, so a session must
+	// finish with enough room left for the final drain (earlyDrainMargin).
+	// Instead of refusing outright — which previously left a node idle for the
+	// rest of its run — clamp the session to fit. Recording continues until the
+	// deadline rather than stopping after the first session.
+	if rd := resolveRunDeadline(); !rd.IsZero() {
+		limit := rd.Add(-earlyDrainMargin)
+		if time.Now().Add(d).After(limit) {
+			fit := time.Until(limit)
+			if fit <= 0 {
+				log.Printf("[session] refusing to start %s session — run deadline %s too close to finish a safe drain (runner VM dies at run end)", d, rd.Format(time.RFC3339))
+				return
+			}
+			log.Printf("[session] clamping session from %s to %s to finish before run deadline %s", d.Round(time.Second), fit.Round(time.Second), rd.Format(time.RFC3339))
+			d = fit
+		}
 	}
 	m.sessionMu.Lock()
 	m.sessionDuration = d // persist so CreateChannelFromAssignment can restart the session later
@@ -1101,6 +1111,11 @@ func (m *Manager) StartSession(d time.Duration) {
 // delays (close/merge/enqueue), throughput-estimate error, and the
 // keep-alive's exit grace.
 const earlyDrainMargin = 20 * time.Minute
+
+// sessionResumeMin is the minimum remaining time worth starting a new session
+// for after a session-boundary rebalance. Below this we stay stopped so we
+// don't spin up a trivially-short session right before the runner dies.
+const sessionResumeMin = 5 * time.Minute
 
 // defaultUploadThroughput is used when no upload has been observed yet (or
 // uploads are stalled): a conservative aggregate rate so a freshly-queued
@@ -1232,17 +1247,27 @@ sessionWait:
 		log.Println("[session] upload-complete.flag written")
 	}
 
-	// Final-drain rule: if the next full session would overrun the runner's
-	// hard deadline, do NOT resume. The workflow tears the VM down at the
-	// deadline, so channels resumed now would record straight into a doomed
-	// tail whose files die with the VM. Stay stopped instead; the boundary
-	// rebalance above already released this node's claims.
-	if rd := resolveRunDeadline(); !rd.IsZero() && time.Now().Add(d).After(rd) {
-		log.Printf("[session] next session would overrun run deadline %s — staying stopped after final drain", rd.Format(time.RFC3339))
+	// Resume for the remainder of the run instead of going idle. Each cycle is
+	// clamped to finish before RUN_DEADLINE (see StartSession), so we keep
+	// recording right up to the VM teardown rather than leaving channels
+	// unrecorded for the rest of the workflow.
+	if rd := resolveRunDeadline(); !rd.IsZero() {
+		limit := rd.Add(-earlyDrainMargin)
+		fit := time.Until(limit)
+		if fit < sessionResumeMin {
+			log.Printf("[session] run deadline %s too close for another session — staying stopped after final drain", rd.Format(time.RFC3339))
+			m.sessionMu.Lock()
+			m.sessionStarted = false
+			m.sessionStopped = true
+			m.sessionMu.Unlock()
+			return
+		}
+		log.Printf("[session] starting next session (clamped to %s) before run deadline %s", fit.Round(time.Second), rd.Format(time.RFC3339))
 		m.sessionMu.Lock()
 		m.sessionStarted = false
-		m.sessionStopped = true
+		m.sessionStopped = false
 		m.sessionMu.Unlock()
+		go m.sessionLoop(fit)
 		return
 	}
 

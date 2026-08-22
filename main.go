@@ -335,7 +335,7 @@ func main() {
 				Name:    "min-duration-before-upload",
 				Usage:   "Minimum video duration in seconds before uploading; shorter videos wait and merge with the next recording (0 = disabled)",
 				EnvVars: []string{"MIN_DURATION_BEFORE_UPLOAD"},
-				Value:   1200,
+				Value:   60,
 			},
 			&cli.StringFlag{
 				Name:    "voesx-api-key",

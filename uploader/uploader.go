@@ -113,6 +113,26 @@ type MultiHostUploader struct {
 	hostInitOnce  sync.Once
 	hosts         map[string]uploaderFunc // host name -> upload function, lazy-init
 	progress      ProgressFunc
+	disabledHosts map[string]bool         // hosts disabled for the rest of this run
+	disabledMu    sync.Mutex
+}
+
+// DisableHost marks a host as unavailable for the remainder of this run (e.g.
+// VOE.sx once its storage quota is exhausted), so we stop retrying it on every
+// file and spamming the same unrecoverable error.
+func (m *MultiHostUploader) DisableHost(name string) {
+	m.disabledMu.Lock()
+	if m.disabledHosts == nil {
+		m.disabledHosts = map[string]bool{}
+	}
+	m.disabledHosts[name] = true
+	m.disabledMu.Unlock()
+}
+
+func (m *MultiHostUploader) isHostDisabled(name string) bool {
+	m.disabledMu.Lock()
+	defer m.disabledMu.Unlock()
+	return m.disabledHosts[name]
 }
 
 type uploaderFunc func(string, ProgressFunc) (string, error)
@@ -238,6 +258,10 @@ func (m *MultiHostUploader) UploadSelected(filePath string, hosts []string) []Up
 
 	progressFn := m.progress
 	for _, name := range hosts {
+		if m.isHostDisabled(name) {
+			m.log.Info("upload: skipping disabled host %s for %s", name, filePath)
+			continue
+		}
 		uploadFn, ok := m.hosts[name]
 		if !ok {
 			continue
@@ -247,6 +271,15 @@ func (m *MultiHostUploader) UploadSelected(filePath string, hosts []string) []Up
 			defer wg.Done()
 			m.log.Info("upload: starting %s upload for %s", host, filePath)
 			link, err := fn(filePath, progressFn)
+			if err != nil {
+				m.log.Error("upload: %s failed for %s: %v", host, filePath, err)
+				if isVoeStorageFull(err) {
+					m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
+					m.DisableHost(host)
+				}
+			} else {
+				m.log.Info("upload: %s successful for %s: %s", host, filePath, link)
+			}
 			mu.Lock()
 			results = append(results, UploadResult{
 				Host:         host,
@@ -254,11 +287,6 @@ func (m *MultiHostUploader) UploadSelected(filePath string, hosts []string) []Up
 				Error:        err,
 			})
 			mu.Unlock()
-			if err != nil {
-				m.log.Error("upload: %s failed for %s: %v", host, filePath, err)
-			} else {
-				m.log.Info("upload: %s successful for %s: %s", host, filePath, link)
-			}
 		}(name, uploadFn)
 	}
 
@@ -286,6 +314,10 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 	progressFn := m.progress
 
 	for _, host := range priorityHosts {
+		if m.isHostDisabled(host) {
+			m.log.Info("upload: skipping disabled host %s for %s", host, filePath)
+			continue
+		}
 		fn, ok := m.hosts[host]
 		if !ok {
 			continue
@@ -295,6 +327,10 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 		results = append(results, UploadResult{Host: host, DownloadLink: link, Error: err})
 		if err != nil {
 			m.log.Error("upload: %s (priority) failed for %s: %v", host, filePath, err)
+			if isVoeStorageFull(err) {
+				m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
+				m.DisableHost(host)
+			}
 		} else {
 			m.log.Info("upload: %s (priority) successful for %s: %s", host, filePath, link)
 		}

@@ -2176,6 +2176,21 @@ func mergeVideos(inputs []string, outputPath string) error {
 // so the caller should stop processing it.  Returns false when the caller
 // should proceed with its normal upload logic (only when the feature is
 // disabled or the video meets the threshold with no pending segments).
+// isDefinitiveStop reports whether the recording ended for good (channel went
+// offline / was handed off / stopped) rather than pausing to reconnect a
+// briefly-expired HLS session. On a definitive stop we flush pending segments
+// even below the min-duration threshold so short-but-real recordings are not
+// discarded (and later deleted after 24h).
+func isDefinitiveStop(endReason string) bool {
+	if endReason == "" {
+		return false
+	}
+	if strings.Contains(endReason, "reconnecting") {
+		return false
+	}
+	return true
+}
+
 func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 	// The fragment's end reason is only knowable right now — once a short
 	// fragment is parked in .pending (and later merged) the reason would be
@@ -2282,13 +2297,16 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 		}
 
 		mergedDur, probeErr := VideoDurationSeconds(mergedPath)
-		if probeErr != nil || mergedDur < float64(minDur) {
-			if probeErr != nil {
-				ch.Warn("min-duration: could not probe merged output (%v) — holding it in pending, NOT uploading", probeErr)
-			} else {
-				ch.Warn("min-duration: merged output for %s is %.1fs (< %ds) — holding it in pending, NOT uploading",
-					filepath.Base(mergedPath), mergedDur, minDur)
-			}
+		holdPending := false
+		if probeErr != nil {
+			ch.Warn("min-duration: could not probe merged output (%v) — holding it in pending, NOT uploading", probeErr)
+			holdPending = true
+		} else if mergedDur < float64(minDur) && !isDefinitiveStop(endReason) {
+			ch.Warn("min-duration: merged output for %s is %.1fs (< %ds) — holding it in pending, NOT uploading",
+				filepath.Base(mergedPath), mergedDur, minDur)
+			holdPending = true
+		}
+		if holdPending {
 			// The current video is already incorporated into the merged output:
 			// drop the original and park the consolidated file with the pending
 			// segments so nothing below the threshold is ever uploaded.
@@ -2404,11 +2422,11 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 			return true
 		}
 
-		if mergedDur >= float64(minDur) {
+		if mergedDur >= float64(minDur) || isDefinitiveStop(endReason) {
 			for _, s := range mergeInputs {
 				os.Remove(s)
 			}
-			ch.Info("min-duration: merged %d segments = %.1fs (>= %ds) — uploading", len(mergeInputs), mergedDur, minDur)
+			ch.Info("min-duration: merged %d segments = %.1fs — uploading (definitive stop flush)", len(mergeInputs), mergedDur)
 			mu.Unlock()
 
 			// Rename the unique scratch output to the STABLE merged-* name and
@@ -2443,7 +2461,18 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 			mu.Unlock()
 		}
 	} else {
+		var lone string
+		if len(segments) == 1 {
+			lone = segments[0]
+		}
 		mu.Unlock()
+		if lone != "" && isDefinitiveStop(endReason) {
+			ch.Info("min-duration: definitive stop — uploading lone pending segment %s", filepath.Base(lone))
+			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(lone)
+			if UploadOrphanedFile(lone, thumbURL, spriteURL, previewURL) {
+				_ = os.Remove(lone)
+			}
+		}
 	}
 
 	return true // video was deferred to pending (or merged+uploaded)

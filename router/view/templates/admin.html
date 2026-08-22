@@ -382,6 +382,46 @@
         .btn-delete { background: rgba(239,68,68,0.15); color: #ef4444; }
         .btn-delete:hover { background: rgba(239,68,68,0.25); }
 
+        /* Recording reconciliation */
+        .recon-verdict {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .recon-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .recon-verdict-text { font-weight: 800; letter-spacing: 0.05em; }
+        .recon-verdict-detail { color: var(--text-muted); }
+        .recon-healthy { background: rgba(16,185,129,0.12); }
+        .recon-healthy .recon-dot { background: #10b981; }
+        .recon-healthy .recon-verdict-text { color: #10b981; }
+        .recon-warning { background: rgba(245,158,11,0.12); }
+        .recon-warning .recon-dot { background: #f59e0b; }
+        .recon-warning .recon-verdict-text { color: #f59e0b; }
+        .recon-critical { background: rgba(239,68,68,0.12); }
+        .recon-critical .recon-dot { background: #ef4444; }
+        .recon-critical .recon-verdict-text { color: #ef4444; }
+        .recon-critical-text { color: #ef4444 !important; font-weight: 700; }
+        .recon-note {
+            margin-top: 12px;
+            font-size: 11px;
+            color: var(--text-muted);
+            background: rgba(255,255,255,0.03);
+            border-left: 2px solid rgba(255,255,255,0.12);
+            padding: 8px 10px;
+            border-radius: 0 6px 6px 0;
+            line-height: 1.5;
+        }
+
         .edit-link {
             font-size: 11px;
             font-weight: 600;
@@ -936,6 +976,52 @@
     </details>
 
     <!-- ════════ SYSTEM HEALTH ════════ -->
+    <!-- ════════ RECORDING RECONCILIATION ════════ -->
+    <details class="section" open>
+        <summary><span class="arrow">▶</span> Recording Reconciliation</summary>
+        <div class="section-body">
+            {{ if .Recon }}
+            <div class="recon-verdict recon-{{ .Recon.Verdict }}">
+                <span class="recon-dot"></span>
+                <span class="recon-verdict-text">
+                    {{ if eq .Recon.Verdict "critical" }}CRITICAL
+                    {{ else if eq .Recon.Verdict "warning" }}WARNING
+                    {{ else }}HEALTHY{{ end }}
+                </span>
+                <span class="recon-verdict-detail">{{ .Recon.VerdictDetail }}</span>
+            </div>
+            <div class="detail-grid" style="margin-top:12px">
+                <div class="detail-item">
+                    <div class="label">On this node's disk</div>
+                    <div class="val">{{ .Recon.LocalFiles }} files · {{ .Recon.LocalBytesHuman }}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">In Supabase (global)</div>
+                    <div class="val">{{ if .Recon.HasSupabase }}{{ .Recon.SupabaseTotal }} rows{{ else }}unavailable{{ end }}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Orphans (no metadata)</div>
+                    <div class="val">{{ .Recon.Orphans }} files · {{ .Recon.OrphanBytesHuman }}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">In upload pipeline</div>
+                    <div class="val">{{ .Recon.InFlight }} files</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Stuck / likely lost</div>
+                    <div class="val {{ if gt .Recon.Stuck 0 }}recon-critical-text{{ end }}">{{ .Recon.Stuck }} files · {{ .Recon.StuckBytesHuman }}</div>
+                </div>
+            </div>
+            <div class="recon-note">
+                Supabase totals are fleet-wide (recordings aren't node-scoped), while disk counts are for this node only.
+                The reliable loss signal is <b>Stuck</b> — files on disk with no cloud metadata that aren't being uploaded.
+            </div>
+            {{ else }}
+            <div class="empty-state">Reconciliation unavailable.</div>
+            {{ end }}
+        </div>
+    </details>
+
     <details class="section">
         <summary><span class="arrow">▶</span> System Health</summary>
         <div class="section-body">
