@@ -1,7 +1,6 @@
 package channel
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -538,29 +537,13 @@ func (ch *Channel) handleSegmentForMonitor(runID uint64, b []byte, duration floa
 	}
 
 	if isMP4InitSegment(b) {
-		// A different init segment arriving mid-recording is a genuine HLS
-		// discontinuity (the CDN issued a fresh init after a token/edge change).
-		// A single MP4 cannot hold two different inits, so finalize the current
-		// file and start a new one rather than corrupting playback by appending
-		// incompatible fragments. With the same init (the common token-refresh
-		// case) we keep appending to the open file — the whole session stays in
-		// one recording.
-		if ch.mp4InitSegment != nil && ch.Filesize > 0 && !bytes.Equal(b, ch.mp4InitSegment) {
-			if cerr := ch.cleanupLocked(); cerr != nil {
-				ch.fileMu.Unlock()
-				return fmt.Errorf("rotate on discontinuity: %w", cerr)
-			}
-			filename, gerr := ch.generateFilenameLocked()
-			if gerr != nil {
-				ch.fileMu.Unlock()
-				return fmt.Errorf("rotate on discontinuity: %w", gerr)
-			}
-			if cerr := ch.createNewFileLocked(filename, ch.FileExt); cerr != nil {
-				ch.fileMu.Unlock()
-				return fmt.Errorf("rotate on discontinuity: %w", cerr)
-			}
-			ch.Sequence++
-		}
+		// NOTE: we deliberately do NOT rotate on an init-segment change.
+		// Chaturbate re-issues the fMP4 init segment frequently (often every
+		// few segments), and the first init written at file start stays valid
+		// for the whole live session. Rotating on every change fragmented
+		// recordings into 1-3 min clips. Session continuation in RecordStream
+		// already keeps one file open across token-refresh stalls, which is
+		// what yields long, single recordings.
 		ch.mp4InitSegment = append(ch.mp4InitSegment[:0], b...)
 	}
 	if ch.FileExt == ".mp4" && ch.Filesize == 0 && !isMP4InitSegment(b) && len(ch.mp4InitSegment) > 0 {
