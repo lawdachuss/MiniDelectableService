@@ -247,17 +247,7 @@ func (ch *Channel) Monitor(runID uint64) {
 // segments, writing them live-muxed into a single file.
 func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, req *internal.Req) error {
 	ch.fileMu.Lock()
-	// Resume mode: the previous RecordStream returned a soft stall (HLS token
-	// refresh / CDN hiccup) while the model was still live, and we deliberately
-	// kept the output file open. Reuse that file so the ENTIRE live session is
-	// captured as ONE recording instead of a chain of ~20-min fragments.
-	resume := ch.File != nil
-	if !resume {
-		ch.mp4InitSegment = nil
-	}
-	// Non-resume sessions finalize on exit by default; resumed sessions keep
-	// the file open unless the stream ends definitively.
-	ch.finalizeOnExit = !resume
+	ch.mp4InitSegment = nil
 	ch.fileMu.Unlock()
 
 	streamInfo, err := s.FetchStream(ctx, req, ch.Config.Username)
@@ -298,14 +288,10 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 		return fmt.Errorf("get stream: %w", internal.ErrChannelOffline)
 	}
 
-	// On resume we keep the original session start time and sequence so the
-	// continuous recording retains a single stable identity/filename.
-	if !resume {
-		ch.StreamedAt = time.Now().Unix()
-		ch.Config.StreamedAt = ch.StreamedAt
-		_ = server.Manager.SaveConfig()
-		ch.Sequence = 0
-	}
+	ch.StreamedAt = time.Now().Unix()
+	ch.Config.StreamedAt = ch.StreamedAt
+	_ = server.Manager.SaveConfig()
+	ch.Sequence = 0
 	ch.Viewers = streamInfo.NumUsers
 	ch.Tags = streamInfo.Tags
 	if ch.LiveThumbURL != streamInfo.LiveThumbURL {
@@ -315,33 +301,18 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 
 	playlist, err := chaturbate.FetchPlaylist(ctx, streamInfo.HLSSource, ch.Config.Resolution, ch.Config.Framerate, streamInfo.CDNReferer, streamInfo.MouflonPDKey)
 	if err != nil {
-		if resume {
-			// Transient playlist fetch during a live session: keep the open
-			// file and let the Monitor retry shortly instead of finalizing a
-			// partial recording.
-			return fmt.Errorf("get playlist: %w", err)
-		}
 		return fmt.Errorf("get playlist: %w", err)
 	}
 
-	if !resume {
-		ch.FileExt = playlist.FileExt
-		if err := ch.NextFile(playlist.FileExt); err != nil {
-			return fmt.Errorf("next file: %w", err)
-		}
+	ch.FileExt = playlist.FileExt
+	if err := ch.NextFile(playlist.FileExt); err != nil {
+		return fmt.Errorf("next file: %w", err)
 	}
 
-	// Ensure the file is finalized + uploaded on exit UNLESS we are keeping it
-	// open across a soft stall (set below after the watch result is known).
+	// Ensure the file is cleaned up when this function exits in any case.
 	defer func() {
-		ch.fileMu.Lock()
-		finalize := ch.finalizeOnExit
-		ch.finalizeOnExit = false
-		ch.fileMu.Unlock()
-		if finalize {
-			if err := ch.Cleanup(CloseProcess); err != nil {
-				ch.Error("cleanup on record stream exit: %s", err.Error())
-			}
+		if err := ch.Cleanup(CloseProcess); err != nil {
+			ch.Error("cleanup on record stream exit: %s", err.Error())
 		}
 	}()
 
@@ -391,16 +362,7 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 	watchErr := playlist.WatchSegments(ctx, func(b []byte, duration float64) error {
 		return ch.handleSegmentForMonitor(runID, b, duration)
 	})
-	finalErr := ch.resolveWatchEnd(ctx, s, req, watchErr)
-
-	// A soft stall (model still live, HLS token/CDN hiccup) keeps the file open
-	// so the next RecordStream invocation resumes appending to it — one
-	// recording per live session. Every other outcome finalizes + uploads.
-	keepOpen := errors.Is(finalErr, internal.ErrStreamStalled)
-	ch.fileMu.Lock()
-	ch.finalizeOnExit = !keepOpen
-	ch.fileMu.Unlock()
-	return finalErr
+	return ch.resolveWatchEnd(ctx, s, req, watchErr)
 }
 
 // resolveWatchEnd classifies the error returned by WatchSegments, sets the
