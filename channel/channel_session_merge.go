@@ -36,7 +36,16 @@ type sessionMergeEntry struct {
 var (
 	sessionMergeMu     sync.Mutex
 	sessionMergeByUser = map[string]*sessionMergeEntry{}
+	// sessionMergeLockByUser serializes merges for a single channel so two
+	// finalized cycles can never be merged concurrently (which would race on
+	// the shared running-merge file and the group map).
+	sessionMergeLockByUser sync.Map // map[string]*sync.Mutex
 )
+
+func sessionMergeLock(user string) *sync.Mutex {
+	v, _ := sessionMergeLockByUser.LoadOrStore(user, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 func isReconnectingReason(r string) bool {
 	return strings.Contains(r, "reconnecting")
@@ -60,6 +69,12 @@ func (ch *Channel) trySessionMerge(finalPath, endReason string) bool {
 		return false
 	}
 	user := ch.Config.Username
+
+	// Serialize merges for this channel so concurrent finalizations of the
+	// same session can't race on the running-merge file.
+	lock := sessionMergeLock(user)
+	lock.Lock()
+	defer lock.Unlock()
 
 	sessionMergeMu.Lock()
 	prev := sessionMergeByUser[user]

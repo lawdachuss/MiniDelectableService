@@ -206,6 +206,12 @@ func computeRecordingReconciliation(uploads *entity.UploadsResponse) *RecordingR
 	var orphanBytes, stuckBytesAcc int64
 	now := time.Now()
 	for _, o := range orphans {
+		// Session-continuity merge intermediates are held on disk by design
+		// (no cloud metadata yet) and 0-byte leftovers have no content to lose,
+		// so neither is a "permanent loss" candidate.
+		if o.Size == 0 || strings.Contains(o.Filename, ".merged.") {
+			continue
+		}
 		orphanBytes += o.Size
 		mod, err := time.Parse(time.RFC3339, o.ModTime)
 		if err != nil {
@@ -1215,6 +1221,11 @@ func scanAllVideoFiles() []fileEntry {
 			if channel.IsFinalizingTemp(name) || strings.Contains(name, ".deleting.") || strings.Contains(name, ".merging") {
 				continue
 			}
+			// Session-continuity merge intermediates (.merged.mp4) are held on
+			// disk by design until the live session ends; they are not orphans.
+			if strings.Contains(name, ".merged.") {
+				continue
+			}
 			info, err := e.Info()
 			if err != nil {
 				continue
@@ -1277,6 +1288,11 @@ func scanOrphanFiles() []orphanEntry {
 			// mid-finalize leaves a partial "<base>.finalizing.mp4" behind
 			// that probes as corrupt and must never reach the hosts.
 			if channel.IsFinalizingTemp(name) || strings.Contains(name, ".deleting.") {
+				continue
+			}
+			// Session-continuity merge intermediates (.merged.mp4) are held
+			// intentionally until the live session ends; not orphans.
+			if strings.Contains(name, ".merged.") {
 				continue
 			}
 			if uploaded[name] {
