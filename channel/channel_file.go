@@ -662,6 +662,14 @@ func qualityArgsForEncoder(encoder string, quality int) []string {
 // endReason (why the recording stopped) is forwarded to the pipeline so it is
 // persisted to the recordings row in Supabase.
 func (ch *Channel) MoveToOutputDir(srcPath, endReason string) string {
+	// Central min-duration gate: never upload a sub-threshold recording.
+	// Same-session merge cycles are combined upstream; if the final (merged)
+	// result is still below the threshold it is a genuinely short stream and is
+	// discarded rather than pushed as a small clip.
+	if discardIfBelowMinDuration(ch.Config.Username, srcPath) {
+		return ""
+	}
+
 	// Enqueue the file into the pipeline for thumbnail → upload → metadata → cleanup.
 	// The pipeline handles all lifecycle (semaphore, waitgroup, state persistence).
 	//
@@ -833,6 +841,40 @@ func resolveMinDurationBeforeUpload(username string) int {
 		return server.Config.MinDurationBeforeUpload
 	}
 	return 0
+}
+
+// discardIfBelowMinDuration is the single enforcement point for the
+// "longer videos only" policy: a finalized recording shorter than the
+// min-duration-before-upload threshold is deleted (never uploaded).  Every
+// egress path — the normal upload, the merge flush, and orphan recovery —
+// routes through this so no code path can leak a sub-threshold clip.
+//
+// Without this, the min-duration gate only blocked at PARK time; the
+// definitive-stop flush (handleMinDurationAndMerge) and the lone-segment
+// recovery still uploaded sub-threshold files (with empty end_reason), which
+// is exactly what produced the 16s/21s recordings in the archive.
+//
+// A probe failure is treated as "keep" — we never delete content whose
+// duration we cannot confirm.  When the threshold is disabled (<=0) this is a
+// no-op.
+func discardIfBelowMinDuration(username, path string) bool {
+	minDur := resolveMinDurationBeforeUpload(username)
+	if minDur <= 0 {
+		return false
+	}
+	dur, err := VideoDurationSeconds(path)
+	if err != nil {
+		return false
+	}
+	if dur < float64(minDur) {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			recoveryLogf(path, "min-duration: could not delete sub-threshold file %.1fs (< %ds): %v — leaving it un-uploaded", dur, minDur, rmErr)
+			return true // still treated as discarded: do not upload
+		}
+		recoveryLogf(path, "min-duration: discarded sub-threshold recording %.1fs (< %ds)", dur, minDur)
+		return true
+	}
+	return false
 }
 
 // MaybeDeferToPending checks whether min-duration is enabled and, if so,
@@ -1466,6 +1508,13 @@ func uploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string, thumbM
 	// re-creates it.
 	if _, err := os.Stat(filePath); err != nil {
 		recoveryLogf(filename, "file vanished before upload (%v) — skipping; will be retried", err)
+		return false
+	}
+
+	// Central min-duration gate: orphan recovery must obey the same "longer
+	// videos only" policy as the channel flow, otherwise sub-threshold clips
+	// (e.g. a lone parked segment flushed on a definitive stop) slip through.
+	if discardIfBelowMinDuration(extractUsernameFromFilename(filename), filePath) {
 		return false
 	}
 
@@ -2360,10 +2409,10 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 
 		if ch.Config.Compress {
 			ch.Info("min-duration: merged -> %s (%.1fs), compressing before upload", filepath.Base(mergedPath), mergedDur)
-			ch.CompressFile(mergedPath, "")
+			ch.CompressFile(mergedPath, endReason)
 		} else {
 			ch.Info("min-duration: merged -> %s (%.1fs), proceeding with upload", filepath.Base(mergedPath), mergedDur)
-			ch.MoveToOutputDir(mergedPath, "")
+			ch.MoveToOutputDir(mergedPath, endReason)
 		}
 		return true
 	}
@@ -2448,9 +2497,9 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 				mergedPath = stablePath
 			}
 			if ch.Config.Compress {
-				ch.CompressFile(mergedPath, "")
+				ch.CompressFile(mergedPath, endReason)
 			} else {
-				ch.MoveToOutputDir(mergedPath, "")
+				ch.MoveToOutputDir(mergedPath, endReason)
 			}
 		} else {
 			// Keep pending under the stable name so the next merge dedupes it.
