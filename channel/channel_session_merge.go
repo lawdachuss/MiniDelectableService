@@ -28,9 +28,9 @@ import (
 // individually so nothing is ever lost.
 
 type sessionMergeEntry struct {
-	path               string
-	endedReconnecting bool
-	updatedAt          time.Time
+	path              string
+	endedContinuation bool
+	updatedAt         time.Time
 }
 
 var (
@@ -47,8 +47,19 @@ func sessionMergeLock(user string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-func isReconnectingReason(r string) bool {
-	return strings.Contains(r, "reconnecting")
+// isContinuationReason reports whether endReason means the stream is still live
+// and the next HLS cycle belongs to the SAME session — so fragments must be
+// merged, not uploaded as separate recordings.  Chaturbate rotates its HLS
+// token roughly every 20 minutes; that rotation surfaces as a stall whose
+// reason is "stream session expired (no new segments)" or
+// "...(HLS session/token) — reconnecting".  Both are continuations, not real
+// session ends.  This matches how streamlink, yt-dlp and hls.js handle token
+// expiry: they re-fetch a fresh token and keep the SAME recording going instead
+// of finalizing and starting a new file every ~20 minutes.
+func isContinuationReason(r string) bool {
+	return strings.Contains(r, "reconnecting") ||
+		strings.Contains(r, "stream session expired") ||
+		strings.Contains(r, "no new segments")
 }
 
 func isMaxDurationReason(r string) bool {
@@ -89,16 +100,16 @@ func (ch *Channel) trySessionMerge(finalPath, endReason string) bool {
 			ch.flushSessionEntry(prev)
 		}
 		sessionMergeMu.Lock()
-		sessionMergeByUser[user] = &sessionMergeEntry{path: finalPath, endedReconnecting: false, updatedAt: time.Now()}
+		sessionMergeByUser[user] = &sessionMergeEntry{path: finalPath, endedContinuation: false, updatedAt: time.Now()}
 		sessionMergeMu.Unlock()
 		MarkUploadInFlight(finalPath)
 		return true
 
-	case isReconnectingReason(endReason):
+	case isContinuationReason(endReason):
 		// Continuation of the same live session.
 		if prev == nil {
 			sessionMergeMu.Lock()
-			sessionMergeByUser[user] = &sessionMergeEntry{path: finalPath, endedReconnecting: true, updatedAt: time.Now()}
+			sessionMergeByUser[user] = &sessionMergeEntry{path: finalPath, endedContinuation: true, updatedAt: time.Now()}
 			sessionMergeMu.Unlock()
 			MarkUploadInFlight(finalPath)
 			return true
@@ -115,7 +126,7 @@ func (ch *Channel) trySessionMerge(finalPath, endReason string) bool {
 		}
 		MarkUploadInFlight(merged)
 		sessionMergeMu.Lock()
-		sessionMergeByUser[user] = &sessionMergeEntry{path: merged, endedReconnecting: true, updatedAt: time.Now()}
+		sessionMergeByUser[user] = &sessionMergeEntry{path: merged, endedContinuation: true, updatedAt: time.Now()}
 		sessionMergeMu.Unlock()
 		return true
 
@@ -125,7 +136,7 @@ func (ch *Channel) trySessionMerge(finalPath, endReason string) bool {
 		if prev == nil {
 			return false
 		}
-		if !prev.endedReconnecting {
+		if !prev.endedContinuation {
 			// prev was a max-duration flush start; upload it, then let this
 			// final file upload on its own (the cut boundary is respected).
 			MarkUploadDone(prev.path)

@@ -70,3 +70,43 @@ func TestMergeTwoFiles(t *testing.T) {
 		t.Fatalf("merged2 duration %.1fs < 85%% of %.1fs", dm2, dm+dc)
 	}
 }
+
+// TestContinuationClassification locks the fix for ~20-minute fragmentation:
+// Chaturbate's HLS token rotates every ~20 minutes, surfacing as a stall whose
+// reason is "stream session expired (no new segments)" (or "...— reconnecting").
+// Both must be treated as a continuation of the SAME live session (so fragments
+// merge into one long recording), NOT as a session end. Definitive ends
+// (offline, private show, max duration, handoff, unknown) must remain stops so a
+// merge flushes instead of holding forever.
+func TestContinuationClassification(t *testing.T) {
+	continuations := []string{
+		"stream session expired (no new segments)",
+		"stream session expired (HLS session/token) — reconnecting",
+		"stream session expired (HLS session/token) — reconnecting (site probe failed: 502)",
+	}
+	for _, r := range continuations {
+		if !isContinuationReason(r) {
+			t.Errorf("isContinuationReason(%q) = false, want true (fragment would be uploaded alone)", r)
+		}
+		if isDefinitiveStop(r) {
+			t.Errorf("isDefinitiveStop(%q) = true, want false (would not merge with next cycle)", r)
+		}
+	}
+
+	stops := []string{
+		"channel went offline",
+		"channel entered a private show",
+		"max duration or filesize reached",
+		"channel stopped (handoff)",
+		"stream ended normally",
+		"unknown",
+	}
+	for _, r := range stops {
+		if isContinuationReason(r) {
+			t.Errorf("isContinuationReason(%q) = true, want false", r)
+		}
+		if !isDefinitiveStop(r) {
+			t.Errorf("isDefinitiveStop(%q) = false, want true (merge would never flush)", r)
+		}
+	}
+}

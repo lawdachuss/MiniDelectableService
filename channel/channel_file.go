@@ -2233,15 +2233,18 @@ func mergeVideos(inputs []string, outputPath string) error {
 // should proceed with its normal upload logic (only when the feature is
 // disabled or the video meets the threshold with no pending segments).
 // isDefinitiveStop reports whether the recording ended for good (channel went
-// offline / was handed off / stopped) rather than pausing to reconnect a
-// briefly-expired HLS session. On a definitive stop we flush pending segments
-// even below the min-duration threshold so short-but-real recordings are not
-// discarded (and later deleted after 24h).
+// offline / entered a private show / hit max duration / was handed off /
+// paused) rather than pausing to reconnect a briefly-expired HLS session.
+// Chaturbate rotates its HLS token every ~20 minutes, which shows up as a stall
+// reason of "stream session expired (no new segments)" or "...— reconnecting".
+// Those are continuations, not ends: sub-threshold fragments must be held and
+// merged with the next cycle instead of being uploaded as lone ~20-minute clips
+// (matching streamlink/yt-dlp/hls.js token-refresh behaviour).
 func isDefinitiveStop(endReason string) bool {
 	if endReason == "" {
 		return false
 	}
-	if strings.Contains(endReason, "reconnecting") {
+	if isContinuationReason(endReason) {
 		return false
 	}
 	return true

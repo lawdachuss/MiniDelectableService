@@ -116,3 +116,12 @@ last-run.txt
 
 # Local data backups
 .audit/
+
+# Node coordination / scratch artifacts
+_node_urls.txt
+_nodes.json
+st_manifest.json
+_preview_scan.py
+manager/upload-complete.flag
+*.flag
+
