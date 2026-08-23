@@ -534,6 +534,18 @@ type Playlist struct {
 	FileExt          string        // ".ts" for legacy HLS, ".mp4" for LL-HLS fMP4
 	Client           *internal.Req // reuse the same client that fetched the master playlist
 	MouflonPDKey     string        // Stripchat MOUFLON v2 decryption key; empty for Chaturbate
+
+	// RefreshURL re-fetches fresh HLS playlist URLs after a token/session
+	// expiry (CDN 403). When set, the watch loop calls it on a media-forbidden
+	// error and keeps the SAME open recording file (continuing to append
+	// segments) instead of finalising the current fragment and starting a new
+	// one. This is the root-cause fix for ~20-minute fragmentation: Chaturbate
+	// rotates its HLS token every ~20 minutes, which surfaces as a 403. By
+	// re-fetching a fresh token and continuing — exactly what streamlink,
+	// yt-dlp (--hls-use-mpegts) and hls.js do — a live session stays one
+	// continuous recording up to max duration. May be nil (legacy callers keep
+	// the old finalise-and-reconnect behaviour).
+	RefreshURL func(ctx context.Context) (videoURL, audioURL, rootURL string, err error)
 }
 
 // Resolution represents a video resolution and its corresponding framerate.
@@ -830,6 +842,20 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 		sawNewSegment := false
 		resp, err := client.Get(ctx, p.PlaylistURL)
 		if err != nil {
+			if errors.Is(err, internal.ErrMediaForbidden) && p.RefreshURL != nil {
+				// Token/session expired (CDN 403). Re-fetch a fresh HLS URL and
+				// keep recording into the SAME open file — do NOT finalise and
+				// start a new fragment. This is what keeps a live session
+				// continuous instead of splitting every ~20 minutes.
+				if vURL, aURL, rURL, rerr := p.RefreshURL(ctx); rerr == nil && vURL != "" {
+					p.PlaylistURL = vURL
+					p.AudioPlaylistURL = aURL
+					p.RootURL = rURL
+					consecutiveErrors = 0
+					<-time.After(300 * time.Millisecond)
+					continue
+				}
+			}
 			if consecutiveErrors++; consecutiveErrors >= 5 {
 				return fmt.Errorf("get playlist: %w", err)
 			}
@@ -978,6 +1004,16 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 		// Fetch video playlist
 		videoResp, err := client.Get(ctx, p.PlaylistURL)
 		if err != nil {
+			if errors.Is(err, internal.ErrMediaForbidden) && p.RefreshURL != nil {
+				if vURL, aURL, rURL, rerr := p.RefreshURL(ctx); rerr == nil && vURL != "" {
+					p.PlaylistURL = vURL
+					p.AudioPlaylistURL = aURL
+					p.RootURL = rURL
+					consecutiveErrors = 0
+					<-time.After(300 * time.Millisecond)
+					continue
+				}
+			}
 			if consecutiveErrors++; consecutiveErrors >= 5 {
 				return fmt.Errorf("get video playlist: %w", err)
 			}
@@ -1003,6 +1039,16 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 		// Fetch audio playlist
 		audioResp, err := client.Get(ctx, p.AudioPlaylistURL)
 		if err != nil {
+			if errors.Is(err, internal.ErrMediaForbidden) && p.RefreshURL != nil {
+				if vURL, aURL, rURL, rerr := p.RefreshURL(ctx); rerr == nil && vURL != "" {
+					p.PlaylistURL = vURL
+					p.AudioPlaylistURL = aURL
+					p.RootURL = rURL
+					consecutiveErrors = 0
+					<-time.After(300 * time.Millisecond)
+					continue
+				}
+			}
 			if consecutiveErrors++; consecutiveErrors >= 5 {
 				return fmt.Errorf("get audio playlist: %w", err)
 			}

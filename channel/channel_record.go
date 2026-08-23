@@ -304,6 +304,24 @@ func (ch *Channel) RecordStream(ctx context.Context, runID uint64, s site.Site, 
 		return fmt.Errorf("get playlist: %w", err)
 	}
 
+	// Token-refresh transparency: when Chaturbate rotates the HLS token (~every
+	// 20 min) the CDN returns 403. Instead of finalising the file and starting a
+	// new fragment, the watch loop re-fetches a fresh playlist via this callback
+	// and keeps appending to the same open recording. The callback re-resolves
+	// the live HLS source (new token) the same way the initial playlist was
+	// fetched, so the recording stays one continuous file up to max duration.
+	playlist.RefreshURL = func(rctx context.Context) (string, string, string, error) {
+		si, ferr := s.FetchStream(rctx, req, ch.Config.Username)
+		if ferr != nil || si == nil {
+			return "", "", "", ferr
+		}
+		fp, ferr := chaturbate.FetchPlaylist(rctx, si.HLSSource, ch.Config.Resolution, ch.Config.Framerate, si.CDNReferer, si.MouflonPDKey)
+		if ferr != nil {
+			return "", "", "", ferr
+		}
+		return fp.PlaylistURL, fp.AudioPlaylistURL, fp.RootURL, nil
+	}
+
 	ch.FileExt = playlist.FileExt
 	if err := ch.NextFile(playlist.FileExt); err != nil {
 		return fmt.Errorf("next file: %w", err)

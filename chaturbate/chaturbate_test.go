@@ -272,3 +272,87 @@ func TestWatchSegmentsContinuesAfterSegmentFetchFailure(t *testing.T) {
 		t.Fatalf("handler called %d times, want 2 (seg_1 + seg_3; failed seg_2 must be skipped)", got)
 	}
 }
+
+// TestWatchSegmentsRefreshesOnForbidden verifies the root-cause fix for
+// ~20-minute fragmentation: a CDN 403 (HLS token/session expiry) must trigger
+// RefreshURL, after which the loop keeps writing segments into the SAME open
+// recording instead of returning an error and finalising the fragment. This is
+// what lets a live session stay one continuous file up to max duration.
+func TestWatchSegmentsRefreshesOnForbidden(t *testing.T) {
+	if server.Config == nil {
+		server.Config = &entity.Config{}
+	}
+	server.Config.Debug = false
+
+	var reqCount int32
+	var refreshCalls atomic.Int32
+
+	playlistBody := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		"#EXT-X-TARGETDURATION:2",
+		"#EXT-X-MEDIA-SEQUENCE:100",
+		"#EXT-X-MAP:URI=\"init.mp4\"",
+		"#EXTINF:2.000,",
+		"seg_100.m4s",
+		"#EXTINF:2.000,",
+		"seg_101.m4s",
+		"#EXTINF:2.000,",
+		"seg_102.m4s",
+		"",
+	}, "\n")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/playlist.m3u8", func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&reqCount, 1)
+		if n <= 2 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte(playlistBody))
+	})
+	mux.HandleFunc("/init.mp4", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("init-data"))
+	})
+	for _, s := range []string{"seg_100.m4s", "seg_101.m4s", "seg_102.m4s"} {
+		seg := s
+		mux.HandleFunc("/"+seg, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(seg + "-data"))
+		})
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	pl := &Playlist{
+		PlaylistURL: srv.URL + "/playlist.m3u8",
+		RootURL:     srv.URL + "/",
+	}
+	pl.RefreshURL = func(_ context.Context) (string, string, string, error) {
+		refreshCalls.Add(1)
+		return srv.URL + "/playlist.m3u8", "", srv.URL + "/", nil
+	}
+
+	var handlerCalls atomic.Int32
+	handler := func(_ []byte, _ float64) error {
+		handlerCalls.Add(1)
+		return nil
+	}
+
+	prev := streamStallPolls
+	streamStallPolls = 3
+	t.Cleanup(func() { streamStallPolls = prev })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_ = pl.WatchSegments(ctx, handler)
+
+	if got := refreshCalls.Load(); got < 1 {
+		t.Fatalf("RefreshURL called %d times, want >= 1 (403 must trigger token refresh)", got)
+	}
+	// init + 3 segments = 4 handler calls: recordings continued past the 403s
+	// instead of finalising a fragment.
+	if got := handlerCalls.Load(); got < 4 {
+		t.Fatalf("handler called %d times, want >= 4 (init + 3 segments; 403 must not finalise the recording)", got)
+	}
+}
