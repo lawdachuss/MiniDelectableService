@@ -180,6 +180,12 @@ func (c *Coordinator) runOfflineShuffleCycleWith(db dbShuffler) {
 		if c.Manager != nil && c.Manager.HasPendingSegments(ca.Username) {
 			continue
 		}
+		// Never shuffle a channel that is actively recording live: reassignment
+		// would let another node start a duplicate recording and this node's
+		// reconcile would yank the in-progress file.
+		if c.Manager != nil && c.Manager.IsRecording(ca.Username) {
+			continue
+		}
 		offline = append(offline, ca)
 	}
 	if len(offline) == 0 {
@@ -374,6 +380,18 @@ func (c *Coordinator) runDeadlineMigrationCycleWith(db dbShuffler) {
 				log.Printf("[coordinator] deadline migration: skipping manual-paused %s/%s (user pause preserved)", ca.Site, ca.Username)
 				continue
 			}
+			// Never migrate a channel that is actively recording: pulling it
+			// away mid-recording fragments or strands the in-progress file.
+			// The DB status flag covers other nodes; the local check covers
+			// this node's own imminent drain.
+			if ca.Status == "recording" {
+				log.Printf("[coordinator] deadline migration: skipping recording %s/%s (defer until session ends)", ca.Site, ca.Username)
+				continue
+			}
+			if imm.NodeID == c.NodeID && c.Manager != nil && c.Manager.IsRecording(ca.Username) {
+				log.Printf("[coordinator] deadline migration: skipping locally-recording %s/%s (defer until session ends)", ca.Site, ca.Username)
+				continue
+			}
 			target := leastLoaded(candidates, loadMap)
 			if target.NodeID == imm.NodeID {
 				continue
@@ -451,6 +469,13 @@ func (c *Coordinator) runReconcileCycleWith(db dbShuffler) {
 	// Stop channels no longer assigned to us (e.g. migrated away / reaped).
 	for _, lc := range local {
 		if !dbMap[lc] {
+			// Never interrupt an in-progress live recording: pausing/removing it
+			// would fragment or strand the file.  Defer the removal until the
+			// recording finishes; the next reconcile cycle will catch it.
+			if c.Manager.IsRecording(lc) {
+				log.Printf("[coordinator] reconcile: channel %s is actively recording — deferring removal until recording ends", lc)
+				continue
+			}
 			log.Printf("[coordinator] reconcile: channel %s no longer assigned to this node — stopping", lc)
 			if err := c.Manager.RemoveChannelForReassignment(lc); err != nil {
 				log.Printf("[coordinator] reconcile: remove %s error: %v", lc, err)

@@ -220,6 +220,11 @@ type ChannelManager interface {
 	RemoveChannelForReassignment(username string) error
 	GetLocalChannels() []string
 	HasPendingSegments(username string) bool
+	// IsRecording reports whether the channel is actively writing a live
+	// recording file on THIS node right now.  The shuffle/reconcile/deadline
+	// cycles use it to never reassign, pause, or remove a channel mid-recording
+	// (which would strand or fragment an in-progress recording).
+	IsRecording(username string) bool
 
 	// ManualPausedChannels returns the channels the USER explicitly paused
 	// (pause reason = manual). Automatic paths must never fight these: they

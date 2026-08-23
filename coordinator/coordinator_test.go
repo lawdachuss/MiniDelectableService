@@ -121,6 +121,10 @@ func (m *mockChannelManager) HasPendingSegments(username string) bool {
 	return false
 }
 
+func (m *mockChannelManager) IsRecording(username string) bool {
+	return false
+}
+
 func (m *mockChannelManager) ManualPausedChannels() []ChannelPause {
 	return m.manualPaused
 }
@@ -644,9 +648,59 @@ func timePtr(t time.Time) *time.Time {
 	return &t
 }
 
-// TestRunDeadlineMigrationCycle verifies ALL channels of an imminent-deadline
-// node (including live+recording) are reassigned to the least-loaded healthy
-// node, spreading across candidates.
+// mockChannelManagerWithRecording reports a fixed set of channels as actively
+// recording, used to verify the reconcile loop never removes them mid-recording.
+type mockChannelManagerWithRecording struct {
+	mockChannelManager
+	recordingSet map[string]bool
+}
+
+func (m *mockChannelManagerWithRecording) IsRecording(username string) bool {
+	return m.recordingSet[username]
+}
+
+// TestRunReconcileCycleDefersRecording verifies that a local channel whose DB
+// assignment was removed (e.g. reassigned elsewhere) is NOT stopped/removed
+// while it is actively recording — the removal is deferred until the recording
+// ends, so an in-progress live recording is never fragmented or stranded.
+func TestRunReconcileCycleDefersRecording(t *testing.T) {
+	mock := &mockClient{
+		aliveNodes: []database.Node{{NodeID: "node-a", CurrentLoad: 1}},
+		assignmentsByNode: map[string][]database.ChannelAssignment{
+			// DB assignment for node-a: only "done" is assigned here.
+			// "rec" was reassigned away, so a naive reconcile would stop it.
+			"node-a": {
+				{Username: "done", Site: "chaturbate", Status: "claimed"},
+			},
+		},
+	}
+	mgr := &mockChannelManagerWithRecording{
+		mockChannelManager: mockChannelManager{
+			// Both channels are running locally; "rec" is recording live.
+			created: []*database.ChannelAssignment{{Username: "done"}, {Username: "rec"}},
+		},
+		recordingSet: map[string]bool{"rec": true},
+	}
+	c := &Coordinator{NodeID: "node-a", Mode: entity.PoolModePooled, Manager: mgr}
+
+	c.runReconcileCycleWith(mock)
+
+	// "done" stays assigned (kept); "rec" is recording (deferred) — so nothing
+	// should be removed.
+	if len(mgr.removed) != 0 {
+		t.Fatalf("expected no removals, got %v", mgr.removed)
+	}
+	for _, u := range mgr.removed {
+		if u == "rec" {
+			t.Fatalf("recording channel 'rec' must NOT be removed mid-recording; removed=%v", mgr.removed)
+		}
+	}
+}
+
+
+// are reassigned to the least-loaded healthy node, spreading across candidates
+// — EXCEPT a channel that is actively recording, which is deferred until its
+// session ends so an in-progress recording is never fragmented or stranded.
 func TestRunDeadlineMigrationCycle(t *testing.T) {
 	mock := &mockClient{
 		imminentNodes: []database.Node{{NodeID: "node-x", SessionDeadline: timePtr(time.Now().Add(5 * time.Minute))}},
@@ -666,21 +720,25 @@ func TestRunDeadlineMigrationCycle(t *testing.T) {
 
 	c.runDeadlineMigrationCycleWith(mock)
 
-	if len(mock.reassignCalls) != 2 {
-		t.Fatalf("expected 2 reassigns, got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
+	// Only off1 is migrated; the recording channel live1 is deferred.
+	if len(mock.reassignCalls) != 1 {
+		t.Fatalf("expected 1 reassign (recording channel deferred), got %d: %+v", len(mock.reassignCalls), mock.reassignCalls)
 	}
 	for _, call := range mock.reassignCalls {
 		if call.fromNode != "node-x" {
 			t.Fatalf("reassign from %q, want node-x: %+v", call.fromNode, call)
 		}
+		if call.username == "live1" {
+			t.Fatalf("recording channel live1 must NOT be migrated: %+v", call)
+		}
 		if call.toNode == "node-x" || call.toNode == "node-a" {
 			t.Fatalf("reassign to invalid target %q: %+v", call.toNode, call)
 		}
 	}
-	// Both go to node-z (initially least loaded); node-y must never receive one.
+	// off1 goes to node-z (initially least loaded); node-y must never receive one.
 	for _, call := range mock.reassignCalls {
 		if call.toNode != "node-z" {
-			t.Fatalf("expected all moves to node-z, got %+v", call)
+			t.Fatalf("expected move to node-z, got %+v", call)
 		}
 	}
 }

@@ -534,6 +534,19 @@ func (m *Manager) HasPendingSegments(username string) bool {
 // orphan/pending flows gate with the same threshold the channel flow uses
 // (a channel configured with 1200s in the pool stays gated even when the
 // node's global MIN_DURATION_BEFORE_UPLOAD env var is unset).
+// IsRecording reports whether the channel is actively writing a live recording
+// file on this node right now (CurrentRecordingPath != "").  Used by the
+// coordinator's shuffle/reconcile/deadline cycles so a channel is never
+// reassigned, paused, or removed mid-recording.
+func (m *Manager) IsRecording(username string) bool {
+	if v, ok := m.Channels.Load(username); ok {
+		if ch, ok := v.(*channel.Channel); ok {
+			return ch.CurrentRecordingPath() != ""
+		}
+	}
+	return false
+}
+
 func (m *Manager) ChannelMinDurationBeforeUpload(username string) int {
 	if v, ok := m.Channels.Load(username); ok {
 		if ch, ok := v.(*channel.Channel); ok {
