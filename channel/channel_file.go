@@ -172,6 +172,13 @@ func (ch *Channel) processPendingFile(pf pendingFile) {
 		return
 	}
 
+	// Join consecutive same-session recording cycles into one continuous video
+	// (the HLS token refresh would otherwise split every ~20 minutes).  When
+	// the file is consumed into a merge it is NOT uploaded individually here.
+	if ch.trySessionMerge(finalPath, pf.endReason) {
+		return
+	}
+
 	// If no output dir is configured, recordings can be relocated to the
 	// completed dir (goondvr semantics) before the pipeline runs in place.
 	if server.Config.OutputDir == "" && server.Config.CompletedDir != "" {
