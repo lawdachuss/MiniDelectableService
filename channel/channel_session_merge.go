@@ -200,7 +200,7 @@ func mergeTwoFiles(a, b string) (string, error) {
 	}
 	defer os.Remove(listPath)
 
-	args := []string{"-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy"}
+	args := []string{"-nostdin", "-y", "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy"}
 	if outExt == ".mp4" {
 		args = append(args, "-movflags", "+faststart")
 	}
