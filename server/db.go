@@ -1207,8 +1207,13 @@ func DeleteVideoCompletely(filename string) error {
 // locally too so recording metadata can be rebuilt without re-uploading.
 // The Supabase write remains best-effort (it is the cross-node durable copy).
 func SaveJournalEntry(fileHash, filename, host, status, link string, fileSize int64, errMsg string) error {
+	// Local-first: always try to persist the dedup record locally. But a local
+	// write failure (full/readonly runner disk) must NOT block the Supabase
+	// journal — that's our cross-node source of truth for visibility and dedup.
+	// Previously a local failure returned early and skipped the Supabase write
+	// entirely, going silent exactly when we most need the log.
 	if lErr := saveLocalJournalEntry(fileHash, host, status, link, fileSize, errMsg); lErr != nil {
-		return lErr
+		fmt.Printf("warn: saveLocalJournalEntry failed for %s/%s: %v\n", host, filename, lErr)
 	}
 
 	client := GetDBClient()
