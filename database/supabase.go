@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -182,6 +183,40 @@ func (c *Client) getN(path string, result interface{}, maxRetries int) error {
 	}
 
 	return json.NewDecoder(resp.Body).Decode(result)
+}
+
+// getAllPaginated fetches every row from a PostgREST collection by paging in
+// batches of 1000.  This is independent of the server's max_rows setting
+// (Supabase defaults to 1000), so a single limit=N request that silently
+// truncates at 1000 is replaced by a correct full fetch.  dst must be a pointer
+// to a slice (*[]T); batches are decoded into a fresh slice of the same element
+// type and appended, so it works for any T.
+func (c *Client) getAllPaginated(path string, dst interface{}) error {
+	rv := reflect.ValueOf(dst)
+	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("getAllPaginated: dst must be *[]T, got %T", dst)
+	}
+	sliceType := rv.Elem().Type()
+	const page = 1000
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	for offset := 0; ; offset += page {
+		batchPtr := reflect.New(sliceType)
+		sub := fmt.Sprintf("%s%slimit=%d&offset=%d", path, sep, page, offset)
+		if err := c.get(sub, batchPtr.Interface()); err != nil {
+			return err
+		}
+		batch := batchPtr.Elem()
+		for i := 0; i < batch.Len(); i++ {
+			rv.Elem().Set(reflect.Append(rv.Elem(), batch.Index(i)))
+		}
+		if batch.Len() < page {
+			break
+		}
+	}
+	return nil
 }
 
 func (c *Client) post(path string, body interface{}, result interface{}) error {
@@ -378,7 +413,7 @@ func (c *Client) GetChannel(username string) (*Channel, error) {
 // GetAllChannels retrieves all channels
 func (c *Client) GetAllChannels() ([]Channel, error) {
 	var channels []Channel
-	err := c.get("/channels?order=created_at.desc&limit=50000", &channels)
+	err := c.getAllPaginated("/channels?order=created_at.desc", &channels)
 	return channels, err
 }
 
@@ -434,7 +469,7 @@ func (c *Client) DeleteChannelsNotIn(usernames []string) error {
 	}
 
 	var existing []Channel
-	if err := c.get("/channels?select=username&limit=50000", &existing); err != nil {
+	if err := c.getAllPaginated("/channels?select=username", &existing); err != nil {
 		return err
 	}
 	var toDelete []string
@@ -541,7 +576,7 @@ func (c *Client) GetRecordingsByUsername(username string) ([]Recording, error) {
 // GetAllRecordings retrieves all recordings
 func (c *Client) GetAllRecordings() ([]Recording, error) {
 	var recordings []Recording
-	err := c.get("/recordings?order=timestamp.desc&limit=50000", &recordings)
+	err := c.getAllPaginated("/recordings?order=timestamp.desc", &recordings)
 	return recordings, err
 }
 
@@ -650,7 +685,7 @@ func (c *Client) GetUploadLinks(recordingID string) ([]UploadLink, error) {
 // The caller can group by recording_id for O(1) per-recording lookup.
 func (c *Client) GetAllUploadLinks() ([]UploadLink, error) {
 	var links []UploadLink
-	err := c.get("/upload_links?limit=50000", &links)
+	err := c.getAllPaginated("/upload_links", &links)
 	return links, err
 }
 
@@ -718,10 +753,10 @@ func (c *Client) ListUploadedVideosBelowDuration(thresholdSeconds float64) ([]Re
 
 	// Step 2: recordings with 0 < duration < threshold, keeping only uploaded ones.
 	// The duration filters run server-side so only eligible rows are transferred.
-	path := fmt.Sprintf("/recordings?select=id,username,filename,timestamp,duration,filesize&duration=gt.0&duration=lt.%s&limit=50000",
+	path := fmt.Sprintf("/recordings?select=id,username,filename,timestamp,duration,filesize&duration=gt.0&duration=lt.%s",
 		strconv.FormatFloat(thresholdSeconds, 'f', -1, 64))
 	var recs []Recording
-	if err := c.get(path, &recs); err != nil {
+	if err := c.getAllPaginated(path, &recs); err != nil {
 		return nil, err
 	}
 
@@ -941,7 +976,7 @@ func (c *Client) GetPreviewImage(filename string) (*PreviewImage, error) {
 // GetAllPreviewImages returns all preview images from the database.
 func (c *Client) GetAllPreviewImages() ([]PreviewImage, error) {
 	var images []PreviewImage
-	err := c.get("/preview_images?limit=50000", &images)
+	err := c.getAllPaginated("/preview_images", &images)
 	return images, err
 }
 
@@ -1395,7 +1430,7 @@ func (c *Client) ReleaseNodeOfflineChannels(nodeID string, excludeUsernames []st
 
 	// Count what the PATCH will release (drives the caller's log message).
 	var matches []ChannelAssignment
-	if err := c.get(filter+"&select=username&limit=50000", &matches); err != nil {
+	if err := c.getAllPaginated(filter+"&select=username", &matches); err != nil {
 		return 0, err
 	}
 	if len(matches) == 0 {
@@ -1563,7 +1598,7 @@ func (c *Client) MarkChannelRecording(username, site string) error {
 func (c *Client) RepairOrphanedAssignments() (int, error) {
 	// Step 1: count the broken rows
 	var orphaned []ChannelAssignment
-	err := c.get("/channel_assignments?assigned_node=not.is.null&status=eq.unassigned&select=username&limit=50000", &orphaned)
+	err := c.getAllPaginated("/channel_assignments?assigned_node=not.is.null&status=eq.unassigned&select=username", &orphaned)
 	if err != nil {
 		return 0, err
 	}
@@ -1612,14 +1647,14 @@ func (c *Client) GetAssignment(username, site string) (*ChannelAssignment, error
 // GetAssignmentsByStatus returns all assignments with a given status.
 func (c *Client) GetAssignmentsByStatus(status string) ([]ChannelAssignment, error) {
 	var assignments []ChannelAssignment
-	err := c.get(fmt.Sprintf("/channel_assignments?status=eq.%s&order=username.asc", url.QueryEscape(status)), &assignments)
+	err := c.getAllPaginated(fmt.Sprintf("/channel_assignments?status=eq.%s&order=username.asc", url.QueryEscape(status)), &assignments)
 	return assignments, err
 }
 
 // GetAllAssignments returns all channel assignments.
 func (c *Client) GetAllAssignments() ([]ChannelAssignment, error) {
 	var assignments []ChannelAssignment
-	err := c.get("/channel_assignments?order=username.asc&limit=50000", &assignments)
+	err := c.getAllPaginated("/channel_assignments?order=username.asc", &assignments)
 	return assignments, err
 }
 
@@ -1704,7 +1739,7 @@ func (c *Client) GetAssignmentStats() (*AssignmentStats, error) {
 
 	// Distinct assigned nodes can't be counted via REST, so fetch and dedupe.
 	var assigned []ChannelAssignment
-	if err := c.get("/channel_assignments?assigned_node=not.is.null&select=assigned_node&limit=50000", &assigned); err != nil {
+	if err := c.getAllPaginated("/channel_assignments?assigned_node=not.is.null&select=assigned_node", &assigned); err != nil {
 		return nil, err
 	}
 	assignedNodes := make(map[string]bool)
@@ -1807,7 +1842,7 @@ func (c *Client) SetChannelsNotLive(pairs [][2]string) error {
 func (c *Client) ReclaimChannels(deadNodeID string) (int, error) {
 	// First, count what we'll reclaim
 	var assignments []ChannelAssignment
-	err := c.get(fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&select=username&limit=50000",
+	err := c.getAllPaginated(fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&select=username",
 		url.QueryEscape(deadNodeID)), &assignments)
 	if err != nil {
 		return 0, err
@@ -1873,7 +1908,7 @@ func (c *Client) GetAllSettingKeys(likePattern string) ([]string, error) {
 	// Supabase REST doesn't support LIKE directly, so we fetch all keys
 	// and filter client-side. For typical deployments this is < 100 keys.
 	var settings []AppSetting
-	err := c.get("/app_settings?select=key&limit=50000", &settings)
+	err := c.getAllPaginated("/app_settings?select=key", &settings)
 	if err != nil {
 		return nil, err
 	}
