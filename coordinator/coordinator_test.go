@@ -79,6 +79,10 @@ func (m *mockClient) ReleaseExcessOfflineChannels(nodeID string, limit int) ([]d
 	return m.releasedExcess, nil
 }
 
+func (m *mockClient) ReassertAssignmentNode(username, site, nodeID string) error {
+	return nil
+}
+
 type mockChannelManager struct {
 	created      []*database.ChannelAssignment
 	removed      []string
@@ -115,6 +119,15 @@ func (m *mockChannelManager) GetLocalChannels() []string {
 		list = append(list, ca.Username)
 	}
 	return list
+}
+
+func (m *mockChannelManager) LocalChannelSite(username string) (string, bool) {
+	for _, ca := range m.created {
+		if ca.Username == username {
+			return ca.Site, true
+		}
+	}
+	return "", false
 }
 
 func (m *mockChannelManager) HasPendingSegments(username string) bool {

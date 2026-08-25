@@ -446,6 +446,19 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 		return nil
 	}
 
+	// Duplicate-recording guard. If the DB assignment is already status=
+	// 'recording' but we are NOT the node actively recording it, another node
+	// owns the live recording (the assignment may have been reassigned to us
+	// while it was mid-recording elsewhere — e.g. by an external autopilot).
+	// Starting it here would produce a second, overlapping recording, so skip
+	// it; the owning node keeps recording until the stream/session ends. A
+	// freshly claimed or reassigned channel arrives with status='claimed', so
+	// legitimate starts are never blocked by this guard.
+	if ca.Status == "recording" && !m.IsRecording(ca.Username) {
+		log.Printf("[manager] assignment %s/%s is status=recording on another node — not starting duplicate recording", ca.Site, ca.Username)
+		return nil
+	}
+
 	conf := coordinator.ConfigFromAssignment(ca)
 	conf.Sanitize()
 
@@ -600,11 +613,34 @@ func (m *Manager) RemoveChannelForReassignment(username string) error {
 		return nil
 	}
 
+	// Never tear down a channel that is actively recording. A reassignment
+	// (coordinator rebalance or an external autopilot, possibly via a raw DB
+	// UPDATE) must not cut an in-progress recording into a short fragment. The
+	// recording node keeps the file rolling; the reconcile loop re-pins the DB
+	// assignment to this node so the destination never starts a duplicate. The
+	// channel is removed on the next reconciliation once the recording ends.
+	if m.IsRecording(username) {
+		ch.Info("channel is actively recording — refusing reassignment teardown; will finish current recording first")
+		return nil
+	}
+
 	m.Channels.Delete(username)
 	go func() {
 		ch.Stop()
 	}()
 	return nil
+}
+
+// LocalChannelSite returns the site (chaturbate/stripchat/...) of a channel
+// that is active on this node. The coordinator uses it to re-pin a recording
+// channel's DB assignment to this node by (username, site).
+func (m *Manager) LocalChannelSite(username string) (string, bool) {
+	if v, ok := m.Channels.Load(username); ok {
+		if ch, ok := v.(*channel.Channel); ok {
+			return ch.Config.Site, true
+		}
+	}
+	return "", false
 }
 
 const (

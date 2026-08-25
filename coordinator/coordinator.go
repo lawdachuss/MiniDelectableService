@@ -219,6 +219,7 @@ type ChannelManager interface {
 	CreateChannelFromAssignment(ca *database.ChannelAssignment) error
 	RemoveChannelForReassignment(username string) error
 	GetLocalChannels() []string
+	LocalChannelSite(username string) (string, bool)
 	HasPendingSegments(username string) bool
 	// IsRecording reports whether the channel is actively writing a live
 	// recording file on THIS node right now.  The shuffle/reconcile/deadline

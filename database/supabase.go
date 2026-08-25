@@ -1586,6 +1586,21 @@ func (c *Client) MarkChannelRecording(username, site string) error {
 		})
 }
 
+// ReassertAssignmentNode forces a channel's owning node back to nodeID. Used by
+// the reconcile loop to keep a channel pinned to the node that is actively
+// recording it, so a reassignment (coordinator rebalance or an external
+// autopilot, possibly via a raw DB UPDATE) cannot fragment an in-progress
+// recording by moving it to — and spawning a duplicate on — another node. It
+// updates by (username, site) and is a no-op if the row does not exist.
+func (c *Client) ReassertAssignmentNode(username, site, nodeID string) error {
+	return c.patch(
+		fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s",
+			url.QueryEscape(username), url.QueryEscape(site)),
+		map[string]interface{}{
+			"assigned_node": nodeID,
+		})
+}
+
 // RepairOrphanedAssignments fixes rows where assigned_node is set but
 // status is still 'unassigned'. This can happen if a claim was partially
 // rolled back (assigned_node written, status not updated) or if a

@@ -130,6 +130,35 @@ func TestCreateChannelFromAssignmentResumesPausedChannel(t *testing.T) {
 	}
 }
 
+// TestCreateChannelFromAssignmentSkipsDuplicateRecording verifies the
+// duplicate-recording guard: a DB assignment already status='recording' that
+// this node is NOT actively recording must NOT be started, otherwise a channel
+// reassigned here mid-recording by an external autopilot would spawn a second,
+// overlapping recording on top of the one owned by the source node.
+func TestCreateChannelFromAssignmentSkipsDuplicateRecording(t *testing.T) {
+	m, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer m.StopAllChannels()
+
+	ca := &database.ChannelAssignment{
+		Username:   "dup_user",
+		Site:       "chaturbate",
+		Status:     "recording",
+		Framerate:  60,
+		Resolution: 1080,
+	}
+	if err := m.CreateChannelFromAssignment(ca); err != nil {
+		t.Fatalf("CreateChannelFromAssignment returned error: %v", err)
+	}
+	for _, u := range m.GetLocalChannels() {
+		if u == "dup_user" {
+			t.Fatalf("duplicate recording channel must not be started, but it was added to local channels")
+		}
+	}
+}
+
 // restoreTestGlobalsSafe restores server.Manager/server.Config to their
 // pre-test values, falling back to safe non-nil substitutes when the originals
 // were nil. Channel Monitor/Publisher goroutines spawned by a test can outlive

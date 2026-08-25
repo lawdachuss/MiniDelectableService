@@ -39,6 +39,7 @@ type dbShuffler interface {
 	GetNodeAssignments(nodeID string) ([]database.ChannelAssignment, error)
 	GetNodesWithImminentDeadline(window time.Duration) ([]database.Node, error)
 	ReassignChannel(username, site, fromNode, toNode string) error
+	ReassertAssignmentNode(username, site, nodeID string) error
 }
 
 // StartOfflineShuffleLoop periodically rebalances OFFLINE channels across nodes.
@@ -473,6 +474,17 @@ func (c *Coordinator) runReconcileCycleWith(db dbShuffler) {
 			// would fragment or strand the file.  Defer the removal until the
 			// recording finishes; the next reconcile cycle will catch it.
 			if c.Manager.IsRecording(lc) {
+				// The DB assignment diverged (reassignment by the coordinator,
+				// an external autopilot, or a raw DB UPDATE), but this node is
+				// the one actively recording. Re-pin the assignment to this node
+				// so the destination never sees — and never starts a duplicate
+				// of — the recording. The channel is released normally once the
+				// recording ends and reconciliation runs again.
+				if site, ok := c.Manager.LocalChannelSite(lc); ok {
+					if err := db.ReassertAssignmentNode(lc, site, c.NodeID); err != nil {
+						log.Printf("[coordinator] reconcile: re-pin %s to %s error: %v", lc, c.NodeID, err)
+					}
+				}
 				log.Printf("[coordinator] reconcile: channel %s is actively recording — deferring removal until recording ends", lc)
 				continue
 			}
