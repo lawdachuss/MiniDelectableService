@@ -20,9 +20,16 @@ func sharedTransport() http.RoundTripper {
 	return getSharedTransport()
 }
 
+// defaultBrowserUA is sent when no per-node USER_AGENT is configured. Stripchat
+// (and other frontend APIs) reject header-less requests, so we always present a
+// Chrome User-Agent even on nodes that only record Stripchat. Stripchat's
+// requests bypass the httpcloak client (directHosts) and would otherwise send no
+// User-Agent, which Stripchat's anti-bot layer rejects with HTTP 418.
+const defaultBrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 // IsCloudflareChallenge reports whether an HTTP response is a Cloudflare
 // challenge/block page rather than real content. It matches on the status
-// codes Cloudflare uses for challenge/rate-limit pages (403, 429, 503, 410)
+// codes Cloudflare uses for challenge/rate-limit pages (403, 418, 429, 503, 410)
 // AND on the body markers present in the challenge HTML. The body check is
 // intentionally broad: cb.xxx varies the exact title ("Just a moment…",
 // "Attention Required! | Cloudflare") and can return the challenge on any
@@ -32,7 +39,7 @@ func IsCloudflareChallenge(status int, body string) bool {
 	// now" — treating them as a block backs the channel off instead of
 	// hammering the API with per-second retries (seen fleet-wide on cb.xxx
 	// serving "Just a moment…" pages at HTTP 429/410 to an over-claiming node).
-	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status == http.StatusGone {
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status == http.StatusGone || status == http.StatusTeapot {
 		return true
 	}
 	snippet := body
@@ -363,15 +370,34 @@ func SetRequestHeaders(req *http.Request) {
 		// Do NOT send it to CDN media hosts (mmcdn.com) as it may cause rejection.
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
-		domain := strings.TrimRight(server.Config.Domain, "/")
-		if domain != "" {
-			req.Header.Set("Origin", domain)
-			req.Header.Set("Referer", domain+"/")
+		// Derive Origin/Referer from the actual target host instead of the
+		// configured Chaturbate domain. Sending a cross-site Referer (e.g. the
+		// Chaturbate domain to stripchat.com's frontend API) makes Stripchat's
+		// anti-bot layer reject the request with HTTP 418.
+		host := req.URL.Host
+		if host == "" {
+			host = strings.TrimPrefix(strings.TrimPrefix(server.Config.Domain, "https://"), "http://")
+			host = strings.TrimRight(host, "/")
 		}
+		origin := "https://" + host
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Referer", origin+"/")
+
+		// Emulate a real browser so frontend APIs (Stripchat, Chaturbate)
+		// don't flag the request as a bot.
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
 	}
 
 	if server.Config.UserAgent != "" {
 		req.Header.Set("User-Agent", strings.TrimSpace(server.Config.UserAgent))
+	} else {
+		// Stripchat API requests bypass the httpcloak client (directHosts) and
+		// would otherwise send no User-Agent, which Stripchat rejects with 418.
+		req.Header.Set("User-Agent", defaultBrowserUA)
 	}
 	if server.Config.Cookies != "" {
 		cookies := ParseCookies(server.Config.Cookies)
