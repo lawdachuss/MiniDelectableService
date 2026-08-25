@@ -196,15 +196,15 @@
         {{ range .Videos }}
         {{ if .ThumbnailURL }}
         <div class="video-card group cursor-pointer"
-             data-preview="{{ .PreviewURL }}"
+                   data-preview="{{ .PreviewURL | proxy }}"
              data-video-href="{{ if .FullPath }}/video?path={{ .FullPath | urlquery }}{{ else }}/video?path={{ .Filename | urlquery }}{{ end }}"
              onclick="location.href=this.dataset.videoHref">
             <div class="card-thumb">
                 {{ if .ThumbnailURL }}
-                <img src="{{ .ThumbnailURL }}" alt="" loading="lazy" />
+                <img src="{{ .ThumbnailURL | proxy }}" alt="" loading="lazy" />
                 {{ end }}
                 {{ if .PreviewURL }}
-                <div class="sprite-overlay">{{ if isWebp .PreviewURL }}<img src="{{ .PreviewURL }}" class="preview-gif" alt="" loading="lazy" decoding="async" />{{ else }}<video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video>{{ end }}</div>
+                <div class="sprite-overlay">{{ if isWebp .PreviewURL }}<img src="{{ .PreviewURL | proxy }}" class="preview-gif" alt="" loading="lazy" decoding="async" />{{ else }}<video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video>{{ end }}</div>
                 {{ end }}
                 {{ if .FullPath }}
                 <div class="play-btn-wrap">

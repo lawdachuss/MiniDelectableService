@@ -9,6 +9,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1603,6 +1604,70 @@ func ServeLiveThumb(c *gin.Context) {
 	thumbCache[username] = thumbCacheEntry{data: data, contentType: ct, expiresAt: time.Now().Add(5 * time.Second)}
 	thumbCacheMu.Unlock()
 	c.Data(http.StatusOK, ct, data)
+}
+
+// proxyAllowedSuffixes are the image-host suffixes we will fetch on behalf of
+// the browser.  Anything else is rejected so the DVR cannot be used as an open
+// proxy.
+var proxyAllowedSuffixes = []string{
+	"pixhost.to", "catbox.moe", "imgbb.com", "i.ibb.co", "pimpandhost.com",
+}
+
+// ServeImageProxy streams an external thumbnail/sprite/preview image through the
+// DVR server itself.  The browser requests a same-origin URL
+// (/api/imgproxy?url=...), so broken thumbnails caused by the client being
+// unable to reach the upstream image host (firewall / region / DNS / hotlink
+// rules) disappear — the server fetches the bytes (which it demonstrably can)
+// and relays them.
+func ServeImageProxy(c *gin.Context) {
+	raw := c.Query("url")
+	if raw == "" {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	allowed := false
+	for _, s := range proxyAllowedSuffixes {
+		if strings.HasSuffix(u.Host, s) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		c.Status(http.StatusForbidden)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; chaturbate-dvr/1.0)")
+	req.Header.Set("Accept", "image/*,*/*")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[imgproxy] fetch failed for %s: %v", raw, err)
+		c.Status(http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.Status(http.StatusBadGateway)
+		return
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = mime.TypeByExtension(filepath.Ext(u.Path))
+	}
+	c.Header("Cache-Control", "public, max-age=86400")
+	c.DataFromReader(resp.StatusCode, resp.ContentLength, ct, resp.Body, nil)
 }
 
 func DeleteOrphans(c *gin.Context) {

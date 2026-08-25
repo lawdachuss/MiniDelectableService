@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -100,6 +101,9 @@ func SetupViews(r *gin.Engine) {
 	// Thumbnail proxy API
 	r.GET("/api/thumb/:username", ServeLiveThumb)
 
+	// Same-origin image proxy for external thumbnail/sprite/preview hosts.
+	r.GET("/api/imgproxy", ServeImageProxy)
+
 	// Upload queue API
 	r.GET("/api/uploads", UploadQueue)
 
@@ -157,6 +161,19 @@ func templateFuncs() template.FuncMap {
 		"divBytes": func(b int64) float64 { return float64(b) / 1024 / 1024 },
 		"add": func(a, b int) int { return a + b },
 		"isWebp": func(url string) bool { return strings.HasSuffix(url, ".webp") },
+		// proxy routes an external image URL (thumbnail/sprite/preview on the
+		// image hosts) through the DVR server so the browser loads it same-origin.
+		// Empty/non-http values pass through unchanged.
+		"proxy": func(raw string) string {
+			if raw == "" {
+				return ""
+			}
+			u, err := url.Parse(raw)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+				return raw
+			}
+			return "/api/imgproxy?url=" + url.QueryEscape(raw)
+		},
 	}
 }
 

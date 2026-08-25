@@ -657,10 +657,10 @@
             <span class="text-xs text-zinc-600">Loading video…</span>
         </div>
         {{ if .ThumbnailURL }}
-        <div class="poster-overlay" id="poster-overlay" style="background-image:url('{{ .ThumbnailURL }}')"></div>
+        <div class="poster-overlay" id="poster-overlay" style="background-image:url('{{ .ThumbnailURL | proxy }}')"></div>
         {{ end }}
         <video id="video-player" preload="metadata" playsinline
-               poster="{{ if .ThumbnailURL }}{{ .ThumbnailURL }}{{ end }}"
+               poster="{{ if .ThumbnailURL }}{{ .ThumbnailURL | proxy }}{{ end }}"
                onloadeddata="playerLoaded()" onerror="playerError()" onplay="onPlay()" onpause="onPause()">
             <source src="/play?path={{ .FullPath | urlquery }}" type="{{ .MimeType }}" />
         </video>
@@ -790,7 +790,7 @@
             <span class="text-xs text-zinc-600">Loading video…</span>
         </div>
         <video id="video-player" preload="metadata" playsinline crossorigin="anonymous"
-               poster="{{ if .ThumbnailURL }}{{ .ThumbnailURL }}{{ end }}"
+               poster="{{ if .ThumbnailURL }}{{ .ThumbnailURL | proxy }}{{ end }}"
                onloadeddata="playerLoaded()" onerror="playerError()" onplay="onPlay()" onpause="onPause()">
             <source src="{{ .VideoURL }}" type="video/mp4" />
         </video>
@@ -914,7 +914,7 @@
     <h2 class="text-base font-bold text-zinc-300 mb-1">File Uploaded</h2>
     <p class="text-sm text-zinc-500 max-w-sm mx-auto">This recording has been uploaded to external hosts and removed from local storage.</p>
     {{ if .ThumbnailURL }}
-    <img src="{{ .ThumbnailURL }}" alt="" class="mt-5 max-h-48 rounded-xl mx-auto object-cover opacity-50" />
+    <img src="{{ .ThumbnailURL | proxy }}" alt="" class="mt-5 max-h-48 rounded-xl mx-auto object-cover opacity-50" />
     {{ end }}
 </div>
 <div class="flex justify-end mb-4">
@@ -1063,7 +1063,7 @@
         <div class="related-card group" onclick="window.location.href='/video?path={{ if .FullPath }}{{ .FullPath | urlquery }}{{ else }}{{ .Filename | urlquery }}{{ end }}'">
             <div class="related-thumb shrink-0">
                 {{ if .ThumbnailURL }}
-                <img src="{{ .ThumbnailURL }}" alt="" loading="lazy" />
+                <img src="{{ .ThumbnailURL | proxy }}" alt="" loading="lazy" />
                 {{ else }}
                 <div class="w-full h-full flex items-center justify-center" style="background:var(--bg-card)">
                     <svg class="w-5 h-5 text-zinc-800" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
