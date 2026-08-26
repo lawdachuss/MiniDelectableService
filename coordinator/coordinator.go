@@ -315,6 +315,14 @@ type Coordinator struct {
 	assignerColdStart    *time.Time
 	assignerColdStartMu  sync.Mutex
 
+	// assignerAssigned is set once the one-time equal startup assignment has
+	// been performed (after every node was live). After that, channels are NOT
+	// continuously reshuffled; reassignment happens only when the fleet
+	// membership changes (a node joins/leaves). Guarded by assignerAssignMu.
+	assignerAssigned  bool
+	assignerFleetSig  string
+	assignerAssignMu  sync.Mutex
+
 	// stuckPauseSeen tracks consecutive observations of a paused-but-still-
 	// assigned channel (key nodeID/site/username → count). A channel must be
 	// observed across stuckPauseConfirmCycles consecutive checks before it is

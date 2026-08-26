@@ -61,23 +61,30 @@ $depsJob = Start-Job -Name deps -ArgumentList $repoDir -ScriptBlock {
   param($d)
   $ErrorActionPreference = 'Continue'
   Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
-  try {
-    python -m pip install --quiet --disable-pip-version-check -r "$d\requirements.txt"
-    Write-Host "pip install exit: $LASTEXITCODE"
-    python -c "import curl_cffi; print('curl_cffi OK', curl_cffi.__version__); import playwright; print('playwright OK'); from scrapling.fetchers import StealthySession; print('scrapling OK')"
-    if ($LASTEXITCODE -ne 0) {
-      Write-Warning "python not usable - trying py -3 launcher"
-      py -3 -m pip install --quiet --disable-pip-version-check -r "$d\requirements.txt"
-      py -3 -c "import curl_cffi; print('curl_cffi OK via py -3'); import playwright; print('playwright OK'); from scrapling.fetchers import StealthySession; print('scrapling OK')"
+  $pipOk = $false
+  for ($i = 1; $i -le 3 -and -not $pipOk; $i++) {
+    Write-Host "[DEPS] pip install attempt $i"
+    try { python -m pip install --quiet --disable-pip-version-check -r "$d\requirements.txt" } catch {}
+    if ($LASTEXITCODE -eq 0) { $pipOk = $true }
+    if (-not $pipOk) {
+      try { py -3 -m pip install --quiet --disable-pip-version-check -r "$d\requirements.txt" } catch {}
+      if ($LASTEXITCODE -eq 0) { $pipOk = $true }
     }
-  } catch { Write-Warning "cookie deps install failed: $($_.Exception.Message)" }
-  Write-Host "[PLAYWRIGHT] Installing Chromium browser binaries..."
+    if (-not $pipOk) { Write-Warning "[DEPS] pip install attempt $i failed - retrying in 5s"; Start-Sleep -Seconds 5 }
+  }
+  if (-not $pipOk) { Write-Warning "[DEPS] pip install failed after 3 attempts" }
   try {
-    $t = Measure-Command { python -m playwright install chromium 2>&1 | Out-Null }
-    Write-Host "[PLAYWRIGHT] Chromium install done in $([math]::Round($t.TotalSeconds,1))s (exit $LASTEXITCODE)"
-  } catch { Write-Warning "[PLAYWRIGHT] Chromium install failed: $($_.Exception.Message)" }
+    python -c "import curl_cffi; print('curl_cffi OK', curl_cffi.__version__); import playwright; print('playwright OK'); from scrapling.fetchers import StealthySession; print('scrapling OK')"
+    if ($LASTEXITCODE -ne 0) { Write-Warning "[DEPS] import check failed - scrapling/playwright may be missing" }
+  } catch { Write-Warning "[DEPS] import check error: $($_.Exception.Message)" }
+  $chromiumOk = $false
+  for ($i = 1; $i -le 3 -and -not $chromiumOk; $i++) {
+    Write-Host "[PLAYWRIGHT] Chromium install attempt $i"
+    try { python -m playwright install chromium 2>&1 | Out-Null } catch {}
+    if ($LASTEXITCODE -eq 0) { $chromiumOk = $true }
+    if (-not $chromiumOk) { Write-Warning "[PLAYWRIGHT] Chromium install attempt $i failed - retrying in 5s"; Start-Sleep -Seconds 5 }
+  }
 }
-
 # ========== JOB 3: Pinned Chrome 146 (cf_clearance TLS fingerprint) ==========
 $chromeJob = Start-Job -Name chrome -ScriptBlock {
   $ErrorActionPreference = 'Continue'
@@ -146,51 +153,53 @@ try {
   Remove-Item $warmScript -Force -ErrorAction SilentlyContinue
 } catch { Write-Warning "[SCRAPLING] warm-up failed: $($_.Exception.Message)" }
 
-# ========== Grab fresh cookies (hard cap 540s) ==========
+# ========== Grab fresh cookies (retry up to 3x; hard cap per attempt) ==========
 Set-Location $repoDir
 $env:PYTHONUNBUFFERED = '1'
-$env:GRAB_TOTAL_TIMEOUT = '480'
-Write-Host "[COOKIE] Running cookie_grabber.py to mint fresh cf_clearance... (hard cap 540s)"
-# Preserve browsers that already existed (RDP user's, etc.) - only NEW ones die.
-$preGrab = @(Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$capSec = 540
-$grabJob = Start-Job -ScriptBlock {
-  param($dir)
-  Set-Location $dir
-  $env:PYTHONUNBUFFERED = '1'
-  & python -u scripts/cookie_grabber.py 2>&1
-  Write-Output "__EXITCODE__$LASTEXITCODE"
-} -ArgumentList $repoDir
-$lastOutputLen = 0
-while ($grabJob.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $capSec) {
-  $lines = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
-  if ($lines.Count -gt $lastOutputLen) {
-    $lines[$lastOutputLen..($lines.Count - 1)] | ForEach-Object { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
-    $lastOutputLen = $lines.Count
+$env:GRAB_TOTAL_TIMEOUT = '240'
+$capSec = 240
+$maxAttempts = 3
+$grabSucceeded = $false
+$grabExit = 1
+for ($attempt = 1; $attempt -le $maxAttempts -and -not $grabSucceeded; $attempt++) {
+  Write-Host "[COOKIE] Running cookie_grabber.py (attempt $attempt of $maxAttempts, cap ${capSec}s)"
+  $preGrab = @(Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $grabJob = Start-Job -ScriptBlock {
+    param($dir)
+    Set-Location $dir
+    $env:PYTHONUNBUFFERED = '1'
+    & python -u scripts/cookie_grabber.py 2>&1
+    Write-Output "__EXITCODE__$LASTEXITCODE"
+  } -ArgumentList $repoDir
+  $lines = @()
+  while ($grabJob.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $capSec) {
+    $out = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
+    if ($out.Count -gt $lines.Count) {
+      $out[$lines.Count..($out.Count - 1)] | ForEach-Object { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
+      $lines = $out
+    }
+    Start-Sleep -Seconds 2
   }
-  Start-Sleep -Seconds 2
+  $rem = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
+  foreach ($_ in $rem) { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
+  $capped = $sw.Elapsed.TotalSeconds -ge $capSec
+  if ($capped) {
+    Write-Warning "[COOKIE] attempt $attempt exceeded ${capSec}s hard cap - stopping job"
+    Stop-Job $grabJob -ErrorAction SilentlyContinue
+  }
+  $grabExit = 1
+  foreach ($_ in ($lines + $rem)) { if ($_ -match '__EXITCODE__(\d+)') { $grabExit = [int]$matches[1] } }
+  Remove-Job $grabJob -Force -ErrorAction SilentlyContinue
+  Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue |
+    Where-Object { $preGrab -notcontains $_.Id } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+  Write-Host "[COOKIE] attempt $attempt finished (exit $grabExit, capped=$capped)"
+  if ($grabExit -eq 0) { $grabSucceeded = $true }
+  if (-not $grabSucceeded -and $attempt -lt $maxAttempts) { Write-Host "[COOKIE] attempt $attempt failed - retrying in 5s"; Start-Sleep -Seconds 5 }
 }
-$remaining = @(Receive-Job $grabJob -ErrorAction SilentlyContinue)
-foreach ($_ in $remaining) { if ($_ -notmatch '^__EXITCODE__') { Write-Host "  [CG] $_" } }
-$capped = $sw.Elapsed.TotalSeconds -ge $capSec
-if ($capped) {
-  Write-Warning "[COOKIE] cookie_grabber.py exceeded ${capSec}s hard cap - stopping job"
-  Stop-Job $grabJob -ErrorAction SilentlyContinue
-}
-$grabExit = 0
-$allOutput = @($lines) + @($remaining)
-foreach ($_ in $allOutput) {
-  if ($_ -match '__EXITCODE__(\d+)') { $grabExit = [int]$matches[1] }
-}
-Remove-Job $grabJob -Force -ErrorAction SilentlyContinue
-# Kill only browsers that started DURING the grab (they belong to the grabber).
-Get-Process chrome,msedge,camoufox,firefox -ErrorAction SilentlyContinue |
-  Where-Object { $preGrab -notcontains $_.Id } |
-  Stop-Process -Force -ErrorAction SilentlyContinue
-Write-Host "[COOKIE] cookie_grabber.py finished in $([math]::Round($sw.Elapsed.TotalSeconds,1))s (exit $grabExit, capped=$capped)"
-if ($grabExit -ne 0) {
-  Write-Warning "[COOKIE] cookie_grabber.py failed (exit $grabExit) - DVR will use existing cookies from Supabase"
+if (-not $grabSucceeded) {
+  Write-Warning "[COOKIE] cookie_grabber.py failed after $maxAttempts attempts - DVR will use existing cookies from Supabase"
 } else {
   Write-Host "[COOKIE] Fresh cf_clearance saved to Supabase - DVR will load it on startup"
 }

@@ -19,21 +19,37 @@ import (
 // CONTROLLER — leader-elected channel assignment balancer
 // ============================================================================
 //
-// This replaces the old per-node claim/shuffle/reaper system. A single node
-// (the leader, elected via a DB lease) periodically:
-//   1. Computes liveness for every pooled channel (Chaturbate via the bulk
-//      affiliate API; Stripchat via per-model checks, throttled).
-//   2. Writes is_live so the whole fleet shares one authoritative liveness view.
-//   3. Force-releases channels owned by dead nodes and offline non-recording
-//      channels on live nodes.
-//   4. Resets stale "recording" rows whose stream is now confirmed offline.
-//   5. Balances live channels PER SITE across active nodes so every node
-//      records (roughly) the same number of live cb.xxx and stripchat channels.
+// A single node (the leader, elected via a DB lease) is responsible for
+// assigning live channels across the fleet. Its behaviour is deliberately NOT
+// a continuous reshuffler:
 //
-// Cold-start guard: if more than cold_start_offline_threshold nodes are offline
-// (e.g. a full fleet restart where some nodes boot faster), assignment is held
-// for up to cold_start_wait_sec so the fast nodes don't grab every channel
-// before the rest join. After the wait (or once enough nodes are up) it proceeds.
+//   - Every cycle it recomputes liveness for every pooled channel (Chaturbate
+//     via the bulk affiliate API; Stripchat via per-model checks, throttled)
+//     and writes is_live, so the whole fleet shares one authoritative,
+//     continuously-updated view of live channels on BOTH cb.xxx and stripchat.
+//
+//   - Assignment (moving channels between nodes) happens ONLY:
+//       1. ONCE at startup, after every node is live — an equal split of live
+//          channels per site across all active nodes.
+//       2. On a membership change — a node goes offline (its channels are
+//          reclaimed and redistributed once to the remaining live nodes) or a
+//          new node comes online (it receives an equal share).
+//
+//     A stable, healthy fleet is therefore never reshuffled; each node keeps
+//     the channels it was given. This avoids the old "continuous shuffle"
+//     problem where channels jumped between nodes every tick.
+//
+//   - When reassignment does occur, recording channels are NEVER moved
+//     (balanceSite only relocates claimed/unassigned rows), so in-progress
+//     recordings are never lost.
+//
+//   - Dead-node housekeeping (reclaim) and offline-non-recording release run
+//     every cycle; ReleaseNodeOfflineChannels excludes status=recording, so a
+//     live node's in-progress recordings are never disturbed.
+//
+// Cold-start guard: the one-time assignment waits until ALL nodes are live
+// (offlineCount==0). A broken node can never block the fleet forever — after
+// cold_start_wait_sec the leader proceeds with whoever is up.
 //
 // The per-node assignment-sync loop (shuffle.go) still obeys these decisions:
 // it starts channels assigned to its node and stops those no longer assigned.
@@ -121,8 +137,8 @@ func (c *Coordinator) runControllerCycle() {
 	for _, n := range nodes {
 		switch n.Status {
 		case "draining":
-			// Excluded from targets but not "offline" — its channels will be
-			// rebalanced onto active nodes below.
+			// Excluded from targets (its channels are rebalanced onto active
+			// nodes when a membership change triggers a rebalance).
 			continue
 		case "offline":
 			dead = append(dead, n)
@@ -141,42 +157,22 @@ func (c *Coordinator) runControllerCycle() {
 		activeSet[n.NodeID] = true
 	}
 
-	// Cold-start guard: don't assign until the fleet has mostly joined.
-	if offlineCount > cfg.ColdStartOfflineThr {
-		c.assignerColdStartMu.Lock()
-		if c.assignerColdStart == nil {
-			t := now
-			c.assignerColdStart = &t
-			log.Printf("[controller] cold-start: %d nodes offline (>%d) — holding assignment up to %ds for fleet to join",
-				offlineCount, cfg.ColdStartOfflineThr, cfg.ColdStartWaitSec)
-		}
-		elapsed := now.Sub(*c.assignerColdStart)
-		if elapsed < time.Duration(cfg.ColdStartWaitSec)*time.Second {
-			c.assignerColdStartMu.Unlock()
-			return
-		}
-		c.assignerColdStartMu.Unlock()
-		log.Printf("[controller] cold-start window elapsed — proceeding with assignment")
-	} else {
-		c.assignerColdStartMu.Lock()
-		c.assignerColdStart = nil
-		c.assignerColdStartMu.Unlock()
-	}
-
 	all, err := c.Client.GetAllAssignments()
 	if err != nil {
 		log.Printf("[controller] get assignments error: %v", err)
 		return
 	}
 
-	// 1–2. Liveness + is_live write. Returns live[key] (true if live) and only
-	// includes keys we definitively evaluated (unknown probes are skipped so we
-	// never flip a flag we couldn't confirm).
+	// Background liveness (continuous): every cycle recompute and publish
+	// is_live for BOTH platforms — Chaturbate via the bulk affiliate call and
+	// Stripchat via per-model probes. The fleet always has an authoritative,
+	// up-to-date count of live channels on cb.xxx and stripchat. This runs
+	// forever and is independent of assignment.
 	live := c.computeLiveness(ctx, cfg, all)
 
-	// 3. Reset stale "recording" rows whose stream is now confirmed offline, so
-	// the rebalancer (which refuses to move "recording" rows) can redistribute
-	// them. Only touches definitively-evaluated offline channels.
+	// Reset stale "recording" rows whose stream is now confirmed offline, so a
+	// dead stream doesn't stay pinned as recording. Only definitively-evaluated
+	// offline channels are touched.
 	for _, ca := range all {
 		if ca.Status != "recording" {
 			continue
@@ -188,8 +184,10 @@ func (c *Coordinator) runControllerCycle() {
 		}
 	}
 
-	// 4. Release channels owned by dead nodes (force, incl. recording) and
-	// offline non-recording channels on live nodes.
+	// Housekeeping every cycle: free channels owned by dead nodes and offline
+	// non-recording channels on live nodes. ReleaseNodeOfflineChannels never
+	// touches a live node's recording channels, so in-progress recordings are
+	// never disturbed.
 	for _, d := range dead {
 		n, err := c.Client.ReclaimChannels(d.NodeID)
 		if err != nil {
@@ -207,10 +205,75 @@ func (c *Coordinator) runControllerCycle() {
 		}
 	}
 
-	// 5. Per-site balanced distribution.
-	for _, site := range []string{"chaturbate", "stripchat"} {
-		c.balanceSite(site, all, active, activeSet, live)
+	// ── Assignment gating ──────────────────────────────────────────────────
+	// The fleet gets ONE equal assignment once every node is live (the "startup"
+	// assignment). After that, channels are NOT continuously reshuffled: a
+	// stable, healthy fleet keeps exactly the channels it was given. Reassignment
+	// happens ONLY on a membership change —
+	//   • a node goes offline → its channels are reclaimed and redistributed ONCE
+	//     to the remaining live nodes;
+	//   • a new node comes online → it receives an equal share (moved from
+	//     others).
+	// Recording channels are never moved, so in-progress recordings are never
+	// lost. balanceSite enforces this (it only relocates claimed/unassigned
+	// rows).
+	needAssignment := false
+	fleetSig := fleetSignature(active, dead)
+	c.assignerAssignMu.Lock()
+	if !c.assignerAssigned {
+		// Cold-start: wait until ALL nodes are live before the one-time split,
+		// so no node grabs every channel before the rest boot. A broken node can
+		// never block the fleet forever — after ColdStartWaitSec we proceed with
+		// whoever is up.
+		if offlineCount == 0 {
+			needAssignment = true
+		} else {
+			if c.assignerColdStart == nil {
+				t := now
+				c.assignerColdStart = &t
+				log.Printf("[controller] cold-start: %d node(s) offline — holding one-time assignment until all nodes are live (max %ds)",
+					offlineCount, cfg.ColdStartWaitSec)
+			}
+			if now.Sub(*c.assignerColdStart) >= time.Duration(cfg.ColdStartWaitSec)*time.Second {
+				needAssignment = true
+				log.Printf("[controller] cold-start window elapsed with %d offline — proceeding with one-time assignment", offlineCount)
+			}
+		}
+	} else if fleetSig != c.assignerFleetSig {
+		needAssignment = true
+		log.Printf("[controller] fleet membership changed (was %q) — rebalancing once", c.assignerFleetSig)
 	}
+	c.assignerAssignMu.Unlock()
+
+	if needAssignment && len(active) > 0 {
+		for _, site := range []string{"chaturbate", "stripchat"} {
+			c.balanceSite(site, all, active, activeSet, live)
+		}
+		c.assignerAssignMu.Lock()
+		c.assignerAssigned = true
+		c.assignerColdStart = nil
+		c.assignerFleetSig = fleetSig
+		c.assignerAssignMu.Unlock()
+		log.Printf("[controller] assignment complete: %d active node(s), equal split applied", len(active))
+	}
+}
+
+// fleetSignature returns a stable string describing the current fleet
+// membership (which nodes are active vs dead). It changes exactly when a node
+// joins or leaves, and is used to trigger a one-time rebalance only on such a
+// membership change rather than on every liveness tick.
+func fleetSignature(active, dead []database.Node) string {
+	act := make([]string, 0, len(active))
+	for _, n := range active {
+		act = append(act, "A:"+n.NodeID)
+	}
+	d := make([]string, 0, len(dead))
+	for _, n := range dead {
+		d = append(d, "D:"+n.NodeID)
+	}
+	sort.Strings(act)
+	sort.Strings(d)
+	return strings.Join(act, ",") + "|" + strings.Join(d, ",")
 }
 
 // computeLiveness evaluates liveness for every pooled channel and writes is_live.

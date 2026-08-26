@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/teacat/chaturbate-dvr/server"
 )
 
 // AffiliateModel represents a single model from the affiliate onlinerooms API.
@@ -42,14 +44,16 @@ type AffiliateAPIResult struct {
 	ttl       time.Duration
 }
 
+// affiliateUA matches the TLS/UA fingerprint that mints cf_clearance in
+// cookie_grabber.py (Chrome 146). Cloudflare binds the clearance to that
+// fingerprint, so the same UA must be presented when reusing the cookie.
+const affiliateUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+
 var (
 	affiliateCache   = &AffiliateAPIResult{ttl: 30 * time.Second}
 	affiliateClient  = &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:    2,
-			IdleConnTimeout: 30 * time.Second,
-		},
+		Timeout:   20 * time.Second,
+		Transport: sharedTransport(),
 	}
 	defaultAffiliateBase = "https://www.cb.xxx/"
 )
@@ -106,8 +110,20 @@ func fetchAffiliateAPI(ctx context.Context, wmCode, baseURL string) (map[string]
 	if err != nil {
 		return nil, fmt.Errorf("affiliate: create request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	// Present the node's minted cf_clearance (IP+TLS-bound) and a matching UA so
+	// the request clears Cloudflare on datacenter IPs (GitHub runners). Without
+	// this the bare client is challenged and the whole bulk liveness check fails.
+	req.Header.Set("User-Agent", affiliateUA)
 	req.Header.Set("Accept", "application/json")
+	if server.Config != nil {
+		if server.Config.Cookies != "" {
+			for name, value := range ParseCookies(server.Config.Cookies) {
+				req.AddCookie(&http.Cookie{Name: name, Value: value})
+			}
+		} else if server.Config.CfClearance != "" {
+			req.AddCookie(&http.Cookie{Name: "cf_clearance", Value: server.Config.CfClearance})
+		}
+	}
 
 	resp, err := affiliateClient.Do(req)
 	if err != nil {

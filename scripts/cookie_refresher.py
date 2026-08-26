@@ -64,7 +64,7 @@ def supabase_request(method, url, api_key, data=None):
     headers = {"apikey": api_key, "Authorization": f"Bearer {api_key}"}
     if data is not None:
         headers["Content-Type"] = "application/json"
-    if method == "PATCH":
+    if method in ("PATCH", "POST"):
         headers["Prefer"] = "return=representation"
     try:
         resp = cffi_requests.request(
