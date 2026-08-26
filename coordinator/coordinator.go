@@ -164,14 +164,9 @@ func (c *Coordinator) startHealthCheckLoop(ctx context.Context) {
 			case <-c.stopCh:
 				return
 		case <-ticker.C:
-			c.checkCycleHealth("claim", &c.cycleGuardClaim)
-			c.checkCycleHealth("live-check", &c.cycleGuardLiveCheck)
-			c.checkCycleHealth("reaper", &c.cycleGuardReaper)
-			c.checkCycleHealth("offline-shuffle", &c.cycleGuardShuffle)
-			c.checkCycleHealth("hoard-rebalance", &c.cycleGuardHoard)
-			c.checkCycleHealth("deadline-migration", &c.cycleGuardDeadline)
-			c.checkCycleHealth("reconcile", &c.cycleGuardReconcile)
-			c.checkCycleHealth("stuck-pause", &c.cycleGuardStuckPause)
+		c.checkCycleHealth("reconcile", &c.cycleGuardReconcile)
+		c.checkCycleHealth("controller", &c.cycleGuardController)
+		c.checkCycleHealth("stuck-pause", &c.cycleGuardStuckPause)
 		}
 		}
 	}()
@@ -307,6 +302,18 @@ type Coordinator struct {
 	cycleGuardReconcile     cycleGuard
 	cycleGuardStuckPause    cycleGuard
 	cycleGuardHoard         cycleGuard
+	cycleGuardController    cycleGuard
+
+	// assignerCfg is the cached assignment tunables (loaded once from
+	// app_settings.key='assigner_config'). Guarded by assignerCfgMu.
+	assignerCfg       *assignerConfig
+	assignerCfgMu     sync.Mutex
+	// assignerColdStart marks when a cold-start hold began; while set and within
+	// the cold-start window the controller defers assignment so a slow-booting
+	// fleet doesn't let its fast nodes grab every channel. Guarded by
+	// assignerColdStartMu.
+	assignerColdStart    *time.Time
+	assignerColdStartMu  sync.Mutex
 
 	// stuckPauseSeen tracks consecutive observations of a paused-but-still-
 	// assigned channel (key nodeID/site/username → count). A channel must be
@@ -361,16 +368,10 @@ func (c *Coordinator) Start(ctx context.Context) {
 	c.Register()
 	c.StartHeartbeatLoop(ctx)
 	c.StartHeartbeatWatchdog(ctx)
-	c.StartClaimLoop(ctx)
-	c.StartLiveCheckLoop(ctx)
-	c.StartReaperLoop(ctx)
-	c.StartOfflineShuffleLoop(ctx)
-	c.StartHoardRebalanceLoop(ctx)
-	c.StartDeadlineMigrationLoop(ctx)
-	c.StartReconcileLoop(ctx)
+	c.StartAssignmentSyncLoop(ctx)
+	c.StartControllerAssignmentLoop(ctx)
 	c.StartStuckPauseMonitorLoop(ctx)
 
-	// Start the health check watchdog that detects stalled cycles
 	c.startHealthCheckLoop(ctx)
 }
 
@@ -470,26 +471,6 @@ func (c *Coordinator) Register() {
 			log.Printf("[coordinator] registered as node %q on %s (no session deadline — permanent node)", c.NodeID, host)
 		}
 	}
-}
-
-// ownDeadlineImminent reports whether this node's own session_deadline is
-// imminent: within the deadline-migration window but not yet passed. While
-// imminent, the deadline-migration cycle is reassigning this node's channels
-// to other nodes, so the claim cycle pauses to avoid re-claiming them
-// (claim→migrate→reclaim ping-pong). Once the deadline has PASSED the node is
-// no longer imminent: migration skips past deadlines (see
-// GetNodesWithImminentDeadline), so a node that outlives its deadline — e.g. a
-// session restart that never fired — resumes claiming and keeps recording
-// instead of being drained forever.
-func (c *Coordinator) ownDeadlineImminent() bool {
-	c.mu.Lock()
-	d := c.ownDeadline
-	c.mu.Unlock()
-	if d.IsZero() {
-		return false
-	}
-	remaining := time.Until(d)
-	return remaining > 0 && remaining <= deadlineMigrationWindow
 }
 
 // StartDraining sets the node status to "draining" so other nodes know not to

@@ -1281,14 +1281,6 @@ sessionWait:
 
 	log.Println("[session] all processing complete — session ended")
 
-	// Session-boundary rebalance: release all DB assignments and run a fresh
-	// claim cycle so channels are distributed evenly across all nodes for the
-	// next session. Must happen AFTER uploads finish (no live data to lose)
-	// and before the workflow reads upload-complete.flag.
-	if m.Coordinator != nil {
-		m.Coordinator.RebalanceAtSessionBoundary()
-	}
-
 	// Signal workflow that all uploads are done so it can safely exit.
 	if err := os.WriteFile("upload-complete.flag", []byte("done"), 0644); err != nil {
 		log.Printf("[session] WARNING: could not write upload-complete.flag: %v", err)

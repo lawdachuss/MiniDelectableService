@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go/v4"
@@ -415,12 +416,34 @@ func (ch *Channel) resolveWatchEnd(ctx context.Context, s site.Site, req *intern
 	// the site API — it knows the room's true room_status — instead of blindly
 	// labeling every CDN rejection a private show (which ended live recordings
 	// and benched the channel for the whole offline interval).
-	if _, err := s.FetchStream(ctx, req, ch.Config.Username); err != nil {
+	if si, err := s.FetchStream(ctx, req, ch.Config.Username); err != nil {
 		switch {
 		case errors.Is(err, internal.ErrPrivateStream):
 			ch.setCloseReason("channel entered a private show")
 		case errors.Is(err, internal.ErrChannelOffline), errors.Is(err, internal.ErrNotFound):
-			ch.setCloseReason("channel went offline")
+			// A mid-recording CDN 403/404 is ambiguous (see comment above): the
+			// public stream may have ended OR the HLS session/token simply
+			// rotated (Chaturbate's normal ~20-minute token refresh), OR the
+			// site probe returned a transient/degraded response (empty
+			// room_status, a brief "away" flake) while the model is still live.
+			// Finalizing as "channel went offline" here fractures one
+			// continuous session into a standalone clip every time it happens:
+			// trySessionMerge treats that reason as a definitive stop, so the
+			// cycles are never merged.
+			//
+			// Trust only an EXPLICIT "not live" signal from the probe.
+			// Chaturbate's own API reports room_status="offline"/"away" when the
+			// model truly left; any other status we were actively recording
+			// through (public, hidden, or an empty/ambiguous value) means the
+			// model is still broadcastable — treat it as a stalled session so
+			// the Monitor reconnects with a fresh HLS URL and the cycle merges
+			// into the same long recording.
+			if si != nil && isDefinitiveOfflineStatus(si.RoomStatus) {
+				ch.setCloseReason("channel went offline")
+			} else {
+				ch.setCloseReason("stream session expired (HLS session/token) — reconnecting")
+				return internal.ErrStreamStalled
+			}
 		case errors.Is(err, context.Canceled):
 			// paused/stopped — the pause/stop path already set a reason.
 		default:
@@ -458,6 +481,22 @@ func (ch *Channel) resolveWatchEnd(ctx context.Context, s site.Site, req *intern
 	// waiting out the offline interval.
 	ch.setCloseReason("stream session expired (HLS session/token) — reconnecting")
 	return internal.ErrStreamStalled
+}
+
+// isDefinitiveOfflineStatus reports whether a Chaturbate room_status is an
+// explicit "model is not broadcasting" signal.  Only these statuses should
+// finalize a mid-recording session as offline — anything else (public, hidden,
+// or an empty/ambiguous value we were actively recording through) is treated as
+// a transient HLS token/edge rotation or probe flake so the cycle merges into
+// the same session.  "offline" means the model left; "away" means Chaturbate
+// reports the broadcaster as away with no capturable hls_source.  "private" and
+// "group" are handled separately by the probe (ErrPrivateStream).
+func isDefinitiveOfflineStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "offline", "away":
+		return true
+	}
+	return false
 }
 
 // scrapeProfileOnDemand fetches the model's full public profile via the site

@@ -1263,6 +1263,105 @@ func (c *Client) GetNodesWithImminentDeadline(window time.Duration) ([]Node, err
 	return nodes, nil
 }
 
+// GetNodes returns every registered node (no filtering). The assignment
+// controller uses it to compute the active/draining/dead fleet membership for
+// balanced channel distribution.
+func (c *Client) GetNodes() ([]Node, error) {
+	var nodes []Node
+	if err := c.get("/nodes?order=node_id.asc", &nodes); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// ============================================================================
+// CONTROLLER LEADER LEASE
+// ============================================================================
+
+// TryAcquireControllerLease attempts to become the sole assignment controller.
+// It calls the claim_controller_lease RPC, which only grants the lease when it
+// is unowned or expired (or already held by this node), so exactly one node
+// wins even if several race. Returns true if this node now holds the lease.
+// The RPC must exist in the database (see migrate_controller_lease.sql) and be
+// GRANTed to anon.
+func (c *Client) TryAcquireControllerLease(nodeID string, ttlSeconds int) (bool, error) {
+	resp, err := c.requestWithRetry("POST", "/rpc/claim_controller_lease", map[string]interface{}{
+		"p_node_id": nodeID,
+		"p_ttl":     ttlSeconds,
+	})
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var rows []struct {
+		ClaimControllerLease bool `json:"claim_controller_lease"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		return false, fmt.Errorf("decode lease: %w", err)
+	}
+	return len(rows) > 0 && rows[0].ClaimControllerLease, nil
+}
+
+// ReleaseControllerLease expires the lease early if this node currently holds
+// it. Called on graceful shutdown so another node can take over promptly.
+func (c *Client) ReleaseControllerLease(nodeID string) error {
+	return c.patch("/controller_lease?node_id=eq."+url.QueryEscape(nodeID),
+		map[string]interface{}{"expires_at": "now()"})
+}
+
+// SetAssignmentStatus updates the status column of a single channel assignment.
+// Used by the controller to reset a stale "recording" row back to "claimed"
+// once the stream is confirmed offline.
+func (c *Client) SetAssignmentStatus(username, site, status string) error {
+	return c.patch(fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s",
+		url.QueryEscape(username), url.QueryEscape(site)),
+		map[string]interface{}{"status": status})
+}
+
+// SetSiteLiveness bulk-updates is_live for a single site. Only the explicitly
+// listed usernames are touched (chunked in-list PATCHes), so channels that
+// could not be evaluated this cycle (e.g. a Stripchat geo-ban) keep their
+// previous flag. Recording channels are excluded from the "not live" set so a
+// transient offline reading can never flip a live recording's flag.
+func (c *Client) SetSiteLiveness(site string, liveUsernames, deadUsernames []string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if len(liveUsernames) > 0 {
+		if err := c.patchSiteLive(site, liveUsernames, true, now); err != nil {
+			return err
+		}
+	}
+	if len(deadUsernames) > 0 {
+		if err := c.patchSiteLive(site, deadUsernames, false, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) patchSiteLive(site string, usernames []string, live bool, now string) error {
+	const chunk = 200
+	for start := 0; start < len(usernames); start += chunk {
+		end := start + chunk
+		if end > len(usernames) {
+			end = len(usernames)
+		}
+		in := joinEscaped(usernames[start:end])
+		filter := fmt.Sprintf("/channel_assignments?site=eq.%s&username=in.(%s)&is_live=eq.%v",
+			url.QueryEscape(site), in, !live)
+		if err := c.patch(filter, map[string]interface{}{
+			"is_live":         live,
+			"live_checked_at": now,
+		}); err != nil {
+			return fmt.Errorf("patch site liveness: %w", err)
+		}
+	}
+	return nil
+}
+
 // ReassignChannel atomically moves a channel_assignments row from one node to
 // another via the reassign_channel RPC (SELECT ... FOR UPDATE SKIP LOCKED), so
 // even when several nodes race to migrate the same channel only one wins.
