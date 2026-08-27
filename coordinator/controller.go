@@ -291,30 +291,72 @@ func fleetSignature(active, dead []database.Node) string {
 func (c *Coordinator) computeLiveness(ctx context.Context, cfg assignerConfig, all []database.ChannelAssignment) map[string]bool {
 	live := map[string]bool{}
 
-	// ── Chaturbate: single bulk affiliate call (no per-channel cost) ──
-	if cfg.CBEnabled && server.Config != nil && server.Config.AffiliateWM != "" {
-		models, err := internal.FetchAffiliateOnlineModels(ctx, server.Config.AffiliateWM, server.Config.Domain)
-		if err == nil {
-			var cbLive, cbDead []string
-			for _, ca := range all {
-				if ca.Site != "chaturbate" {
-					continue
-				}
-				k := keyOf(ca)
-				if _, ok := models[strings.ToLower(ca.Username)]; ok {
-					cbLive = append(cbLive, ca.Username)
-					live[k] = true
-				} else {
-					cbDead = append(cbDead, ca.Username)
-					live[k] = false
-				}
-			}
-			cbDead = filterNonRecording(all, cbDead)
-			if err := c.Client.SetSiteLiveness("chaturbate", cbLive, cbDead); err != nil {
-				log.Printf("[controller] CB is_live update error: %v", err)
+	// ── Chaturbate: bulk affiliate call (fast path) + per-channel fallback ──
+	// The onlinerooms affiliate API returns ONLY the models under that white-label
+	// affiliate, so even when it works it structurally under-reports the full
+	// channel set the DVRs actually record. We use it as a fast confirmation for
+	// the models it lists, then probe every channel it did NOT confirm live
+	// per-channel (the cookie-less chatvideocontext endpoint, cached + rate-limited)
+	// so the controller always holds a truthful live set to distribute. When
+	// AffiliateWM is empty or the call errors, we probe every channel.
+	if cfg.CBEnabled && server.Config != nil {
+		affiliateAvailable := false
+		var affiliate map[string]internal.AffiliateModel
+		if server.Config.AffiliateWM != "" {
+			models, affiliateErr := internal.FetchAffiliateOnlineModels(ctx, server.Config.AffiliateWM, server.Config.Domain)
+			if affiliateErr == nil {
+				affiliate = models
+				affiliateAvailable = true
+			} else {
+				log.Printf("[controller] CB affiliate check error: %v — falling back to per-channel liveness", affiliateErr)
 			}
 		} else {
-			log.Printf("[controller] CB affiliate check error: %v (keeping prior is_live)", err)
+			log.Printf("[controller] CB affiliate WM not configured — using per-channel liveness fallback")
+		}
+
+		var cbLive, cbDead []string
+		sem := make(chan struct{}, maxInt(4, cfg.SCConcurrency*2))
+		var wg sync.WaitGroup
+		var liveMu sync.Mutex
+		for _, ca := range all {
+			if ca.Site != "chaturbate" {
+				continue
+			}
+			k := keyOf(ca)
+			if affiliateAvailable {
+				if m, ok := affiliate[strings.ToLower(ca.Username)]; ok && m.CurrentShow != "away" && m.CurrentShow != "offline" {
+					liveMu.Lock()
+					live[k] = true
+					cbLive = append(cbLive, ca.Username)
+					liveMu.Unlock()
+					continue
+				}
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			go func(username, key string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				res := c.checkChaturbateLive(ctx, username)
+				liveMu.Lock()
+				switch res {
+				case LivenessLive:
+					live[key] = true
+					cbLive = append(cbLive, username)
+				case LivenessOffline:
+					live[key] = false
+					cbDead = append(cbDead, username)
+				}
+				liveMu.Unlock()
+			}(ca.Username, k)
+		}
+		wg.Wait()
+		cbDead = filterNonRecording(all, cbDead)
+		if err := c.Client.SetSiteLiveness("chaturbate", cbLive, cbDead); err != nil {
+			log.Printf("[controller] CB is_live update error: %v", err)
 		}
 	}
 
@@ -348,6 +390,42 @@ func (c *Coordinator) computeLiveness(ctx context.Context, cfg assignerConfig, a
 	}
 
 	return live
+}
+
+// cbLiveEntry caches a single per-channel chaturbate liveness probe result.
+type cbLiveEntry struct {
+	res LivenessResult
+	at  time.Time
+}
+
+// checkChaturbateLive probes one chaturbate channel via the configured
+// LivenessChecker (the cookie-less chatvideocontext room check) and caches the
+// result for 2 minutes. This is the per-channel fallback used when the bulk
+// affiliate onlinerooms API is unset or under-reports non-affiliate models, so
+// the controller always has a truthful live set to distribute. Transient probe
+// failures return LivenessUnknown (the caller preserves the prior flag rather
+// than marking a channel offline).
+func (c *Coordinator) checkChaturbateLive(ctx context.Context, username string) LivenessResult {
+	c.cbLiveMu.Lock()
+	if c.cbLiveCache == nil {
+		c.cbLiveCache = map[string]cbLiveEntry{}
+	} else if e, ok := c.cbLiveCache[username]; ok && time.Since(e.at) < 2*time.Minute {
+		c.cbLiveMu.Unlock()
+		return e.res
+	}
+	c.cbLiveMu.Unlock()
+
+	var res LivenessResult
+	if c.LiveCheck != nil {
+		res = c.LiveCheck.CheckLive(ctx, "chaturbate", username)
+	} else {
+		res = LivenessUnknown
+	}
+
+	c.cbLiveMu.Lock()
+	c.cbLiveCache[username] = cbLiveEntry{res: res, at: time.Now()}
+	c.cbLiveMu.Unlock()
+	return res
 }
 
 // scLiveResult is the outcome of a Stripchat liveness probe for one model.

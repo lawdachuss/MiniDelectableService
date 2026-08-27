@@ -304,6 +304,13 @@ type Coordinator struct {
 	cycleGuardHoard         cycleGuard
 	cycleGuardController    cycleGuard
 
+	// cbLiveCache caches per-channel chaturbate liveness probe results so the
+	// fallback liveness check (used when the bulk affiliate API is unset or
+	// under-reports non-affiliate models) doesn't re-hit Chaturbate for every
+	// channel every cycle. Guarded by cbLiveMu.
+	cbLiveCache map[string]cbLiveEntry
+	cbLiveMu    sync.Mutex
+
 	// assignerCfg is the cached assignment tunables (loaded once from
 	// app_settings.key='assigner_config'). Guarded by assignerCfgMu.
 	assignerCfg       *assignerConfig
