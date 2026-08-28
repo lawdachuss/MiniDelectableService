@@ -263,7 +263,7 @@ func (c *Coordinator) runControllerCycle() {
 	// then stops — existing recordings are never moved, so they're never lost.
 	if len(active) > 0 {
 		for _, site := range []string{"chaturbate", "stripchat"} {
-			c.balanceSite(site, all, active, activeSet, reclaimSet, heldSet)
+			c.balanceSite(site, all, active, activeSet, reclaimSet, heldSet, needAssignment)
 		}
 	}
 	if needAssignment {
@@ -538,7 +538,7 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 // HELD (briefly-offline, within the grace window) node (a transient blip must
 // not trigger a mass reassignment). Everything else is moved onto its equal slot,
 // so the fleet converges to an exact even split with zero unassigned channels.
-func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool) {
+func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, doRebalance bool) {
 	// Build the full pool of channels for this site. Assignment is a pure equal
 	// split across the active nodes and does NOT depend on liveness, so an
 	// offline/unknown channel is still placed on a node (it records when it goes
@@ -590,17 +590,29 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 		if heldSet[cur] {
 			continue
 		}
-		if cur == "" || !activeSet[cur] {
+		if cur == "" {
+			// Step A (every cycle): claim every free/unassigned channel to its
+			// equal-split slot so no channel is ever left unassigned.
 			if ok, err := c.Client.ClaimSpecificChannel(ca.Username, ca.Site, want); err != nil {
 				log.Printf("[controller] claim %s/%s -> %s error: %v", ca.Site, ca.Username, want, err)
 				continue
 			} else if !ok {
 				continue
 			}
-		} else {
+			continue
+		}
+		// Step B (membership change only): a channel already assigned to a live
+		// node but out of place is relocated to its equal-split slot. This is
+		// gated so a stable fleet is not continuously reshuffled.
+		if !doRebalance {
+			continue
+		}
+		if ok, err := c.Client.ClaimSpecificChannel(ca.Username, ca.Site, want); err != nil {
+			log.Printf("[controller] claim %s/%s -> %s error: %v", ca.Site, ca.Username, want, err)
+			continue
+		} else if !ok {
 			if err := c.Client.ReassignChannel(ca.Username, ca.Site, cur, want); err != nil {
 				log.Printf("[controller] reassign %s/%s %s -> %s error: %v", ca.Site, ca.Username, cur, want, err)
-				continue
 			}
 		}
 	}
