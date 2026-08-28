@@ -57,15 +57,15 @@ import (
 const controllerUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 type assignerConfig struct {
-	CycleIntervalSec    int `json:"cycle_interval_sec"`
-	HeartbeatTimeoutSec int `json:"heartbeat_timeout_sec"`
-	ColdStartOfflineThr int `json:"cold_start_offline_threshold"`
-	ColdStartWaitSec    int `json:"cold_start_wait_sec"`
-	SCConcurrency       int `json:"sc_concurrency"`
-	SCCheckTimeoutSec   int `json:"sc_check_timeout_sec"`
-	SCStaleMin          int `json:"sc_stale_min"`
+	CycleIntervalSec    int  `json:"cycle_interval_sec"`
+	HeartbeatTimeoutSec int  `json:"heartbeat_timeout_sec"`
+	ColdStartOfflineThr int  `json:"cold_start_offline_threshold"`
+	ColdStartWaitSec    int  `json:"cold_start_wait_sec"`
+	SCConcurrency       int  `json:"sc_concurrency"`
+	SCCheckTimeoutSec   int  `json:"sc_check_timeout_sec"`
+	SCStaleMin          int  `json:"sc_stale_min"`
 	CBEnabled           bool `json:"cb_enabled"`
-	LeaseTTLSec         int `json:"lease_ttl_sec"`
+	LeaseTTLSec         int  `json:"lease_ttl_sec"`
 }
 
 func defaultAssignerConfig() assignerConfig {
@@ -128,8 +128,6 @@ func (c *Coordinator) runControllerCycle() {
 	}
 
 	cfg := c.assignerConfig()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
 
 	nodes, err := c.Client.GetNodes()
 	if err != nil {
@@ -183,27 +181,6 @@ func (c *Coordinator) runControllerCycle() {
 	if err != nil {
 		log.Printf("[controller] get assignments error: %v", err)
 		return
-	}
-
-	// Background liveness (continuous): every cycle recompute and publish
-	// is_live for BOTH platforms — Chaturbate via the bulk affiliate call and
-	// Stripchat via per-model probes. The fleet always has an authoritative,
-	// up-to-date count of live channels on cb.xxx and stripchat. This runs
-	// forever and is independent of assignment.
-	live := c.computeLiveness(ctx, cfg, all)
-
-	// Reset stale "recording" rows whose stream is now confirmed offline, so a
-	// dead stream doesn't stay pinned as recording. Only definitively-evaluated
-	// offline channels are touched.
-	for _, ca := range all {
-		if ca.Status != "recording" {
-			continue
-		}
-		if v, ok := live[keyOf(ca)]; ok && !v {
-			if err := c.Client.SetAssignmentStatus(ca.Username, ca.Site, "claimed"); err != nil {
-				log.Printf("[controller] reset recording status error for %s/%s: %v", ca.Site, ca.Username, err)
-			}
-		}
 	}
 
 	// Housekeeping every cycle: free channels owned by DEAD nodes only. A dead
@@ -280,11 +257,11 @@ func (c *Coordinator) runControllerCycle() {
 	// runs on a membership change OR whenever the split is still unequal with a
 	// movable (non-recording) channel available, so it corrects imbalance once and
 	// then stops — existing recordings are never moved, so they're never lost.
-		if len(active) > 0 {
-			for _, site := range []string{"chaturbate", "stripchat"} {
-				c.balanceSite(site, all, active, activeSet, reclaimSet, heldSet, live, needAssignment)
-			}
+	if len(active) > 0 {
+		for _, site := range []string{"chaturbate", "stripchat"} {
+			c.balanceSite(site, all, active, activeSet, reclaimSet, heldSet)
 		}
+	}
 	if needAssignment {
 		c.assignerAssignMu.Lock()
 		c.assignerAssigned = true
@@ -543,162 +520,85 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 }
 
 // balanceSite distributes the ENTIRE pool (live + offline) of one site evenly
-// across active nodes, so that NO channel is ever left unassigned.
+// across the active nodes, so that NO channel is ever left unassigned.
 //
-// Step A (ALWAYS runs) assigns every currently-free channel (unassigned, or
-// assigned to a reclaimed/unknown node) to the least-loaded active node. A
-// channel on a HELD (briefly-offline, within the grace window) node is NOT free,
-// so a transient blip never disturbs it. This runs every cycle so the pool is
-// always fully placed and split equally — no channel is ever left unassigned,
-// and an under-target node is filled as soon as free channels exist. Crucially
-// Step A never moves a channel already assigned to a LIVE node, so existing
-// recordings are never disturbed.
+// Assignment is a pure, deterministic equal split — it does NOT depend on
+// liveness. The pool is sorted by username and handed out in contiguous blocks
+// so the first (N%M) nodes get base+1 channels and the rest get base; this is
+// stable across cycles (no churn on a healthy fleet) and reproducible. Every
+// channel ends up on an active node, so even an offline/unknown channel is
+// placed and simply records when it goes live.
 //
-// Step B rebalances over-target nodes by moving only NON-RECORDING channels onto
-// under-target nodes. It runs on a membership change OR whenever a profitable
-// move still exists (over-target node has a movable channel, under-target node
-// has room) — self-terminating so the fleet isn't continuously shuffled. It
-// never moves a "recording" row, so in-progress recordings are never lost.
-func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, live map[string]bool, rebalance bool) {
-	// Distribute the ENTIRE pool (live + offline) evenly across active nodes so
-	// that NO channel is ever left unassigned. Offline channels still get a node
-	// — the node simply won't record them until they go live, and when they do
-	// it records automatically. This is the hard guarantee the operator wants.
-	// The `live` map is no longer used to gate assignment (only to avoid
-	// flipping a live recording's is_live flag); every channel is placed.
-	counts := map[string]int{}
-	var siteChans []database.ChannelAssignment
+// Two channels are deliberately NOT relocated: a channel actively recording on a
+// LIVE node (moving it would lose the in-progress recording) and a channel on a
+// HELD (briefly-offline, within the grace window) node (a transient blip must
+// not trigger a mass reassignment). Everything else is moved onto its equal slot,
+// so the fleet converges to an exact even split with zero unassigned channels.
+func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool) {
+	// Build the full pool of channels for this site. Assignment is a pure equal
+	// split across the active nodes and does NOT depend on liveness, so an
+	// offline/unknown channel is still placed on a node (it records when it goes
+	// live). Every channel gets a node; none is ever left unassigned.
+	var pool []database.ChannelAssignment
 	for _, ca := range all {
-		if ca.Site != site {
-			continue
-		}
-		siteChans = append(siteChans, ca)
-		if activeSet[ca.AssignedNode] {
-			counts[ca.AssignedNode]++
+		if ca.Site == site {
+			pool = append(pool, ca)
 		}
 	}
-	if len(active) == 0 || len(siteChans) == 0 {
+	if len(active) == 0 || len(pool) == 0 {
 		return
 	}
 
-	// Target distribution: floor(N/M) each, first (N%M) nodes get +1.
-	total := len(siteChans)
-	base := total / len(active)
-	rem := total % len(active)
-	target := map[string]int{}
+	// Deterministic order so the split is stable across cycles (no churn).
+	sort.Slice(pool, func(i, j int) bool { return pool[i].Username < pool[j].Username })
+
 	sorted := append([]database.Node{}, active...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NodeID < sorted[j].NodeID })
-	for i, n := range sorted {
-		target[n.NodeID] = base
-		if i < rem {
-			target[n.NodeID]++
+	M := len(sorted)
+	N := len(pool)
+	base := N / M
+	rem := N % M
+
+	// Desired node for pool index i: the first `rem` nodes get base+1, the rest
+	// get base -- the exact equal split (max 1 apart). Channels are handed out in
+	// contiguous blocks so the assignment is stable and reproducible.
+	desiredNode := func(i int) string {
+		if i < rem*(base+1) {
+			return sorted[i/(base+1)].NodeID
 		}
+		return sorted[rem+(i-rem*(base+1))/base].NodeID
 	}
 
-	// Step B first: rebalance over-target nodes (movable = NON-RECORDING channels
-	// only) onto under-target nodes. Running rebalance BEFORE claiming free
-	// channels is essential: if Step A first filled every under-target node to
-	// its target with the unassigned pool, Step B would have nowhere to move the
-	// over-target nodes' excess and the split would stay skewed. By rebalancing
-	// first we free capacity on under-target nodes for both the excess and the
-	// unassigned channels.
-	//
-	// Step B runs on a membership change (rebalance==true), OR whenever a
-	// profitable rebalance still exists: an over-target node holds a movable
-	// channel and an under-target node can take it. This self-terminates — once
-	// the pool is evenly split (or only recordings remain immovable) no profitable
-	// move remains, so the fleet is NOT continuously shuffled; it corrects
-	// imbalance once, then stays put. Recording channels are never moved, so
-	// in-progress recordings are never lost.
-	runStepB := rebalance
-	if !runStepB {
-		underExists := false
-		for _, n := range sorted {
-			if counts[n.NodeID] < target[n.NodeID] {
-				underExists = true
-				break
-			}
+	for i, ca := range pool {
+		want := desiredNode(i)
+		cur := ca.AssignedNode
+		if cur == want {
+			continue
 		}
-		if underExists {
-			for _, ca := range siteChans {
-				if ca.Status == "recording" {
-					continue
-				}
-				if counts[ca.AssignedNode] > target[ca.AssignedNode] {
-					runStepB = true
-					break
-				}
-			}
+		// Never move a channel actively recording on a LIVE node -- that would
+		// lose the in-progress recording. It stays put (temporary minor
+		// imbalance) until the recording ends.
+		if ca.Status == "recording" && cur != "" && activeSet[cur] {
+			continue
 		}
-	}
-	if runStepB {
-		over := append([]database.Node{}, active...)
-		sort.Slice(over, func(i, j int) bool { return counts[over[i].NodeID] > counts[over[j].NodeID] })
-		for _, n := range over {
-			excess := counts[n.NodeID] - target[n.NodeID]
-			if excess <= 0 {
+		// Keep channels on a HELD (briefly-offline, within grace) node so a
+		// transient blip doesn't trigger a mass reassignment.
+		if heldSet[cur] {
+			continue
+		}
+		if cur == "" || !activeSet[cur] {
+			if ok, err := c.Client.ClaimSpecificChannel(ca.Username, ca.Site, want); err != nil {
+				log.Printf("[controller] claim %s/%s -> %s error: %v", ca.Site, ca.Username, want, err)
 				continue
-			}
-			for _, ca := range siteChans {
-				if excess <= 0 {
-					break
-				}
-				if ca.AssignedNode != n.NodeID {
-					continue
-				}
-				if ca.Status == "recording" {
-					continue // never move a recording channel (would lose the recording)
-				}
-				dst := pickUnderTarget(sorted, target, counts)
-				if dst == "" {
-					break
-				}
-				if err := c.Client.ReassignChannel(ca.Username, ca.Site, n.NodeID, dst); err != nil {
-					log.Printf("[controller] rebalance %s/%s %s→%s error: %v", ca.Site, ca.Username, n.NodeID, dst, err)
-					continue
-				}
-				counts[n.NodeID]--
-				counts[dst]++
-				excess--
-			}
-		}
-	}
-
-	// Step A: EVERY channel with no active assignment → under-target node. A
-	// channel is claimable if it is unassigned, assigned to a reclaimed (down >=
-	// grace) node, or assigned to a node we no longer know about (deleted) — but
-	// NOT if it sits on a HELD (briefly-offline) node, whose channels we keep
-	// during the grace window. With Step B having freed capacity, this places the
-	// remaining pool evenly so none is left unassigned and the fleet reaches the
-	// exact equal split.
-	var free []database.ChannelAssignment
-	for _, ca := range siteChans {
-		if ca.AssignedNode == "" || reclaimSet[ca.AssignedNode] || (!activeSet[ca.AssignedNode] && !heldSet[ca.AssignedNode]) {
-			free = append(free, ca)
-		}
-	}
-	sort.Slice(free, func(i, j int) bool { return free[i].Username < free[j].Username })
-	for _, ca := range free {
-		dst := pickUnderTarget(sorted, target, counts)
-		if dst == "" {
-			break
-		}
-		if ca.AssignedNode == "" {
-			ok, err := c.Client.ClaimSpecificChannel(ca.Username, ca.Site, dst)
-			if err != nil {
-				log.Printf("[controller] claim %s/%s→%s error: %v", ca.Site, ca.Username, dst, err)
-				continue
-			}
-			if !ok {
+			} else if !ok {
 				continue
 			}
 		} else {
-			if err := c.Client.ReassignChannel(ca.Username, ca.Site, ca.AssignedNode, dst); err != nil {
-				log.Printf("[controller] reassign %s/%s %s→%s error: %v", ca.Site, ca.Username, ca.AssignedNode, dst, err)
+			if err := c.Client.ReassignChannel(ca.Username, ca.Site, cur, want); err != nil {
+				log.Printf("[controller] reassign %s/%s %s -> %s error: %v", ca.Site, ca.Username, cur, want, err)
 				continue
 			}
 		}
-		counts[dst]++
 	}
 }
 
