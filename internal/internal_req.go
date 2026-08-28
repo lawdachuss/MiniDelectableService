@@ -404,6 +404,13 @@ func SetRequestHeaders(req *http.Request) {
 		for name, value := range cookies {
 			req.AddCookie(&http.Cookie{Name: name, Value: value})
 		}
+		// cf_clearance is TLS/UA-bound: it was minted with the Chrome/146
+		// fingerprint (see internal_affiliate.go affiliateUA, used by the working
+		// onlinerooms call). Presenting a different User-Agent with the clearance
+		// makes Cloudflare reject the request on datacenter (runner) IPs, which is
+		// exactly why the cookie-less liveness GET returned Unknown and the live
+		// set never grew. Force the matching UA whenever we send the clearance.
+		req.Header.Set("User-Agent", affiliateUA)
 	}
 }
 

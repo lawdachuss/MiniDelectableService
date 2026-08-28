@@ -399,19 +399,30 @@ type cbLiveEntry struct {
 }
 
 // checkChaturbateLive probes one chaturbate channel via the configured
-// LivenessChecker (the cookie-less chatvideocontext room check) and caches the
-// result for 2 minutes. This is the per-channel fallback used when the bulk
-// affiliate onlinerooms API is unset or under-reports non-affiliate models, so
-// the controller always has a truthful live set to distribute. Transient probe
-// failures return LivenessUnknown (the caller preserves the prior flag rather
-// than marking a channel offline).
+// LivenessChecker (the chatvideocontext room check, cookie-authenticated when
+// server.Config.Cookies is set) and caches the result. This is the per-channel
+// fallback used when the bulk affiliate onlinerooms API is unset or
+// under-reports non-affiliate models, so the controller always has a truthful
+// live set to distribute.
+//
+// Definitive results (live/offline) are cached for 2 minutes. Transient/unknown
+// probes are cached only briefly (20s) so a channel whose probe was cut off by
+// the cycle timeout (or hit a Cloudflare challenge) is retried on the very next
+// cycle instead of being stranded as unassigned for minutes — otherwise the
+// fleet plateaus at "however many channels one 90s pass can probe".
 func (c *Coordinator) checkChaturbateLive(ctx context.Context, username string) LivenessResult {
 	c.cbLiveMu.Lock()
 	if c.cbLiveCache == nil {
 		c.cbLiveCache = map[string]cbLiveEntry{}
-	} else if e, ok := c.cbLiveCache[username]; ok && time.Since(e.at) < 2*time.Minute {
-		c.cbLiveMu.Unlock()
-		return e.res
+	} else if e, ok := c.cbLiveCache[username]; ok {
+		ttl := 2 * time.Minute
+		if e.res == LivenessUnknown {
+			ttl = 20 * time.Second
+		}
+		if time.Since(e.at) < ttl {
+			c.cbLiveMu.Unlock()
+			return e.res
+		}
 	}
 	c.cbLiveMu.Unlock()
 
