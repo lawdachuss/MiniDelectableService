@@ -1308,9 +1308,19 @@ func (c *Client) TryAcquireControllerLease(nodeID string, ttlSeconds int) (bool,
 
 // ReleaseControllerLease expires the lease early if this node currently holds
 // it. Called on graceful shutdown so another node can take over promptly.
+//
+// It goes through the release_controller_lease RPC (SECURITY DEFINER) rather
+// than a direct PATCH, because the anon API role is RLS-blocked from updating
+// controller_lease directly — a raw PATCH silently affects 0 rows and leaves
+// the lease valid, which would block every other node from ever acquiring it.
 func (c *Client) ReleaseControllerLease(nodeID string) error {
-	return c.patch("/controller_lease?node_id=eq."+url.QueryEscape(nodeID),
-		map[string]interface{}{"expires_at": "now()"})
+	resp, err := c.requestWithRetry("POST", "/rpc/release_controller_lease",
+		map[string]interface{}{"p_node_id": nodeID})
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
 
 // SetAssignmentStatus updates the status column of a single channel assignment.
