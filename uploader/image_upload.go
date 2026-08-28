@@ -54,9 +54,26 @@ func uploadWithRetries(maxAttempts int, label string, fn func() (string, error))
 	return "", lastErr
 }
 
-// Upload tries Pixhost first, then ImgBB, then Catbox.moe.
-// Returns the URL, host name, or an error if all hosts fail.
+// Upload returns the first successful direct image URL. Order: Catbox.moe
+// FIRST, then Pixhost, then ImgBB as fallbacks.
+//
+// On the GitHub Actions runner Catbox MUST be reached through CATBOX_PROXY_URL
+// (a Cloudflare Worker), which leaves from Cloudflare's edge IPs that Catbox
+// does not block — making it the only image host that reliably succeeds from
+// the datacenter runner IPs (Pixhost.to and ImgBB otherwise block/rate-limit
+// the runner). They are kept only as fallbacks for the rare case the
+// proxy/Catbox is unavailable.
 func (m *MultiImageUploader) Upload(filePath string) (url, host string, err error) {
+	// Catbox.moe first — routed through CATBOX_PROXY_URL on the runner so it
+	// succeeds from datacenter IPs where Pixhost/ImgBB are blocked.
+	url, err = uploadWithRetries(3, "Catbox", func() (string, error) {
+		return m.catbox.Upload(filePath)
+	})
+	if err == nil {
+		return url, "Catbox", nil
+	}
+	catboxErr := err
+
 	url, err = uploadWithRetries(3, "Pixhost", func() (string, error) {
 		return m.pixhost.Upload(filePath)
 	})
@@ -71,14 +88,6 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 	if err == nil {
 		return url, "ImgBB", nil
 	}
-	imgbbErr := err
 
-	url, err = uploadWithRetries(3, "Catbox", func() (string, error) {
-		return m.catbox.Upload(filePath)
-	})
-	if err == nil {
-		return url, "Catbox", nil
-	}
-
-	return "", "", fmt.Errorf("pixhost: %w (imgbb: %v, catbox: %v)", pixhostErr, imgbbErr, err)
+	return "", "", fmt.Errorf("catbox: %w (pixhost: %v, imgbb: %v)", catboxErr, pixhostErr, err)
 }
