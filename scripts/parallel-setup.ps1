@@ -92,19 +92,11 @@ $buildJob = Start-Job -Name build -ScriptBlock {
   # cache restore only populates chaturbate-dvr.exe, and later steps (cookie
   # deps install, cookie grab) need the full repo present.
   Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination $d -Recurse -Force -ErrorAction SilentlyContinue
-  $needBuild = -not (Test-Path "$d\chaturbate-dvr.exe")
-  if (-not $needBuild) {
-    # Stale-binary guard: rebuild when any Go source is newer than the cached exe.
-    # The workflow cache only restores on an exact source-hash match, but a stale
-    # exe could still linger in REPO_DIR on a reused runner; never trust it.
-    $exeTime = (Get-Item "$d\chaturbate-dvr.exe").LastWriteTime
-    $newestSrc = Get-ChildItem -Path $d -Recurse -Include *.go,go.mod,go.sum -File -ErrorAction SilentlyContinue |
-      Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($newestSrc -and $newestSrc.LastWriteTime -gt $exeTime) {
-      $needBuild = $true
-      Write-Host "(BUILD) Source is newer than cached binary - rebuilding from current source"
-    }
-  }
+  # ALWAYS build fresh from current source. Caching the DVR binary (workflow
+  # actions/cache) let the fleet run stale builds, so assignment/recording fixes
+  # never reached the nodes. We never trust a prebuilt or restored exe — rebuild
+  # on every run. (The repo copy above refreshes scripts/.env/requirements too.)
+  $needBuild = $true
   if ($needBuild) {
     Set-Location $d
     Write-Host "(BUILD) Building Go binaries..."
