@@ -13,7 +13,13 @@
 --   * dead-node channels are reclaimed (freed) so they get redistributed.
 --
 -- Apply in the Supabase SQL editor (or `psql "$SUPABASE_DB_URL" -f thisfile`).
+-- Idempotent: DROPs the functions first so a re-run never hits a
+-- "cannot change return type" error.
 -- ============================================================================
+
+DROP FUNCTION IF EXISTS mark_channel_recording(text, text);
+DROP FUNCTION IF EXISTS reset_channel_status(text, text, text);
+DROP FUNCTION IF EXISTS reclaim_node_channels(text);
 
 -- 1) Mark a channel as actively recording on its node. The per-node
 --    assignment-sync loop calls this so the controller's rebalancer (which
@@ -61,9 +67,8 @@ GRANT EXECUTE ON FUNCTION reset_channel_status(text, text, text) TO authenticate
 -- 3) Reclaim (free) every channel owned by a dead node so the controller can
 --    redistribute them. Refuses to touch status='recording' defensively (a dead
 --    node cannot be recording, but never interrupt a row mid-write). Returns the
---    number of channels reclaimed. SECURITY DEFINER so the anon API role can
---    write it. Returns a TABLE so PostgREST emits predictable
---    [{ "reclaimed": N }] JSON.
+--    number of channels reclaimed as a TABLE so PostgREST emits predictable
+--    [{ "reclaimed": N }] JSON. SECURITY DEFINER so the anon API role can write.
 CREATE OR REPLACE FUNCTION reclaim_node_channels(p_node_id text)
 RETURNS TABLE(reclaimed int)
 LANGUAGE plpgsql
