@@ -1347,6 +1347,43 @@ func (c *Client) SetAssignmentStatus(username, site, status string) error {
 	return nil
 }
 
+// ResetStaleRecordingAssignments returns every recording row that was reset to
+// claimed because its heartbeat was already stale in the database.  Keeping the
+// timestamp condition in the UPDATE itself is important: a row can become an
+// active recording after the controller has read its assignment snapshot.
+//
+// Recorder nodes use the service-role key, which is permitted to make this
+// conditional REST update.  The two requests cover old heartbeats and NULL
+// heartbeats without ever touching a fresh recording.
+func (c *Client) ResetStaleRecordingAssignments(before time.Time) ([]ChannelAssignment, error) {
+	paths := []string{
+		fmt.Sprintf("/channel_assignments?status=eq.recording&last_heartbeat=lt.%s",
+			url.QueryEscape(before.UTC().Format(time.RFC3339Nano))),
+		"/channel_assignments?status=eq.recording&last_heartbeat=is.null",
+	}
+
+	var reset []ChannelAssignment
+	for _, path := range paths {
+		resp, err := c.requestWithRetry("PATCH", path, map[string]interface{}{"status": "claimed"})
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+		var rows []ChannelAssignment
+		err = json.NewDecoder(resp.Body).Decode(&rows)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("decode stale recording reset: %w", err)
+		}
+		reset = append(reset, rows...)
+	}
+	return reset, nil
+}
+
 // SetSiteLiveness bulk-updates is_live for a single site. Only the explicitly
 // listed usernames are touched (chunked in-list PATCHes), so channels that
 // could not be evaluated this cycle (e.g. a Stripchat geo-ban) keep their

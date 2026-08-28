@@ -269,7 +269,15 @@ func (c *Coordinator) runControllerCycle() {
 	// rows, and only moves existing assignments while repairing an imbalance.
 	if len(active) > 0 {
 		needAssignment = needAssignment || c.hasMovableImbalance(all, active, activeSet, heldSet)
-		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, needAssignment)
+		renewLease := func() bool {
+			held, err := c.Client.TryAcquireControllerLease(c.NodeID, cfg.LeaseTTLSec)
+			if err != nil {
+				log.Printf("[controller] lease renewal error: %v", err)
+				return false
+			}
+			return held
+		}
+		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, needAssignment, renewLease)
 	}
 	if needAssignment {
 		c.assignerAssignMu.Lock()
@@ -284,17 +292,24 @@ func (c *Coordinator) runControllerCycle() {
 const recordingLeaseTTL = 2 * time.Minute
 
 func (c *Coordinator) clearStaleRecordingLeases(all []database.ChannelAssignment, now time.Time) {
-	for i := range all {
-		ca := &all[i]
-		if ca.Status != "recording" || recordingLeaseFresh(ca.LastHeartbeat, now) {
-			continue
-		}
-		if err := c.Client.SetAssignmentStatus(ca.Username, ca.Site, "claimed"); err != nil {
-			log.Printf("[controller] clear stale recording lease %s/%s: %v", ca.Site, ca.Username, err)
-			continue
-		}
-		ca.Status = "claimed"
+	reset, err := c.Client.ResetStaleRecordingAssignments(now.Add(-recordingLeaseTTL))
+	if err != nil {
+		log.Printf("[controller] clear stale recording leases: %v", err)
+		return
 	}
+	if len(reset) == 0 {
+		return
+	}
+	resetKeys := make(map[string]struct{}, len(reset))
+	for _, ca := range reset {
+		resetKeys[keyOf(ca)] = struct{}{}
+	}
+	for i := range all {
+		if _, ok := resetKeys[keyOf(all[i])]; ok {
+			all[i].Status = "claimed"
+		}
+	}
+	log.Printf("[controller] reset %d stale recording lease(s)", len(reset))
 }
 
 func recordingLeaseFresh(lastHeartbeat string, now time.Time) bool {
@@ -597,7 +612,7 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 // HELD (briefly-offline, within the grace window) node (a transient blip must
 // not trigger a mass reassignment). Everything else is moved onto its equal slot,
 // so the fleet converges to an exact even split with zero unassigned channels.
-func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, doRebalance bool) {
+func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, doRebalance bool, renewLease func() bool) {
 	// Build the full pool of channels for this site. Assignment is a pure equal
 	// split across the active nodes and does NOT depend on liveness, so an
 	// offline/unknown channel is still placed on a node (it records when it goes
@@ -622,6 +637,7 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 
 	sorted := append([]database.Node{}, active...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NodeID < sorted[j].NodeID })
+	mutations := 0
 	for i, ca := range pool {
 		want := equalSplitTarget(i, len(pool), sorted)
 		cur := ca.AssignedNode
@@ -639,6 +655,13 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 		if heldSet[cur] {
 			continue
 		}
+		// A full fleet repair can require hundreds of requests.  Renew before
+		// starting each small batch so the original leader cannot continue a
+		// sweep after its short lease has expired.
+		if mutations > 0 && mutations%10 == 0 && !renewLease() {
+			log.Printf("[controller] lease lost during assignment sweep; stopping")
+			return
+		}
 		if cur == "" {
 			// Step A (every cycle): claim every free/unassigned channel to its
 			// equal-split slot so no channel is ever left unassigned.
@@ -648,6 +671,7 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 			} else if !ok {
 				continue
 			}
+			mutations++
 			continue
 		}
 		// Step B (membership change only): a channel already assigned to a live
@@ -664,6 +688,7 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 				log.Printf("[controller] reassign %s/%s %s -> %s error: %v", ca.Site, ca.Username, cur, want, err)
 			}
 		}
+		mutations++
 	}
 }
 
