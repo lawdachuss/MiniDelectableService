@@ -131,7 +131,13 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.REPO_DIR }}\chaturbate-dvr.exe
-          key: dvr-v2-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
+          # Bumped v2 -> v3 to force a cache miss on every node so the binary is
+          # rebuilt from current source. The previous v2 key could restore a
+          # stale exe (built before a controller.go change) and the staleness
+          # guard then saw the restored binary as "newer" than the checked-out
+          # source, leaving the fleet running an old build. A source change now
+          # always misses this exact key -> fresh build.
+          key: dvr-v3-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
 
       - uses: actions/setup-go@v5
         with:
@@ -174,8 +180,9 @@ jobs:
           # could never be restored by the exact-key lookup, so every run
           # re-saved a unique entry and the prefix fallback served stale
           # binaries forever. A source change now changes the hash → cache
-          # miss → fresh build.
-          key: dvr-v2-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
+          # miss → fresh build. Bumped v2 -> v3 to force a one-time full
+          # rebuild from current source across the fleet.
+          key: dvr-v3-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
 
       # DNS fix + pip/playwright deps + pinned Chrome 146 run in PARALLEL
       # background jobs (prepare-cookies.ps1), then cookie_grabber.py mints a
