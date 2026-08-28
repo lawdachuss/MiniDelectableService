@@ -101,26 +101,47 @@ $buildJob = Start-Job -Name build -ScriptBlock {
     Set-Location $d
     Write-Host "(BUILD) Building Go binaries..."
     $sa = $env:ALL_PROXY; Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+    # A first-run module download occasionally times out during a TLS handshake
+    # with proxy.golang.org.  GOPROXY only falls through for 404/410 responses,
+    # not transport errors, so explicitly download the module graph with a
+    # patient retry loop before compiling.  Disabling HTTP/2 here avoids the
+    # flaky shared-runner connection that caused the observed handshake stalls.
     $env:GOPROXY = "https://proxy.golang.org,direct"
+    $env:GODEBUG = "http2client=0"
     # Resolve go.exe explicitly so a PATH hiccup inside the job surfaces as a clear
     # error instead of a CommandNotFound crash with no captured output.
     $goCmd = Get-Command go -ErrorAction SilentlyContinue
     $goPath = if ($goCmd) { $goCmd.Source } else { "$env:GOROOT\bin\go.exe" }
     if (-not (Test-Path $goPath)) { throw "(BUILD) go.exe not found (checked PATH and GOROOT=$env:GOROOT)" }
+
+    $modulesReady = $false
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+      Write-Host "(BUILD) Downloading Go modules (attempt $attempt/6)..."
+      $downloadOut = & $goPath mod download 2>&1
+      if ($LASTEXITCODE -eq 0) {
+        $modulesReady = $true
+        break
+      }
+      Write-Host "(BUILD) Module download attempt $attempt failed (exit $LASTEXITCODE):"
+      $downloadOut | ForEach-Object { Write-Host "  $_" }
+      if ($attempt -lt 6) { Start-Sleep -Seconds ([Math]::Min(45, 5 * $attempt)) }
+    }
+    if (-not $modulesReady) { throw "(BUILD) Go module download failed after 6 attempts" }
+
     foreach ($bin in @("chaturbate-dvr.exe .")) {
       $parts = $bin -split ' ', 2
       $name = $parts[0]; $pkg = $parts[1]
       $ok = $false
-      for ($attempt = 0; $attempt -lt 3; $attempt++) {
+      for ($attempt = 0; $attempt -lt 4; $attempt++) {
         $t = [Diagnostics.Stopwatch]::StartNew()
         $out = & $goPath build -ldflags="-s -w" -o $name $pkg 2>&1
         $t.Stop(); $exit = $LASTEXITCODE
         if ($exit -eq 0) { Write-Host "(BUILD) $($name): $([math]::Round($t.Elapsed.TotalSeconds,1))s"; $ok = $true; break }
         Write-Host "(BUILD) $name attempt $($attempt+1) failed (exit $exit):"
         $out | ForEach-Object { Write-Host "  $_" }
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds ([Math]::Min(30, 5 * ($attempt + 1)))
       }
-      if (-not $ok) { Write-Error "(BUILD) $name failed after 3 attempts"; $out | ForEach-Object { Write-Host "  $_" } }
+      if (-not $ok) { throw "(BUILD) $name failed after 4 attempts" }
     }
     if ($sa) { $env:ALL_PROXY = $sa; $env:all_proxy = $sa }
   } else { Write-Host "(BUILD) Using cached binaries" }
@@ -374,8 +395,8 @@ $stJob = Start-Job -Name tasks -ArgumentList $repoDir -ScriptBlock {
 # exceeds 90s on a shared windows-latest runner. The old fixed Wait-Job -Timeout 90
 # killed an in-flight `go build`, producing a bare "(FATAL) DVR binary not built" on
 # every source change. Poll up to a generous budget and surface the job output.
-Write-Host "[MAIN] Waiting for build (budget 480s)..."; $null = [System.Console]::Out.Flush()
-$buildDeadline = (Get-Date).AddSeconds(480)
+Write-Host "[MAIN] Waiting for build (budget 900s)..."; $null = [System.Console]::Out.Flush()
+$buildDeadline = (Get-Date).AddSeconds(900)
 while ($buildJob.State -eq 'Running' -and (Get-Date) -lt $buildDeadline) {
   Start-Sleep -Seconds 15
 }
@@ -390,7 +411,7 @@ if (-not (Test-Path "$repoDir\chaturbate-dvr.exe")) {
     Write-Error "(FATAL) DVR build job failed"; exit 1
   }
   Write-Host "(BUILD) job state: $buildState"
-  Write-Error "(FATAL) DVR binary not built within 480s"; exit 1
+  Write-Error "(FATAL) DVR binary not built within 900s"; exit 1
 }
 Write-Host "(OK) chaturbate-dvr.exe: $([math]::Round((Get-Item "$repoDir\chaturbate-dvr.exe").Length / 1MB, 1)) MB"
 
