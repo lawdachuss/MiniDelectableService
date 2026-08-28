@@ -120,10 +120,21 @@ $chromeJob = Start-Job -Name chrome -ScriptBlock {
 }
 
 # ========== Wait for all three jobs in parallel ==========
-Write-Host "[PREP] Running DNS + deps + Chrome install in parallel..."; $null = [System.Console]::Out.Flush()
-$null = $dnsJob | Wait-Job -Timeout 120 -ErrorAction SilentlyContinue
-$null = $depsJob | Wait-Job -Timeout 600 -ErrorAction SilentlyContinue
-$null = $chromeJob | Wait-Job -Timeout 900 -ErrorAction SilentlyContinue
+# These tasks are best-effort.  Waiting for them one-by-one accidentally made
+# a slow Chrome download hold the whole DVR startup for DNS + deps + Chrome
+# timeouts combined.  Use one shared deadline, then continue with the stored
+# cookies rather than leave a fleet node offline.
+Write-Host "[PREP] Running DNS + deps + Chrome install in parallel (shared 360s cap)..."; $null = [System.Console]::Out.Flush()
+$prepDeadline = (Get-Date).AddSeconds(360)
+$prepJobs = @($dnsJob, $depsJob, $chromeJob)
+while ((@($prepJobs | Where-Object { $_.State -eq 'Running' }).Count -gt 0) -and (Get-Date) -lt $prepDeadline) {
+  Start-Sleep -Seconds 5
+}
+$stillRunning = @($prepJobs | Where-Object { $_.State -eq 'Running' })
+if ($stillRunning.Count -gt 0) {
+  Write-Warning "[PREP] Shared setup cap reached; stopping $($stillRunning.Count) slow task(s) and continuing"
+  $stillRunning | Stop-Job -ErrorAction SilentlyContinue
+}
 $chromePath = Receive-Job $chromeJob -ErrorAction SilentlyContinue
 Receive-Job $dnsJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [DNS] $_" }
 Receive-Job $depsJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [DEPS] $_" }
