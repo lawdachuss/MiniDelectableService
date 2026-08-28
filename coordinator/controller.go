@@ -329,32 +329,34 @@ func recordingLeaseFresh(lastHeartbeat string, now time.Time) bool {
 	return err == nil && now.Sub(hb) <= recordingLeaseTTL
 }
 
-// hasMovableImbalance is false once the deterministic target has converged;
-// it is a repair condition, not a periodic shuffle.
+// hasMovableImbalance measures ownership counts, never a channel's position in
+// a sorted list.  Equal counts are already balanced even when a different
+// perfectly-valid prior allocation gave a particular channel to another node.
+// That distinction is what prevents a stable fleet from shuffling channels.
 func (c *Coordinator) hasMovableImbalance(all []database.ChannelAssignment, active []database.Node, activeSet, heldSet map[string]bool) bool {
 	if len(active) == 0 || len(all) == 0 {
 		return false
 	}
-	pool := append([]database.ChannelAssignment(nil), all...)
-	sort.Slice(pool, func(i, j int) bool {
-		if pool[i].Site == pool[j].Site {
-			return pool[i].Username < pool[j].Username
+	pool := make([]database.ChannelAssignment, 0, len(all))
+	for _, ca := range all {
+		if !heldSet[ca.AssignedNode] {
+			pool = append(pool, ca)
 		}
-		return pool[i].Site < pool[j].Site
-	})
+	}
 	nodes := append([]database.Node(nil), active...)
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
-	for i, ca := range pool {
-		if ca.AssignedNode == equalSplitTarget(i, len(pool), nodes) {
-			continue
+	targets := equalSplitCounts(len(pool), nodes)
+	counts := make(map[string]int, len(nodes))
+	for _, ca := range pool {
+		if ca.AssignedNode == "" || !activeSet[ca.AssignedNode] {
+			return true
 		}
-		if ca.Status == "recording" && ca.AssignedNode != "" && activeSet[ca.AssignedNode] {
-			continue
+		counts[ca.AssignedNode]++
+	}
+	for _, n := range nodes {
+		if counts[n.NodeID] != targets[n.NodeID] {
+			return true
 		}
-		if heldSet[ca.AssignedNode] {
-			continue
-		}
-		return true
 	}
 	return false
 }
@@ -622,13 +624,12 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 // not trigger a mass reassignment). Everything else is moved onto its equal slot,
 // so the fleet converges to an exact even split with zero unassigned channels.
 func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, doRebalance bool, renewLease func() bool) {
-	// Build the full pool of channels for this site. Assignment is a pure equal
-	// split across the active nodes and does NOT depend on liveness, so an
-	// offline/unknown channel is still placed on a node (it records when it goes
-	// live). Every channel gets a node; none is ever left unassigned.
+	// Rows held for a briefly offline node are deliberately outside this sweep.
+	// The rest of the pool is balanced only by count, which preserves stable
+	// ownership while still ensuring no channel is left unassigned.
 	var pool []database.ChannelAssignment
 	for _, ca := range all {
-		if site == "" || ca.Site == site {
+		if (site == "" || ca.Site == site) && !heldSet[ca.AssignedNode] {
 			pool = append(pool, ca)
 		}
 	}
@@ -646,59 +647,85 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 
 	sorted := append([]database.Node{}, active...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NodeID < sorted[j].NodeID })
+	targets := equalSplitCounts(len(pool), sorted)
+	counts := make(map[string]int, len(sorted))
+	for _, ca := range pool {
+		if activeSet[ca.AssignedNode] {
+			counts[ca.AssignedNode]++
+		}
+	}
+
+	// First fill empty slots. This runs even without a membership rebalance so
+	// newly discovered channels cannot remain unassigned.
 	mutations := 0
-	for i, ca := range pool {
-		want := equalSplitTarget(i, len(pool), sorted)
-		cur := ca.AssignedNode
-		if cur == want {
+	for _, ca := range pool {
+		if ca.AssignedNode != "" {
 			continue
 		}
-		// Never move a channel actively recording on a LIVE node -- that would
-		// lose the in-progress recording. It stays put (temporary minor
-		// imbalance) until the recording ends.
-		if ca.Status == "recording" && cur != "" && activeSet[cur] {
+		want := pickUnderTarget(sorted, targets, counts)
+		if want == "" {
 			continue
 		}
-		// Keep channels on a HELD (briefly-offline, within grace) node so a
-		// transient blip doesn't trigger a mass reassignment.
-		if heldSet[cur] {
-			continue
-		}
-		// A full fleet repair can require hundreds of requests.  Renew before
-		// starting each small batch so the original leader cannot continue a
-		// sweep after its short lease has expired.
 		if mutations > 0 && mutations%10 == 0 && !renewLease() {
 			log.Printf("[controller] lease lost during assignment sweep; stopping")
 			return
 		}
-		if cur == "" {
-			// Step A (every cycle): claim every free/unassigned channel to its
-			// equal-split slot so no channel is ever left unassigned.
-			if ok, err := c.Client.ClaimSpecificChannel(ca.Username, ca.Site, want); err != nil {
-				log.Printf("[controller] claim %s/%s -> %s error: %v", ca.Site, ca.Username, want, err)
-				continue
-			} else if !ok {
-				continue
-			}
-			mutations++
-			continue
-		}
-		// Step B (membership change only): a channel already assigned to a live
-		// node but out of place is relocated to its equal-split slot. This is
-		// gated so a stable fleet is not continuously reshuffled.
-		if !doRebalance {
-			continue
-		}
 		if ok, err := c.Client.ClaimSpecificChannel(ca.Username, ca.Site, want); err != nil {
 			log.Printf("[controller] claim %s/%s -> %s error: %v", ca.Site, ca.Username, want, err)
 			continue
-		} else if !ok {
-			if err := c.Client.ReassignChannel(ca.Username, ca.Site, cur, want); err != nil {
-				log.Printf("[controller] reassign %s/%s %s -> %s error: %v", ca.Site, ca.Username, cur, want, err)
-			}
+		} else if ok {
+			counts[want]++
+			mutations++
 		}
+	}
+	if !doRebalance {
+		return
+	}
+
+	// Then move only from an overloaded/dead node to an under-target node.
+	// A fresh recording is never moved; it simply occupies one of its node's
+	// slots until the stream ends.
+	for _, ca := range pool {
+		cur := ca.AssignedNode
+		if cur == "" || heldSet[cur] || (ca.Status == "recording" && activeSet[cur]) {
+			continue
+		}
+		if activeSet[cur] && counts[cur] <= targets[cur] {
+			continue
+		}
+		want := pickUnderTarget(sorted, targets, counts)
+		if want == "" || want == cur {
+			continue
+		}
+		if mutations > 0 && mutations%10 == 0 && !renewLease() {
+			log.Printf("[controller] lease lost during assignment sweep; stopping")
+			return
+		}
+		if err := c.Client.ReassignChannel(ca.Username, ca.Site, cur, want); err != nil {
+			log.Printf("[controller] reassign %s/%s %s -> %s error: %v", ca.Site, ca.Username, cur, want, err)
+			continue
+		}
+		if activeSet[cur] {
+			counts[cur]--
+		}
+		counts[want]++
 		mutations++
 	}
+}
+
+func equalSplitCounts(total int, nodes []database.Node) map[string]int {
+	targets := make(map[string]int, len(nodes))
+	if len(nodes) == 0 {
+		return targets
+	}
+	base, remainder := total/len(nodes), total%len(nodes)
+	for i, n := range nodes {
+		targets[n.NodeID] = base
+		if i < remainder {
+			targets[n.NodeID]++
+		}
+	}
+	return targets
 }
 
 // equalSplitTarget assigns the first remainder nodes one additional channel.
