@@ -263,11 +263,20 @@ func (c *Coordinator) runControllerCycle() {
 	// restart can converge instead of preserving stale imbalance forever.
 	c.clearStaleRecordingLeases(all, now)
 
+	// Do not let the repair check bypass the cold-start gate.  In particular, an
+	// early worker must not claim the entire unassigned pool merely because it
+	// arrived before the rest of the fleet.  Once an initial allocation has been
+	// made, later unassigned rows and genuine imbalance can be repaired safely.
+	c.assignerAssignMu.Lock()
+	assignedBefore := c.assignerAssigned
+	c.assignerAssignMu.Unlock()
+	canAssign := needAssignment || assignedBefore
+
 	// Assign the complete pool as one deterministic sequence.  Per-site splits
 	// could give the same early-sorting nodes an extra channel for each site.
 	// Whole-pool splitting guarantees a max difference of one with no unassigned
 	// rows, and only moves existing assignments while repairing an imbalance.
-	if len(active) > 0 {
+	if canAssign && len(active) > 0 {
 		needAssignment = needAssignment || c.hasMovableImbalance(all, active, activeSet, heldSet)
 		renewLease := func() bool {
 			held, err := c.Client.TryAcquireControllerLease(c.NodeID, cfg.LeaseTTLSec)
