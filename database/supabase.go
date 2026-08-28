@@ -1326,10 +1326,25 @@ func (c *Client) ReleaseControllerLease(nodeID string) error {
 // SetAssignmentStatus updates the status column of a single channel assignment.
 // Used by the controller to reset a stale "recording" row back to "claimed"
 // once the stream is confirmed offline.
+//
+// Plain anon PATCH is RLS-blocked on channel_assignments (only service_role can
+// write via REST), so this goes through the reset_channel_status RPC
+// (SECURITY DEFINER), which is the only path that actually persists.
 func (c *Client) SetAssignmentStatus(username, site, status string) error {
-	return c.patch(fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s",
-		url.QueryEscape(username), url.QueryEscape(site)),
-		map[string]interface{}{"status": status})
+	resp, err := c.requestWithRetry("POST", "/rpc/reset_channel_status", map[string]interface{}{
+		"p_username": username,
+		"p_site":     site,
+		"p_status":   status,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 // SetSiteLiveness bulk-updates is_live for a single site. Only the explicitly
@@ -1514,12 +1529,24 @@ func (c *Client) ClaimSpecificChannel(username, site, nodeID string) (bool, erro
 }
 
 // ReleaseNodeChannels releases all channels currently assigned to a node.
+//
+// Plain anon PATCH is RLS-blocked on channel_assignments, so the actual write
+// goes through the reclaim_node_channels RPC (SECURITY DEFINER), which frees
+// every channel owned by the node (defensively skipping status='recording' so
+// an in-progress recording is never interrupted mid-write).
 func (c *Client) ReleaseNodeChannels(nodeID string) error {
-	return c.patch(fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&status=neq.unassigned", url.QueryEscape(nodeID)),
-		map[string]interface{}{
-			"assigned_node": nil,
-			"status":        "unassigned",
-		})
+	resp, err := c.requestWithRetry("POST", "/rpc/reclaim_node_channels", map[string]interface{}{
+		"p_node_id": nodeID,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 // ReleaseNodeOfflineChannels releases a node's OFFLINE channels back to the
@@ -1684,15 +1711,26 @@ func (c *Client) ReleaseChannel(username, site string) error {
 // MarkChannelRecording marks a channel as actively recording on its node and
 // bumps its recording heartbeat. Called by the liveness loop for this node's
 // live channels so "live+recording" is authoritative in the DB.
+//
+// Plain anon PATCH is RLS-blocked on channel_assignments, so this goes through
+// the mark_channel_recording RPC (SECURITY DEFINER). This status='recording'
+// mark is what makes the controller's rebalancer refuse to move the row (via the
+// reassign_channel RPC's status guard and the protect_recording_assignment
+// trigger), so an in-progress recording is never interrupted.
 func (c *Client) MarkChannelRecording(username, site string) error {
-	return c.patch(
-		fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s",
-			url.QueryEscape(username), url.QueryEscape(site)),
-		map[string]interface{}{
-			"status":           "recording",
-			"last_recorded_at": "now()",
-			"last_heartbeat":   "now()",
-		})
+	resp, err := c.requestWithRetry("POST", "/rpc/mark_channel_recording", map[string]interface{}{
+		"p_username": username,
+		"p_site":     site,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 // ReassertAssignmentNode forces a channel's owning node back to nodeID. Used by
@@ -1963,23 +2001,32 @@ func (c *Client) SetChannelsNotLive(pairs [][2]string) error {
 
 // ReclaimChannels sets assigned_node=NULL for all channels belonging to a dead node.
 // Returns the number of channels reclaimed.
+//
+// Plain anon PATCH is RLS-blocked on channel_assignments, so the write goes
+// through the reclaim_node_channels RPC (SECURITY DEFINER), which frees every
+// channel owned by the node (defensively skipping status='recording').
 func (c *Client) ReclaimChannels(deadNodeID string) (int, error) {
-	// First, count what we'll reclaim
-	var assignments []ChannelAssignment
-	err := c.getAllPaginated(fmt.Sprintf("/channel_assignments?assigned_node=eq.%s&select=username",
-		url.QueryEscape(deadNodeID)), &assignments)
+	resp, err := c.requestWithRetry("POST", "/rpc/reclaim_node_channels", map[string]interface{}{
+		"p_node_id": deadNodeID,
+	})
 	if err != nil {
 		return 0, err
 	}
-	if len(assignments) == 0 {
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var rows []struct {
+		Reclaimed int `json:"reclaimed"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		return 0, fmt.Errorf("decode reclaim: %w", err)
+	}
+	if len(rows) == 0 {
 		return 0, nil
 	}
-
-	// Release them
-	if err := c.ReleaseNodeChannels(deadNodeID); err != nil {
-		return 0, err
-	}
-	return len(assignments), nil
+	return rows[0].Reclaimed, nil
 }
 
 // BulkInsertAssignments creates channel_assignments rows for channels that don't have one yet.

@@ -264,7 +264,7 @@ func scanVideos() []*VideoEntry {
 				}
 			}
 			modTime := rec.Timestamp
-			if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil {
+			if t, err := time.Parse(time.RFC3339Nano, rec.Timestamp); err == nil {
 				modTime = t.Format("2006-01-02 15:04")
 			} else if t, err := time.Parse("2006-01-02T15:04:05Z", rec.Timestamp); err == nil {
 				modTime = t.Format("2006-01-02 15:04")
@@ -474,8 +474,8 @@ func getRecommendations(currentVideo *VideoEntry, allVideos []*VideoEntry, limit
 
 		// Recent videos get bonus (up to 10 points based on recency)
 		if v.ModTimeSort != "" {
-			vTime, err1 := time.Parse(time.RFC3339, v.ModTimeSort)
-			cTime, err2 := time.Parse(time.RFC3339, currentVideo.ModTimeSort)
+			vTime, err1 := time.Parse(time.RFC3339Nano, v.ModTimeSort)
+			cTime, err2 := time.Parse(time.RFC3339Nano, currentVideo.ModTimeSort)
 			if err1 == nil && err2 == nil {
 				daysDiff := vTime.Sub(cTime).Hours() / 24
 				if daysDiff < 0 {

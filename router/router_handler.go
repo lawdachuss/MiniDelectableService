@@ -214,7 +214,7 @@ func computeRecordingReconciliation(uploads *entity.UploadsResponse) *RecordingR
 			continue
 		}
 		orphanBytes += o.Size
-		mod, err := time.Parse(time.RFC3339, o.ModTime)
+		mod, err := time.Parse(time.RFC3339Nano, o.ModTime)
 		if err != nil {
 			continue
 		}

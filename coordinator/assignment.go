@@ -45,16 +45,13 @@ func (c *Coordinator) CreateChannelAssignment(conf *entity.ChannelConfig) error 
 		return err
 	}
 
-	claimed, err := c.Client.ClaimSpecificChannel(conf.Username, conf.Site, c.NodeID)
-	if err != nil {
-		return err
-	}
-
-	if claimed {
-		log.Printf("[coordinator] claimed new channel %s for this node", conf.Username)
-	} else {
-		log.Printf("[coordinator] channel %s claimed by another node", conf.Username)
-	}
+	// IMPORTANT: do NOT claim the new channel to THIS node. The row is created
+	// with status='unassigned', and the leader-elected controller's balanceSite
+	// sweep claims every unassigned channel into the fleet-wide equal split on
+	// its very next cycle. Claiming here would pin the channel to whichever node
+	// happened to add it — and if it goes live and records before the controller
+	// rebalances, it would be stuck there, breaking the even distribution.
+	log.Printf("[coordinator] created channel %s/%s (unassigned) — controller will assign it", conf.Site, conf.Username)
 
 	return nil
 }

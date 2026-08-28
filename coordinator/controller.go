@@ -152,7 +152,11 @@ func (c *Coordinator) runControllerCycle() {
 		}
 		// How long has this node been unreachable? Use its last heartbeat as the
 		// proxy for when it went down (a node stops heartbeating when it leaves).
-		hb, perr := time.Parse(time.RFC3339, n.LastHeartbeat)
+		// PostgREST returns timestamptz with fractional seconds
+		// (e.g. "2026-08-28T05:28:53.484415+00:00"); time.RFC3339 rejects the
+		// fractional part, which would make EVERY node look stale and disable
+		// assignment entirely. RFC3339Nano parses both forms.
+		hb, perr := time.Parse(time.RFC3339Nano, n.LastHeartbeat)
 		off := nodeReclaimGrace + 1
 		if perr == nil {
 			off = now.Sub(hb)
