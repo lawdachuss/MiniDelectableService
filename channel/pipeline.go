@@ -292,7 +292,7 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 			completedHosts = nil
 			hostsToTry = allHosts
 		}
-ch.Info("upload: %d/%d hosts already have this file — uploading to %d remaining",
+	ch.Info("upload: %d/%d hosts already have this file — uploading to %d remaining",
 		len(completedHosts), len(allHosts), len(hostsToTry))
 	}
 
@@ -493,7 +493,7 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 	// thumbnail and sprite to the image hosts on every retry — exactly the
 	// host-hammering loop that causes the fleet-wide rate-limit failures.
 	// A missing sprite/preview is cosmetic; a missing thumbnail is not.
-	if p.ThumbURL == "" {
+	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
 		thumbURL, spriteURL, previewURL := ch.generateThumbnail(p.FilePath)
 		generated := false
 		if p.ThumbURL == "" && thumbURL != "" {
@@ -509,7 +509,7 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 			generated = true
 		}
 		if generated {
-			ch.Info("upload: generated missing thumbnails for %s (retry)", p.Filename)
+			ch.Info("upload: generated missing presentation assets for %s (retry)", p.Filename)
 		} else {
 			ch.Warn("upload: thumbnail generation failed for %s (skipped — local file kept for later retry)", p.Filename)
 		}
@@ -606,7 +606,7 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 	// source video).  The startup/periodic ScanThumbnails pass picks these
 	// files up and retries generation; deleting here would lose that chance,
 	// while the video itself is already safe in the cloud.
-	if p.ThumbURL == "" {
+	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
 		ch.Info("cleanup: keeping %s — thumbnail missing (queued for thumbnail retry)", p.Filename)
 		return nil
 	}
@@ -643,9 +643,9 @@ type PipelineQueue struct {
 	cond      *sync.Cond
 	wg        sync.WaitGroup
 	stopped   bool
-	started   bool           // tracks whether the worker goroutine has been launched
-	stopCh    chan struct{}  // closed on Stop() to cancel pending retry timers
-	enqueued  int            // total pipelines accepted (after dedup), incl. currently processing
+	started   bool          // tracks whether the worker goroutine has been launched
+	stopCh    chan struct{} // closed on Stop() to cancel pending retry timers
+	enqueued  int           // total pipelines accepted (after dedup), incl. currently processing
 
 	// processingBytes is the FileSize of the pipeline currently being worked
 	// by each worker (popped but not finished).  PendingBytes() sums this with

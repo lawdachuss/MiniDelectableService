@@ -48,17 +48,19 @@ func TestPipelineCleanupDeletesWithLinksAndThumbnail(t *testing.T) {
 		UpdateCh: make(chan bool, 1),
 	}
 	p := &Pipeline{
-		FilePath: filePath,
-		Filename: filepath.Base(filePath),
-		Links:    map[string]string{"GoFile": "https://gofile.example/video"},
-		ThumbURL: "https://pixhost.example/thumb.jpg",
+		FilePath:   filePath,
+		Filename:   filepath.Base(filePath),
+		Links:      map[string]string{"GoFile": "https://gofile.example/video"},
+		ThumbURL:   "https://pixhost.example/thumb.jpg",
+		SpriteURL:  "https://pixhost.example/sprite.jpg",
+		PreviewURL: "https://files.catbox.moe/preview.webp",
 	}
 
 	if err := p.stageCleanup(ch); err != nil {
 		t.Fatalf("stageCleanup: %v", err)
 	}
 	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
-		t.Fatalf("file should have been removed with at least 1 uploaded link and a thumbnail: %v", err)
+		t.Fatalf("file should have been removed with links and all presentation assets: %v", err)
 	}
 }
 
@@ -119,10 +121,10 @@ func TestPipelineCleanupKeepsWhenSpriteButNoThumbnail(t *testing.T) {
 		UpdateCh: make(chan bool, 1),
 	}
 	p := &Pipeline{
-		FilePath:  filePath,
-		Filename:  filepath.Base(filePath),
-		Links:     map[string]string{"GoFile": "https://gofile.example/video"},
-		SpriteURL: "https://pixhost.example/sprite.jpg",
+		FilePath:   filePath,
+		Filename:   filepath.Base(filePath),
+		Links:      map[string]string{"GoFile": "https://gofile.example/video"},
+		SpriteURL:  "https://pixhost.example/sprite.jpg",
 		PreviewURL: "https://files.catbox.moe/preview.webp",
 	}
 
@@ -131,6 +133,31 @@ func TestPipelineCleanupKeepsWhenSpriteButNoThumbnail(t *testing.T) {
 	}
 	if _, err := os.Stat(filePath); err != nil {
 		t.Fatalf("file should be kept when only the thumbnail is missing (sprite/preview exist): %v", err)
+	}
+}
+
+func TestPipelineCleanupKeepsWhenPreviewMissing(t *testing.T) {
+	oldConfig := server.Config
+	defer func() { server.Config = oldConfig }()
+	server.Config = &entity.Config{DeleteLocalAfterUpload: true}
+
+	filePath := filepath.Join(t.TempDir(), "preview-missing.mp4")
+	if err := os.WriteFile(filePath, []byte("video"), 0o666); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+	ch := &Channel{Config: &entity.ChannelConfig{Username: "tester"}, LogCh: make(chan string, 20), UpdateCh: make(chan bool, 1)}
+	p := &Pipeline{
+		FilePath:  filePath,
+		Filename:  filepath.Base(filePath),
+		Links:     map[string]string{"GoFile": "https://gofile.example/video"},
+		ThumbURL:  "https://pixhost.example/thumb.jpg",
+		SpriteURL: "https://pixhost.example/sprite.jpg",
+	}
+	if err := p.stageCleanup(ch); err != nil {
+		t.Fatalf("stageCleanup: %v", err)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("file should be kept when hover preview is missing: %v", err)
 	}
 }
 

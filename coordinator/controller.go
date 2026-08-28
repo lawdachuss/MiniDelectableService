@@ -93,6 +93,9 @@ func (c *Coordinator) StartControllerAssignmentLoop(ctx context.Context) {
 	interval := time.Duration(c.assignerConfig().CycleIntervalSec) * time.Second
 
 	c.runLoopWithRestart(ctx, name, interval, func(stopCh <-chan struct{}, tickerC <-chan time.Time) {
+		// Start promptly after a fleet restart.  The cold-start gate in the
+		// controller still prevents a partial fleet from taking an early split.
+		c.cycleGuardController.tryRun(name, c.runControllerCycle)
 		for {
 			select {
 			case <-ctx.Done():
@@ -255,16 +258,18 @@ func (c *Coordinator) runControllerCycle() {
 	}
 	c.assignerAssignMu.Unlock()
 
-	// Continuous fair claim (Step A): every cycle, assign EVERY free channel (the
-	// whole pool, live or offline) to the least-loaded active node so no channel
-	// is ever left unassigned. Rebalancing of already-assigned channels (Step B)
-	// runs on a membership change OR whenever the split is still unequal with a
-	// movable (non-recording) channel available, so it corrects imbalance once and
-	// then stops — existing recordings are never moved, so they're never lost.
+	// A cancelled runner leaves its final recording marker in the database.  A
+	// fresh marker is protected, while an expired one is made movable so a full
+	// restart can converge instead of preserving stale imbalance forever.
+	c.clearStaleRecordingLeases(all, now)
+
+	// Assign the complete pool as one deterministic sequence.  Per-site splits
+	// could give the same early-sorting nodes an extra channel for each site.
+	// Whole-pool splitting guarantees a max difference of one with no unassigned
+	// rows, and only moves existing assignments while repairing an imbalance.
 	if len(active) > 0 {
-		for _, site := range []string{"chaturbate", "stripchat"} {
-			c.balanceSite(site, all, active, activeSet, reclaimSet, heldSet, needAssignment)
-		}
+		needAssignment = needAssignment || c.hasMovableImbalance(all, active, activeSet, heldSet)
+		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, needAssignment)
 	}
 	if needAssignment {
 		c.assignerAssignMu.Lock()
@@ -274,6 +279,60 @@ func (c *Coordinator) runControllerCycle() {
 		c.assignerAssignMu.Unlock()
 		log.Printf("[controller] assignment sweep: %d active node(s), equal split applied (Step B rebalance on membership change only)", len(active))
 	}
+}
+
+const recordingLeaseTTL = 2 * time.Minute
+
+func (c *Coordinator) clearStaleRecordingLeases(all []database.ChannelAssignment, now time.Time) {
+	for i := range all {
+		ca := &all[i]
+		if ca.Status != "recording" || recordingLeaseFresh(ca.LastHeartbeat, now) {
+			continue
+		}
+		if err := c.Client.SetAssignmentStatus(ca.Username, ca.Site, "claimed"); err != nil {
+			log.Printf("[controller] clear stale recording lease %s/%s: %v", ca.Site, ca.Username, err)
+			continue
+		}
+		ca.Status = "claimed"
+	}
+}
+
+func recordingLeaseFresh(lastHeartbeat string, now time.Time) bool {
+	if lastHeartbeat == "" {
+		return false
+	}
+	hb, err := time.Parse(time.RFC3339Nano, lastHeartbeat)
+	return err == nil && now.Sub(hb) <= recordingLeaseTTL
+}
+
+// hasMovableImbalance is false once the deterministic target has converged;
+// it is a repair condition, not a periodic shuffle.
+func (c *Coordinator) hasMovableImbalance(all []database.ChannelAssignment, active []database.Node, activeSet, heldSet map[string]bool) bool {
+	if len(active) == 0 || len(all) == 0 {
+		return false
+	}
+	pool := append([]database.ChannelAssignment(nil), all...)
+	sort.Slice(pool, func(i, j int) bool {
+		if pool[i].Site == pool[j].Site {
+			return pool[i].Username < pool[j].Username
+		}
+		return pool[i].Site < pool[j].Site
+	})
+	nodes := append([]database.Node(nil), active...)
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
+	for i, ca := range pool {
+		if ca.AssignedNode == equalSplitTarget(i, len(pool), nodes) {
+			continue
+		}
+		if ca.Status == "recording" && ca.AssignedNode != "" && activeSet[ca.AssignedNode] {
+			continue
+		}
+		if heldSet[ca.AssignedNode] {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // fleetSignature returns a stable string describing the current fleet
@@ -545,7 +604,7 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 	// live). Every channel gets a node; none is ever left unassigned.
 	var pool []database.ChannelAssignment
 	for _, ca := range all {
-		if ca.Site == site {
+		if site == "" || ca.Site == site {
 			pool = append(pool, ca)
 		}
 	}
@@ -554,27 +613,17 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 	}
 
 	// Deterministic order so the split is stable across cycles (no churn).
-	sort.Slice(pool, func(i, j int) bool { return pool[i].Username < pool[j].Username })
+	sort.Slice(pool, func(i, j int) bool {
+		if pool[i].Site == pool[j].Site {
+			return pool[i].Username < pool[j].Username
+		}
+		return pool[i].Site < pool[j].Site
+	})
 
 	sorted := append([]database.Node{}, active...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NodeID < sorted[j].NodeID })
-	M := len(sorted)
-	N := len(pool)
-	base := N / M
-	rem := N % M
-
-	// Desired node for pool index i: the first `rem` nodes get base+1, the rest
-	// get base -- the exact equal split (max 1 apart). Channels are handed out in
-	// contiguous blocks so the assignment is stable and reproducible.
-	desiredNode := func(i int) string {
-		if i < rem*(base+1) {
-			return sorted[i/(base+1)].NodeID
-		}
-		return sorted[rem+(i-rem*(base+1))/base].NodeID
-	}
-
 	for i, ca := range pool {
-		want := desiredNode(i)
+		want := equalSplitTarget(i, len(pool), sorted)
 		cur := ca.AssignedNode
 		if cur == want {
 			continue
@@ -616,6 +665,17 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 			}
 		}
 	}
+}
+
+// equalSplitTarget assigns the first remainder nodes one additional channel.
+// It is safe when there are fewer channels than nodes.
+func equalSplitTarget(i, total int, nodes []database.Node) string {
+	base := total / len(nodes)
+	rem := total % len(nodes)
+	if i < rem*(base+1) {
+		return nodes[i/(base+1)].NodeID
+	}
+	return nodes[rem+(i-rem*(base+1))/base].NodeID
 }
 
 // pickUnderTarget returns an active node whose current count is below its

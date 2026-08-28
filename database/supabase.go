@@ -1525,7 +1525,42 @@ func (c *Client) ClaimSpecificChannel(username, site, nodeID string) (bool, erro
 	if err := json.NewDecoder(resp.Body).Decode(&claimed); err != nil {
 		return false, fmt.Errorf("decode claimed: %w", err)
 	}
-	return len(claimed) > 0, nil
+	if len(claimed) > 0 {
+		return true, nil
+	}
+
+	// A few self-hosted PostgREST deployments retain an old RPC definition
+	// after a schema-cache reload.  The service-role client used by recorder
+	// nodes can safely make the identical, conditional REST update as a
+	// compatibility fallback.  The filters preserve the atomic claim rule: a
+	// row is changed only while it is still genuinely unassigned.
+	return c.claimSpecificChannelFallback(username, site, nodeID)
+}
+
+func (c *Client) claimSpecificChannelFallback(username, site, nodeID string) (bool, error) {
+	path := fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s&assigned_node=is.null&status=eq.unassigned",
+		url.QueryEscape(username), url.QueryEscape(site))
+	resp, err := c.requestWithRetry("PATCH", path, map[string]interface{}{
+		"assigned_node": nodeID,
+		"status":        "claimed",
+	})
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	// PostgREST normally returns 204 for a PATCH without return=representation.
+	// Re-read exactly one row: success is only reported if it now belongs to the
+	// requested node, which avoids pretending a concurrently claimed row moved.
+	var rows []ChannelAssignment
+	if err := c.get(fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s&assigned_node=eq.%s&limit=1",
+		url.QueryEscape(username), url.QueryEscape(site), url.QueryEscape(nodeID)), &rows); err != nil {
+		return false, err
+	}
+	return len(rows) == 1, nil
 }
 
 // ReleaseNodeChannels releases all channels currently assigned to a node.
