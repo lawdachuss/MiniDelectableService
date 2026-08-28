@@ -106,6 +106,13 @@ func (c *Coordinator) StartControllerAssignmentLoop(ctx context.Context) {
 	})
 }
 
+// nodeReclaimGrace is how long a node must be unreachable before the controller
+// frees all of its channels and redistributes them evenly across the remaining
+// active nodes. A brief outage (restart, network blip) stays well under this, so
+// a node's channels are HELD during the window — no mass reassignment and no
+// recordings lost. Only a sustained outage (>= grace) triggers reclamation.
+const nodeReclaimGrace = 20 * time.Minute
+
 func (c *Coordinator) runControllerCycle() {
 	if !c.isActive() {
 		return
@@ -132,29 +139,44 @@ func (c *Coordinator) runControllerCycle() {
 
 	now := time.Now()
 	activeSet := map[string]bool{}
-	var active, dead []database.Node
+	reclaimSet := map[string]bool{} // nodes whose channels are freed + redistributed
+	heldSet := map[string]bool{}    // briefly-offline nodes: channels HELD during grace
+	var active, heldNodes, reclaim []database.Node
 	offlineCount := 0
 	for _, n := range nodes {
 		switch n.Status {
 		case "draining":
-			// Excluded from targets (its channels are rebalanced onto active
-			// nodes when a membership change triggers a rebalance).
-			continue
-		case "offline":
-			dead = append(dead, n)
-			offlineCount++
+			// Intentionally removed: free its channels immediately (no grace) so
+			// they're rebalanced onto the remaining active nodes.
+			reclaim = append(reclaim, n)
+			reclaimSet[n.NodeID] = true
 			continue
 		}
-		// status "online": require a fresh heartbeat or treat as dead.
+		// How long has this node been unreachable? Use its last heartbeat as the
+		// proxy for when it went down (a node stops heartbeating when it leaves).
 		hb, perr := time.Parse(time.RFC3339, n.LastHeartbeat)
-		fresh := perr == nil && now.Sub(hb) <= time.Duration(cfg.HeartbeatTimeoutSec)*time.Second
-		if !fresh {
-			dead = append(dead, n)
-			offlineCount++
+		off := nodeReclaimGrace + 1
+		if perr == nil {
+			off = now.Sub(hb)
+		}
+		// Fresh receiver only if explicitly online with a recent heartbeat.
+		fresh := n.Status == "online" && perr == nil && off <= time.Duration(cfg.HeartbeatTimeoutSec)*time.Second
+		if fresh {
+			active = append(active, n)
+			activeSet[n.NodeID] = true
 			continue
 		}
-		active = append(active, n)
-		activeSet[n.NodeID] = true
+		// Not fresh → offline/stale. Hold its channels during the grace window so
+		// a brief blip doesn't cause a mass reassignment; only reclaim (free +
+		// redistribute) once it has been down for >= nodeReclaimGrace.
+		offlineCount++
+		if off >= nodeReclaimGrace {
+			reclaim = append(reclaim, n)
+			reclaimSet[n.NodeID] = true
+		} else {
+			heldNodes = append(heldNodes, n)
+			heldSet[n.NodeID] = true
+		}
 	}
 
 	all, err := c.Client.GetAllAssignments()
@@ -184,24 +206,22 @@ func (c *Coordinator) runControllerCycle() {
 		}
 	}
 
-	// Housekeeping every cycle: free channels owned by dead nodes and offline
-	// non-recording channels on live nodes. ReleaseNodeOfflineChannels never
-	// touches a live node's recording channels, so in-progress recordings are
-	// never disturbed.
-	for _, d := range dead {
+	// Housekeeping every cycle: free channels owned by DEAD nodes only. A dead
+	// node can't record, so its channels must be reassigned (Step A below claims
+	// them onto live nodes). We deliberately do NOT release offline channels on a
+	// live node: the operator requires that NO channel is ever left unassigned,
+	// so an offline channel keeps its node and is simply not recorded until it
+	// goes live. balanceSite then redistributes the whole pool equally; it never
+	// moves "recording" rows, so in-progress recordings are never lost.
+	// Free channels only from nodes that have been down past the grace window.
+	// Held nodes (briefly offline) keep their channels so reassignments — and the
+	// recordings they carry — are not disturbed by a transient blip.
+	for _, d := range reclaim {
 		n, err := c.Client.ReclaimChannels(d.NodeID)
 		if err != nil {
 			log.Printf("[controller] reclaim %s error: %v", d.NodeID, err)
 		} else if n > 0 {
-			log.Printf("[controller] reclaimed %d channels from dead node %s", n, d.NodeID)
-		}
-	}
-	for _, a := range active {
-		n, err := c.Client.ReleaseNodeOfflineChannels(a.NodeID, nil)
-		if err != nil {
-			log.Printf("[controller] release offline %s error: %v", a.NodeID, err)
-		} else if n > 0 {
-			log.Printf("[controller] released %d offline channels from node %s", n, a.NodeID)
+			log.Printf("[controller] reclaimed %d channels from node %s (down >= %s) and redistributing", n, d.NodeID, nodeReclaimGrace)
 		}
 	}
 
@@ -210,15 +230,24 @@ func (c *Coordinator) runControllerCycle() {
 	// assignment). After that, channels are NOT continuously reshuffled: a
 	// stable, healthy fleet keeps exactly the channels it was given. Reassignment
 	// happens ONLY on a membership change —
-	//   • a node goes offline → its channels are reclaimed and redistributed ONCE
-	//     to the remaining live nodes;
-	//   • a new node comes online → it receives an equal share (moved from
-	//     others).
-	// Recording channels are never moved, so in-progress recordings are never
-	// lost. balanceSite enforces this (it only relocates claimed/unassigned
-	// rows).
+	//   • a node goes offline for >= the grace window (20m) → ALL its channels are
+	//     reclaimed and redistributed equally ONCE to the remaining live nodes;
+	//   • a node comes back / a new node joins → it receives an equal share (moved
+	//     from others).
+	// A node that is merely briefly offline (< grace) is HELD: it keeps its
+	// channels so a blip never triggers a mass reassignment or recording loss.
+	// Only the ELECTED leader (this goroutine, guarded by the controller lease)
+	// assigns or unassigns channels — no other node ever reassigns. Recording
+	// channels are never moved by the controller, so in-progress recordings on a
+	// live node are never lost; balanceSite only relocates non-recording rows.
 	needAssignment := false
-	fleetSig := fleetSignature(active, dead)
+	// inFleet = nodes that still own their channels (live or briefly offline and
+	// within the grace window). A node only leaves inFleet once it has been down
+	// past the grace, so a transient blip does NOT change the signature and does
+	// NOT trigger a rebalance. Crossing the grace (or a node joining/leaving)
+	// changes the signature → one rebalance.
+	inFleet := append(append([]database.Node{}, active...), heldNodes...)
+	fleetSig := fleetSignature(inFleet, reclaim)
 	c.assignerAssignMu.Lock()
 	if !c.assignerAssigned {
 		// Cold-start: wait until ALL nodes are live before the one-time split,
@@ -245,17 +274,17 @@ func (c *Coordinator) runControllerCycle() {
 	}
 	c.assignerAssignMu.Unlock()
 
-	// Continuous fair claim (Step A): every cycle, assign free live channels to
-	// the least-loaded active nodes so no live channel stays unassigned and every
-	// node receives an equal share as channels come online. Rebalancing of
-	// already-assigned channels (Step B) runs ONLY when needAssignment is true
-	// (the startup once-all-live split, or a membership change) — never on a
-	// steady tick — so existing recordings are never disrupted by a shuffle.
-	if len(active) > 0 {
-		for _, site := range []string{"chaturbate", "stripchat"} {
-			c.balanceSite(site, all, active, activeSet, live, needAssignment)
+	// Continuous fair claim (Step A): every cycle, assign EVERY free channel (the
+	// whole pool, live or offline) to the least-loaded active node so no channel
+	// is ever left unassigned. Rebalancing of already-assigned channels (Step B)
+	// runs on a membership change OR whenever the split is still unequal with a
+	// movable (non-recording) channel available, so it corrects imbalance once and
+	// then stops — existing recordings are never moved, so they're never lost.
+		if len(active) > 0 {
+			for _, site := range []string{"chaturbate", "stripchat"} {
+				c.balanceSite(site, all, active, activeSet, reclaimSet, heldSet, live, needAssignment)
+			}
 		}
-	}
 	if needAssignment {
 		c.assignerAssignMu.Lock()
 		c.assignerAssigned = true
@@ -513,44 +542,47 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 	return u.IsLive && u.Status == "public", true
 }
 
-// balanceSite distributes live channels of one site across active nodes.
+// balanceSite distributes the ENTIRE pool (live + offline) of one site evenly
+// across active nodes, so that NO channel is ever left unassigned.
 //
-// Step A (ALWAYS runs) assigns currently-free live channels (unassigned, or
-// assigned to a dead/draining node) to the least-loaded active nodes. This is
-// run every cycle so that as channels come online they are immediately claimed
-// and split equally — no live channel is ever left unassigned, and a
-// late-joining/under-target node is filled as soon as free live channels exist.
-// Crucially Step A never moves a channel that is already assigned to a LIVE
-// node, so existing recordings are never disturbed.
+// Step A (ALWAYS runs) assigns every currently-free channel (unassigned, or
+// assigned to a reclaimed/unknown node) to the least-loaded active node. A
+// channel on a HELD (briefly-offline, within the grace window) node is NOT free,
+// so a transient blip never disturbs it. This runs every cycle so the pool is
+// always fully placed and split equally — no channel is ever left unassigned,
+// and an under-target node is filled as soon as free channels exist. Crucially
+// Step A never moves a channel already assigned to a LIVE node, so existing
+// recordings are never disturbed.
 //
-// Step B (only when rebalance==true) rebalances over-target nodes by moving
-// only movable channels (status claimed/unassigned — never recording/paused)
-// onto under-target nodes. This is what produces the perfect equal split, but
-// it relocates already-assigned channels, so it is invoked ONLY on a membership
-// change (startup once all nodes are live, or a node joining/leaving) — never on
-// a steady tick. That keeps the fleet from continuously shuffling assignments.
-func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, live map[string]bool, rebalance bool) {
+// Step B rebalances over-target nodes by moving only NON-RECORDING channels onto
+// under-target nodes. It runs on a membership change OR whenever a profitable
+// move still exists (over-target node has a movable channel, under-target node
+// has room) — self-terminating so the fleet isn't continuously shuffled. It
+// never moves a "recording" row, so in-progress recordings are never lost.
+func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, live map[string]bool, rebalance bool) {
+	// Distribute the ENTIRE pool (live + offline) evenly across active nodes so
+	// that NO channel is ever left unassigned. Offline channels still get a node
+	// — the node simply won't record them until they go live, and when they do
+	// it records automatically. This is the hard guarantee the operator wants.
+	// The `live` map is no longer used to gate assignment (only to avoid
+	// flipping a live recording's is_live flag); every channel is placed.
 	counts := map[string]int{}
-	var liveChans []database.ChannelAssignment
+	var siteChans []database.ChannelAssignment
 	for _, ca := range all {
 		if ca.Site != site {
 			continue
 		}
-		k := keyOf(ca)
-		if v, ok := live[k]; !ok || !v {
-			continue
-		}
-		liveChans = append(liveChans, ca)
+		siteChans = append(siteChans, ca)
 		if activeSet[ca.AssignedNode] {
 			counts[ca.AssignedNode]++
 		}
 	}
-	if len(active) == 0 || len(liveChans) == 0 {
+	if len(active) == 0 || len(siteChans) == 0 {
 		return
 	}
 
 	// Target distribution: floor(N/M) each, first (N%M) nodes get +1.
-	total := len(liveChans)
+	total := len(siteChans)
 	base := total / len(active)
 	rem := total % len(active)
 	target := map[string]int{}
@@ -563,10 +595,85 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 		}
 	}
 
-	// Step A: free live channels → under-target nodes.
+	// Step B first: rebalance over-target nodes (movable = NON-RECORDING channels
+	// only) onto under-target nodes. Running rebalance BEFORE claiming free
+	// channels is essential: if Step A first filled every under-target node to
+	// its target with the unassigned pool, Step B would have nowhere to move the
+	// over-target nodes' excess and the split would stay skewed. By rebalancing
+	// first we free capacity on under-target nodes for both the excess and the
+	// unassigned channels.
+	//
+	// Step B runs on a membership change (rebalance==true), OR whenever a
+	// profitable rebalance still exists: an over-target node holds a movable
+	// channel and an under-target node can take it. This self-terminates — once
+	// the pool is evenly split (or only recordings remain immovable) no profitable
+	// move remains, so the fleet is NOT continuously shuffled; it corrects
+	// imbalance once, then stays put. Recording channels are never moved, so
+	// in-progress recordings are never lost.
+	runStepB := rebalance
+	if !runStepB {
+		underExists := false
+		for _, n := range sorted {
+			if counts[n.NodeID] < target[n.NodeID] {
+				underExists = true
+				break
+			}
+		}
+		if underExists {
+			for _, ca := range siteChans {
+				if ca.Status == "recording" {
+					continue
+				}
+				if counts[ca.AssignedNode] > target[ca.AssignedNode] {
+					runStepB = true
+					break
+				}
+			}
+		}
+	}
+	if runStepB {
+		over := append([]database.Node{}, active...)
+		sort.Slice(over, func(i, j int) bool { return counts[over[i].NodeID] > counts[over[j].NodeID] })
+		for _, n := range over {
+			excess := counts[n.NodeID] - target[n.NodeID]
+			if excess <= 0 {
+				continue
+			}
+			for _, ca := range siteChans {
+				if excess <= 0 {
+					break
+				}
+				if ca.AssignedNode != n.NodeID {
+					continue
+				}
+				if ca.Status == "recording" {
+					continue // never move a recording channel (would lose the recording)
+				}
+				dst := pickUnderTarget(sorted, target, counts)
+				if dst == "" {
+					break
+				}
+				if err := c.Client.ReassignChannel(ca.Username, ca.Site, n.NodeID, dst); err != nil {
+					log.Printf("[controller] rebalance %s/%s %s→%s error: %v", ca.Site, ca.Username, n.NodeID, dst, err)
+					continue
+				}
+				counts[n.NodeID]--
+				counts[dst]++
+				excess--
+			}
+		}
+	}
+
+	// Step A: EVERY channel with no active assignment → under-target node. A
+	// channel is claimable if it is unassigned, assigned to a reclaimed (down >=
+	// grace) node, or assigned to a node we no longer know about (deleted) — but
+	// NOT if it sits on a HELD (briefly-offline) node, whose channels we keep
+	// during the grace window. With Step B having freed capacity, this places the
+	// remaining pool evenly so none is left unassigned and the fleet reaches the
+	// exact equal split.
 	var free []database.ChannelAssignment
-	for _, ca := range liveChans {
-		if ca.AssignedNode == "" || !activeSet[ca.AssignedNode] {
+	for _, ca := range siteChans {
+		if ca.AssignedNode == "" || reclaimSet[ca.AssignedNode] || (!activeSet[ca.AssignedNode] && !heldSet[ca.AssignedNode]) {
 			free = append(free, ca)
 		}
 	}
@@ -592,43 +699,6 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 			}
 		}
 		counts[dst]++
-	}
-
-	// Step B: rebalance over-target nodes (movable channels only). Skipped on a
-	// steady tick (rebalance==false) so assignments aren't continuously shuffled;
-	// runs only on a membership change (startup once all nodes live, or a node
-	// joining/leaving) to reach the exact equal split.
-	if rebalance {
-		over := append([]database.Node{}, active...)
-		sort.Slice(over, func(i, j int) bool { return counts[over[i].NodeID] > counts[over[j].NodeID] })
-		for _, n := range over {
-			excess := counts[n.NodeID] - target[n.NodeID]
-			if excess <= 0 {
-				continue
-			}
-			for _, ca := range liveChans {
-				if excess <= 0 {
-					break
-				}
-				if ca.AssignedNode != n.NodeID {
-					continue
-				}
-				if ca.Status != "claimed" && ca.Status != "unassigned" {
-					continue // never move recording/paused/error channels
-				}
-				dst := pickUnderTarget(sorted, target, counts)
-				if dst == "" {
-					break
-				}
-				if err := c.Client.ReassignChannel(ca.Username, ca.Site, n.NodeID, dst); err != nil {
-					log.Printf("[controller] rebalance %s/%s %s→%s error: %v", ca.Site, ca.Username, n.NodeID, dst, err)
-					continue
-				}
-				counts[n.NodeID]--
-				counts[dst]++
-				excess--
-			}
-		}
 	}
 }
 
