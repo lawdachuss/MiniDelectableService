@@ -1029,7 +1029,10 @@ func CleanupOrphanedFiles() {
 				if IsUploadInFlight(info.path) {
 					return
 				}
-				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
+				thumb := GenerateThumbnailForFile(info.path)
+				thumbURL := thumb.ThumbURL
+				spriteURL := thumb.SpriteURL
+				previewURL := thumb.PreviewURL
 				UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
 				DeleteSidecarFiles(info.path)
 				_ = stem
@@ -1052,7 +1055,10 @@ func CleanupOrphanedFiles() {
 				}
 				// No muxed result either — upload the video part on its own.
 				if !MaybeDeferToPending(vInfo.path) && !IsUploadInFlight(vInfo.path) {
-					thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(vInfo.path)
+					thumb := GenerateThumbnailForFile(vInfo.path)
+					thumbURL := thumb.ThumbURL
+					spriteURL := thumb.SpriteURL
+					previewURL := thumb.PreviewURL
 					UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL)
 				}
 				DeleteSidecarFiles(vInfo.path)
@@ -1076,7 +1082,10 @@ func CleanupOrphanedFiles() {
 					recoveryLogf(vInfo.name, "recovery: mux failed for %s: %v — uploading video-only", stem, err)
 					// Fall back to uploading just the video track
 					if !MaybeDeferToPending(vInfo.path) && !IsUploadInFlight(vInfo.path) {
-						thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(vInfo.path)
+						thumb := GenerateThumbnailForFile(vInfo.path)
+						thumbURL := thumb.ThumbURL
+						spriteURL := thumb.SpriteURL
+						previewURL := thumb.PreviewURL
 						UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL)
 					}
 					DeleteSidecarFiles(vInfo.path)
@@ -1099,7 +1108,10 @@ func CleanupOrphanedFiles() {
 				if IsUploadInFlight(muxedPath) {
 					return
 				}
-				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(muxedPath)
+				thumb := GenerateThumbnailForFile(muxedPath)
+				thumbURL := thumb.ThumbURL
+				spriteURL := thumb.SpriteURL
+				previewURL := thumb.PreviewURL
 				UploadOrphanedFile(muxedPath, thumbURL, spriteURL, previewURL)
 				DeleteSidecarFiles(muxedPath)
 				os.Remove(muxedPath)
@@ -1177,7 +1189,10 @@ func CleanupOrphanedFiles() {
 			}
 
 			recoveryLogf(info.name, "recovery: uploading orphaned main video %s", info.name)
-			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
+			thumb := GenerateThumbnailForFile(info.path)
+			thumbURL := thumb.ThumbURL
+			spriteURL := thumb.SpriteURL
+			previewURL := thumb.PreviewURL
 			UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
 			DeleteSidecarFiles(info.path)
 			_ = stem
@@ -1538,7 +1553,7 @@ func uploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string, thumbM
 
 	// Save preview links first
 	if thumbURL != "" || spriteURL != "" || previewURL != "" {
-		if err := server.SavePreviewLinks(filename, thumbURL, spriteURL, previewURL); err != nil {
+		if err := server.SavePreviewLinks(filename, thumbURL, spriteURL, previewURL, nil, nil, nil); err != nil {
 			recoveryLogf(filename, "could not save preview links: %v", err)
 		}
 	}
@@ -2527,7 +2542,10 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 		mu.Unlock()
 		if lone != "" && isDefinitiveStop(endReason) {
 			ch.Info("min-duration: definitive stop — uploading lone pending segment %s", filepath.Base(lone))
-			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(lone)
+			thumb := GenerateThumbnailForFile(lone)
+			thumbURL := thumb.ThumbURL
+			spriteURL := thumb.SpriteURL
+			previewURL := thumb.PreviewURL
 			if UploadOrphanedFile(lone, thumbURL, spriteURL, previewURL) {
 				_ = os.Remove(lone)
 			}
@@ -2620,7 +2638,10 @@ func processPendingUserSegments(username string) {
 			}
 			recoveryLogf(s, "recovery: uploading pending segment %s", filepath.Base(s))
 			mu.Unlock()
-			thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(s)
+			thumb := GenerateThumbnailForFile(s)
+			thumbURL := thumb.ThumbURL
+			spriteURL := thumb.SpriteURL
+			previewURL := thumb.PreviewURL
 			// Keep the segment on failure: UploadOrphanedFile already removes the
 			// local copy on success (when DeleteLocalAfterUpload is set); a failed
 			// upload must leave the file in .pending for the next retry instead of
@@ -2647,7 +2668,10 @@ func processPendingUserSegments(username string) {
 			singleDur, dErr := VideoDurationSeconds(segCopy[0])
 			if dErr == nil && singleDur >= float64(minDur) {
 				recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (>= %ds) — uploading", singleDur, minDur)
-				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(segCopy[0])
+				thumb := GenerateThumbnailForFile(segCopy[0])
+				thumbURL := thumb.ThumbURL
+				spriteURL := thumb.SpriteURL
+				previewURL := thumb.PreviewURL
 				// Keep on failure so the next scan can retry (see above).
 				if UploadOrphanedFile(segCopy[0], thumbURL, spriteURL, previewURL) {
 					_ = os.Remove(segCopy[0])
@@ -2733,7 +2757,10 @@ func processPendingUserSegments(username string) {
 	if rErr := renameOverwriting(mergedPath, stablePath); rErr == nil {
 		mergedPath = stablePath
 	}
-	thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(mergedPath)
+	thumb := GenerateThumbnailForFile(mergedPath)
+	thumbURL := thumb.ThumbURL
+	spriteURL := thumb.SpriteURL
+	previewURL := thumb.PreviewURL
 	// Keep the merged file on failure: UploadOrphanedFile removes the local
 	// copy itself on success; a failed upload must leave the stable merged-*
 	// file in .pending so the next scan merges/retries it instead of discarding

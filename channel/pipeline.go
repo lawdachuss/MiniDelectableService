@@ -105,11 +105,14 @@ type Pipeline struct {
 	EndReason string `json:"end_reason,omitempty"`
 
 	// Results populated by stages, consumed by downstream stages
-	ThumbURL   string            `json:"thumb_url"`
-	SpriteURL  string            `json:"sprite_url"`
-	PreviewURL string            `json:"preview_url"`
-	EmbedURL   string            `json:"embed_url"`
-	Links      map[string]string `json:"links"` // host -> download URL
+	ThumbURL       string            `json:"thumb_url"`
+	SpriteURL      string            `json:"sprite_url"`
+	PreviewURL     string            `json:"preview_url"`
+	ThumbMirrors   map[string]string `json:"thumb_mirrors,omitempty"`   // host -> URL
+	SpriteMirrors  map[string]string `json:"sprite_mirrors,omitempty"`  // host -> URL
+	PreviewMirrors map[string]string `json:"preview_mirrors,omitempty"` // host -> URL
+	EmbedURL       string            `json:"embed_url"`
+	Links          map[string]string `json:"links"` // host -> download URL
 
 	mu sync.Mutex
 }
@@ -146,40 +149,46 @@ func (p *Pipeline) advanceTo(s Stage) {
 func (p *Pipeline) toDBState() *database.PipelineState {
 	linksJSON, _ := json.Marshal(p.Links)
 	return &database.PipelineState{
-		FileHash:     p.FileHash,
-		FilePath:     p.FilePath,
-		Filename:     p.Filename,
-		Username:     p.Username,
-		FileSize:     p.FileSize,
-		CurrentStage: p.CurrentStage.String(),
-		Failed:       p.Failed,
-		LastError:    p.LastError,
-		Retries:      p.Retries,
-		ThumbURL:     p.ThumbURL,
-		SpriteURL:    p.SpriteURL,
-		PreviewURL:   p.PreviewURL,
-		EmbedURL:     p.EmbedURL,
-		LinksJSON:    string(linksJSON),
+		FileHash:       p.FileHash,
+		FilePath:       p.FilePath,
+		Filename:       p.Filename,
+		Username:       p.Username,
+		FileSize:       p.FileSize,
+		CurrentStage:   p.CurrentStage.String(),
+		Failed:         p.Failed,
+		LastError:      p.LastError,
+		Retries:        p.Retries,
+		ThumbURL:       p.ThumbURL,
+		SpriteURL:      p.SpriteURL,
+		PreviewURL:     p.PreviewURL,
+		ThumbMirrors:   p.ThumbMirrors,
+		SpriteMirrors:  p.SpriteMirrors,
+		PreviewMirrors: p.PreviewMirrors,
+		EmbedURL:       p.EmbedURL,
+		LinksJSON:      string(linksJSON),
 	}
 }
 
 // pipelineFromDBState converts a database.PipelineState back to a Pipeline.
 func pipelineFromDBState(s *database.PipelineState) *Pipeline {
 	p := &Pipeline{
-		FileHash:     s.FileHash,
-		FilePath:     s.FilePath,
-		Filename:     s.Filename,
-		Username:     s.Username,
-		FileSize:     s.FileSize,
-		CurrentStage: stageFromString(s.CurrentStage),
-		Failed:       s.Failed,
-		LastError:    s.LastError,
-		Retries:      s.Retries,
-		ThumbURL:     s.ThumbURL,
-		SpriteURL:    s.SpriteURL,
-		PreviewURL:   s.PreviewURL,
-		EmbedURL:     s.EmbedURL,
-		Links:        make(map[string]string),
+		FileHash:       s.FileHash,
+		FilePath:       s.FilePath,
+		Filename:       s.Filename,
+		Username:       s.Username,
+		FileSize:       s.FileSize,
+		CurrentStage:   stageFromString(s.CurrentStage),
+		Failed:         s.Failed,
+		LastError:      s.LastError,
+		Retries:        s.Retries,
+		ThumbURL:       s.ThumbURL,
+		SpriteURL:      s.SpriteURL,
+		PreviewURL:     s.PreviewURL,
+		ThumbMirrors:   s.ThumbMirrors,
+		SpriteMirrors:  s.SpriteMirrors,
+		PreviewMirrors: s.PreviewMirrors,
+		EmbedURL:       s.EmbedURL,
+		Links:          make(map[string]string),
 	}
 	if s.LinksJSON != "" {
 		json.Unmarshal([]byte(s.LinksJSON), &p.Links)
@@ -205,18 +214,28 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	if p.ThumbURL != "" && p.SpriteURL != "" && p.PreviewURL != "" {
 		return nil
 	}
-	thumbURL, spriteURL, previewURL := ch.generateThumbnail(p.FilePath)
+	thumb := ch.generateThumbnail(p.FilePath)
 	// Fill in only the pieces still missing so a partial failure (e.g. the
 	// preview generated but the thumbnail did not) never discards work that
 	// already succeeded.
 	if p.ThumbURL == "" {
-		p.ThumbURL = thumbURL
+		p.ThumbURL = thumb.ThumbURL
 	}
 	if p.SpriteURL == "" {
-		p.SpriteURL = spriteURL
+		p.SpriteURL = thumb.SpriteURL
 	}
 	if p.PreviewURL == "" {
-		p.PreviewURL = previewURL
+		p.PreviewURL = thumb.PreviewURL
+	}
+	// Store mirror URLs for redundancy.
+	if len(thumb.ThumbMirrors) > 0 {
+		p.ThumbMirrors = thumb.ThumbMirrors
+	}
+	if len(thumb.SpriteMirrors) > 0 {
+		p.SpriteMirrors = thumb.SpriteMirrors
+	}
+	if len(thumb.PreviewMirrors) > 0 {
+		p.PreviewMirrors = thumb.PreviewMirrors
 	}
 
 	// Persist whatever succeeded right away — the thumbnail must not wait for
@@ -224,7 +243,7 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	// write fails, stageSaveMetadata retries it and the throttled
 	// ScanThumbnails backfill is a final safety net.
 	if p.ThumbURL != "" || p.SpriteURL != "" || p.PreviewURL != "" {
-		if err := server.SavePreviewLinks(p.Filename, p.ThumbURL, p.SpriteURL, p.PreviewURL); err != nil {
+		if err := server.SavePreviewLinks(p.Filename, p.ThumbURL, p.SpriteURL, p.PreviewURL, p.ThumbMirrors, p.SpriteMirrors, p.PreviewMirrors); err != nil {
 			ch.Warn("pipeline: could not save preview links early for %s: %v", p.Filename, err)
 		} else {
 			ch.Info("pipeline: saved preview links early for %s", p.Filename)
@@ -494,19 +513,29 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 	// host-hammering loop that causes the fleet-wide rate-limit failures.
 	// A missing sprite/preview is cosmetic; a missing thumbnail is not.
 	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
-		thumbURL, spriteURL, previewURL := ch.generateThumbnail(p.FilePath)
+		thumb := ch.generateThumbnail(p.FilePath)
 		generated := false
-		if p.ThumbURL == "" && thumbURL != "" {
-			p.ThumbURL = thumbURL
+		if p.ThumbURL == "" && thumb.ThumbURL != "" {
+			p.ThumbURL = thumb.ThumbURL
 			generated = true
 		}
-		if p.SpriteURL == "" && spriteURL != "" {
-			p.SpriteURL = spriteURL
+		if p.SpriteURL == "" && thumb.SpriteURL != "" {
+			p.SpriteURL = thumb.SpriteURL
 			generated = true
 		}
-		if p.PreviewURL == "" && previewURL != "" {
-			p.PreviewURL = previewURL
+		if p.PreviewURL == "" && thumb.PreviewURL != "" {
+			p.PreviewURL = thumb.PreviewURL
 			generated = true
+		}
+		// Store mirrors from retry generation.
+		if len(thumb.ThumbMirrors) > 0 {
+			p.ThumbMirrors = thumb.ThumbMirrors
+		}
+		if len(thumb.SpriteMirrors) > 0 {
+			p.SpriteMirrors = thumb.SpriteMirrors
+		}
+		if len(thumb.PreviewMirrors) > 0 {
+			p.PreviewMirrors = thumb.PreviewMirrors
 		}
 		if generated {
 			ch.Info("upload: generated missing presentation assets for %s (retry)", p.Filename)
@@ -516,7 +545,7 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 	}
 
 	if p.ThumbURL != "" || p.SpriteURL != "" || p.PreviewURL != "" {
-		if err := server.SavePreviewLinks(p.Filename, p.ThumbURL, p.SpriteURL, p.PreviewURL); err != nil {
+		if err := server.SavePreviewLinks(p.Filename, p.ThumbURL, p.SpriteURL, p.PreviewURL, p.ThumbMirrors, p.SpriteMirrors, p.PreviewMirrors); err != nil {
 			ch.Error("upload: could not save preview links for %s: %v", p.Filename, err)
 			p.LastError = err.Error()
 			return err

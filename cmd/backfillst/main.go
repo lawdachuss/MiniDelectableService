@@ -171,18 +171,25 @@ func backfillOne(e manifestEntry, partialMB int, seek float64, tailMB int, workD
 	}
 	log.Printf("  frame: %s", thumbPath)
 
-	// 3. Upload through the standard image pipeline.
+	// 3. Upload through the standard image pipeline (all hosts in parallel).
 	imgUploader := uploader.NewMultiImageUploader()
-	thumbURL, _, err := imgUploader.Upload(thumbPath)
-	if err != nil {
-		return "", fmt.Errorf("upload thumbnail: %w", err)
+	thumbURLs := imgUploader.UploadToAllURLs(thumbPath)
+	var thumbURL string
+	for _, host := range []string{"Catbox", "Pixhost", "freeimage.host"} {
+		if url, ok := thumbURLs[host]; ok {
+			thumbURL = url
+			break
+		}
+	}
+	if thumbURL == "" {
+		return "", fmt.Errorf("upload thumbnail: all hosts failed")
 	}
 
 	// 4. Patch both tables (these files have no sprite/preview to preserve).
 	if err := server.UpdateRecordingThumbnails(fn, thumbURL, "", ""); err != nil {
 		return thumbURL, fmt.Errorf("patch recordings row: %w", err)
 	}
-	if err := server.SavePreviewLinks(fn, thumbURL, "", ""); err != nil {
+	if err := server.SavePreviewLinks(fn, thumbURL, "", "", nil, nil, nil); err != nil {
 		return thumbURL, fmt.Errorf("patch preview_images row: %w", err)
 	}
 	return thumbURL, nil

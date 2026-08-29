@@ -262,8 +262,8 @@ func (fw *FileWatcher) processFile(filePath string) {
 	}
 
 	// Generate thumbnails and upload
-	thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(filePath)
-	if !channel.UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL) {
+	thumb := channel.GenerateThumbnailForFile(filePath)
+	if !channel.UploadOrphanedFile(filePath, thumb.ThumbURL, thumb.SpriteURL, thumb.PreviewURL) {
 		log.Printf("[watcher] upload failed for %s; file will remain for retry", base)
 	}
 }

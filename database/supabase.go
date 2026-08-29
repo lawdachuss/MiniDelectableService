@@ -505,14 +505,17 @@ type Recording struct {
 	// EndReason records why the recording stopped (model went offline, stream
 	// session expired, max duration/filesize rotation, paused/stopped, session
 	// boundary). Empty when unknown (e.g. orphan-recovery uploads).
-	EndReason    string `json:"end_reason,omitempty"`
-	ThumbnailURL string `json:"thumbnail_url,omitempty"`
-	SpriteURL    string `json:"sprite_url,omitempty"`
-	PreviewURL   string `json:"preview_url,omitempty"`
-	EmbedURL     string `json:"embed_url,omitempty"`
-	InstanceID   string `json:"instance_id,omitempty"`
-	CreatedAt    string `json:"created_at,omitempty"`
-	UpdatedAt    string `json:"updated_at,omitempty"`
+	EndReason        string            `json:"end_reason,omitempty"`
+	ThumbnailURL     string            `json:"thumbnail_url,omitempty"`
+	SpriteURL        string            `json:"sprite_url,omitempty"`
+	PreviewURL       string            `json:"preview_url,omitempty"`
+	ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"` // host -> URL
+	SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`    // host -> URL
+	PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`   // host -> URL
+	EmbedURL         string            `json:"embed_url,omitempty"`
+	InstanceID       string            `json:"instance_id,omitempty"`
+	CreatedAt        string            `json:"created_at,omitempty"`
+	UpdatedAt        string            `json:"updated_at,omitempty"`
 }
 
 // SaveRecording creates or updates a recording using Supabase's upsert functionality.
@@ -614,6 +617,31 @@ func (c *Client) CountRecordings() (int, error) {
 // DeleteRecording removes a recording
 func (c *Client) DeleteRecording(filename string) error {
 	return c.delete(fmt.Sprintf("/recordings?filename=eq.%s", url.QueryEscape(filename)))
+}
+
+// GetRecordingsWithCatboxThumbnails retrieves only recordings whose thumbnail_url
+// contains "catbox.moe" — used by backfillmirrors to avoid loading all 11K+ rows.
+func (c *Client) GetRecordingsWithCatboxThumbnails() ([]Recording, error) {
+	var recordings []Recording
+	err := c.getAllPaginated("/recordings?thumbnail_url=like.*catbox.moe*&order=timestamp.desc", &recordings)
+	return recordings, err
+}
+
+// GetRecordingsWithCatboxURLs retrieves recordings where ANY of thumbnail_url,
+// sprite_url, or preview_url contains "catbox.moe". Used by backfillmirrors
+// to find all Catbox-hosted images across all asset types.
+func (c *Client) GetRecordingsWithCatboxURLs() ([]Recording, error) {
+	// Use PostgREST's or() filter to find recordings where ANY of thumbnail_url,
+	// sprite_url, or preview_url contains "catbox.moe" in a single query.
+	var recordings []Recording
+	err := c.getAllPaginated(
+		"/recordings?or=(thumbnail_url.like.*catbox.moe*,sprite_url.like.*catbox.moe*,preview_url.like.*catbox.moe*)&order=timestamp.desc",
+		&recordings,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get catbox URLs: %w", err)
+	}
+	return recordings, nil
 }
 
 // DeletePreviewImage removes a preview image by filename
@@ -934,14 +962,17 @@ func (c *Client) GetLogs(username string, limit int) ([]ChannelLog, error) {
 // ============================================================================
 
 type PreviewImage struct {
-	ID           string `json:"id,omitempty"`
-	RecordingID  string `json:"recording_id,omitempty"`
-	Filename     string `json:"filename"`
-	ThumbnailURL string `json:"thumbnail_url,omitempty"`
-	SpriteURL    string `json:"sprite_url,omitempty"`
-	PreviewURL   string `json:"preview_url,omitempty"`
-	InstanceID   string `json:"instance_id,omitempty"`
-	UploadedAt   string `json:"uploaded_at,omitempty"`
+	ID               string            `json:"id,omitempty"`
+	RecordingID      string            `json:"recording_id,omitempty"`
+	Filename         string            `json:"filename"`
+	ThumbnailURL     string            `json:"thumbnail_url,omitempty"`
+	SpriteURL        string            `json:"sprite_url,omitempty"`
+	PreviewURL       string            `json:"preview_url,omitempty"`
+	ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"` // host -> URL
+	SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`    // host -> URL
+	PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`   // host -> URL
+	InstanceID       string            `json:"instance_id,omitempty"`
+	UploadedAt       string            `json:"uploaded_at,omitempty"`
 }
 
 // SavePreviewImage creates or updates preview image metadata using Supabase's upsert functionality.
@@ -1072,23 +1103,26 @@ func (c *Client) DeleteJournalByHash(fileHash string) error {
 // Schema defined in migrate-combined.sql (CREATE TABLE pipeline_states).
 
 type PipelineState struct {
-	FileHash     string `json:"file_hash"`
-	FilePath     string `json:"file_path"`
-	Filename     string `json:"filename"`
-	Username     string `json:"username"`
-	FileSize     int64  `json:"file_size"`
-	CurrentStage string `json:"current_stage"`
-	Failed       bool   `json:"failed"`
-	LastError    string `json:"last_error,omitempty"`
-	ThumbURL     string `json:"thumb_url,omitempty"`
-	SpriteURL    string `json:"sprite_url,omitempty"`
-	PreviewURL   string `json:"preview_url,omitempty"`
-	EmbedURL     string `json:"embed_url,omitempty"`
-	LinksJSON    string `json:"links,omitempty"` // JSON-encoded map[string]string
-	Retries      int    `json:"retries,omitempty"`
-	NodeID       string `json:"node_id,omitempty"`
-	CreatedAt    string `json:"created_at,omitempty"`
-	UpdatedAt    string `json:"updated_at,omitempty"`
+	FileHash       string            `json:"file_hash"`
+	FilePath       string            `json:"file_path"`
+	Filename       string            `json:"filename"`
+	Username       string            `json:"username"`
+	FileSize       int64             `json:"file_size"`
+	CurrentStage   string            `json:"current_stage"`
+	Failed         bool              `json:"failed"`
+	LastError      string            `json:"last_error,omitempty"`
+	ThumbURL       string            `json:"thumb_url,omitempty"`
+	SpriteURL      string            `json:"sprite_url,omitempty"`
+	PreviewURL     string            `json:"preview_url,omitempty"`
+	ThumbMirrors   map[string]string `json:"thumb_mirrors,omitempty"`   // host -> URL
+	SpriteMirrors  map[string]string `json:"sprite_mirrors,omitempty"`  // host -> URL
+	PreviewMirrors map[string]string `json:"preview_mirrors,omitempty"` // host -> URL
+	EmbedURL       string            `json:"embed_url,omitempty"`
+	LinksJSON      string            `json:"links,omitempty"` // JSON-encoded map[string]string
+	Retries        int               `json:"retries,omitempty"`
+	NodeID         string            `json:"node_id,omitempty"`
+	CreatedAt      string            `json:"created_at,omitempty"`
+	UpdatedAt      string            `json:"updated_at,omitempty"`
 }
 
 // SavePipelineState upserts a pipeline state by file_hash.

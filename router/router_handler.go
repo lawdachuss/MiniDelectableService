@@ -1357,8 +1357,8 @@ func RetryOrphan(c *gin.Context) {
 				results[idx] = result{Path: p, Status: "deferred", Error: "below min-duration threshold — moved to pending"}
 				return
 			}
-			thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(p)
-			if !channel.UploadOrphanedFile(p, thumbURL, spriteURL, previewURL) {
+			thumb := channel.GenerateThumbnailForFile(p)
+			if !channel.UploadOrphanedFile(p, thumb.ThumbURL, thumb.SpriteURL, thumb.PreviewURL) {
 				results[idx] = result{Path: p, Status: "failed", Error: "upload did not complete successfully"}
 				return
 			}
@@ -1428,8 +1428,8 @@ func RescanOutputDir(c *gin.Context) {
 					res = rescanResult{Path: path, Status: "deferred", Error: "below min-duration threshold — moved to pending"}
 					return
 				}
-				thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(path)
-				if !channel.UploadOrphanedFile(path, thumbURL, spriteURL, previewURL) {
+				thumb := channel.GenerateThumbnailForFile(path)
+				if !channel.UploadOrphanedFile(path, thumb.ThumbURL, thumb.SpriteURL, thumb.PreviewURL) {
 					res = rescanResult{Path: path, Status: "failed", Error: "upload did not complete successfully"}
 				}
 			}()
@@ -1610,7 +1610,7 @@ func ServeLiveThumb(c *gin.Context) {
 // the browser.  Anything else is rejected so the DVR cannot be used as an open
 // proxy.
 var proxyAllowedSuffixes = []string{
-	"pixhost.to", "catbox.moe", "imgbb.com", "i.ibb.co", "pimpandhost.com",
+	"pixhost.to", "catbox.moe", "freeimage.host", "i.ibb.co", "pimpandhost.com", "imgchest.com", "imgbox.com", "imgbb.com",
 }
 
 // ServeImageProxy streams an external thumbnail/sprite/preview image through the

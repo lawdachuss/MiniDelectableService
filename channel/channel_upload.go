@@ -173,7 +173,7 @@ func (ch *Channel) uploadFile(filePath string, thumbURL, spriteURL, previewURL s
 	// Always save preview links to Supabase first — even if video upload fails,
 	// the preview images were already uploaded to image hosts.
 	if thumbURL != "" || spriteURL != "" || previewURL != "" {
-		if err := server.SavePreviewLinks(filename, thumbURL, spriteURL, previewURL); err != nil {
+		if err := server.SavePreviewLinks(filename, thumbURL, spriteURL, previewURL, nil, nil, nil); err != nil {
 			ch.Error("upload: could not save preview links for %s: %v", filename, err)
 		} else {
 			ch.Info("upload: saved preview links for %s", filename)

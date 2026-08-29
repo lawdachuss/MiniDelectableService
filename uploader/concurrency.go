@@ -18,11 +18,19 @@ const (
 var (
 	hostSemMu sync.RWMutex
 	hostSems  = map[string]chan struct{}{
+		// Video upload hosts
 		"GoFile":        make(chan struct{}, defaultGoFileConcurrency),
 		"VOE.sx":        make(chan struct{}, defaultHostConcurrency),
 		"Streamtape":    make(chan struct{}, defaultHostConcurrency),
 		"Mixdrop":       make(chan struct{}, defaultHostConcurrency),
 		"Vidara":        make(chan struct{}, defaultHostConcurrency),
+		// Image upload hosts (thumbnails, sprites, previews)
+		"Catbox":        make(chan struct{}, defaultHostConcurrency),
+		"Pixhost":       make(chan struct{}, defaultHostConcurrency),
+		"freeimage.host": make(chan struct{}, defaultHostConcurrency),
+		"ImgChest":  make(chan struct{}, defaultHostConcurrency),
+		"Imgbox":    make(chan struct{}, defaultHostConcurrency),
+		"ImgBB":     make(chan struct{}, defaultHostConcurrency),
 	}
 )
 

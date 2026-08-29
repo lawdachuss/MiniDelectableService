@@ -61,6 +61,9 @@ func NewCatboxUploader() *CatboxUploader {
 // Response on success: plain text URL like "https://files.catbox.moe/abc123.webp"
 // Response on error: plain text error message starting with an error description.
 func (u *CatboxUploader) Upload(filePath string) (string, error) {
+	release := acquireHostSem("Catbox")
+	defer release()
+
 	var lastErr error
 
 	for attempt := 0; attempt < 3; attempt++ {

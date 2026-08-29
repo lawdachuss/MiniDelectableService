@@ -70,6 +70,7 @@ jobs:
       CATBOX_PROXY_URL: ${{ secrets.CATBOX_PROXY_URL }}
       CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
       IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
+      IMGCHEST_TOKEN: ${{ secrets.IMGCHEST_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4

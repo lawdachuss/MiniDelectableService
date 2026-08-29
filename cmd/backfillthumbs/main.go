@@ -161,18 +161,25 @@ func backfillOne(e manifestEntry, workDir string) (string, error) {
 		return "", fmt.Errorf("thumbnail file not produced: %v", err)
 	}
 
-	// 3. Upload through the standard image pipeline.
+	// 3. Upload through the standard image pipeline (all hosts in parallel).
 	imgUploader := uploader.NewMultiImageUploader()
-	thumbURL, _, err := imgUploader.Upload(thumbPath)
-	if err != nil {
-		return "", fmt.Errorf("upload thumbnail: %w", err)
+	thumbURLs := imgUploader.UploadToAllURLs(thumbPath)
+	var thumbURL string
+	for _, host := range []string{"Catbox", "Pixhost", "freeimage.host"} {
+		if url, ok := thumbURLs[host]; ok {
+			thumbURL = url
+			break
+		}
+	}
+	if thumbURL == "" {
+		return "", fmt.Errorf("upload thumbnail: all hosts failed")
 	}
 
 	// 4. Patch both tables, preserving the existing sprite/preview URLs.
 	if err := server.UpdateRecordingThumbnails(fn, thumbURL, e.SpriteURL, e.PreviewURL); err != nil {
 		return thumbURL, fmt.Errorf("patch recordings row: %w", err)
 	}
-	if err := server.SavePreviewLinks(fn, thumbURL, e.SpriteURL, e.PreviewURL); err != nil {
+	if err := server.SavePreviewLinks(fn, thumbURL, e.SpriteURL, e.PreviewURL, nil, nil, nil); err != nil {
 		return thumbURL, fmt.Errorf("patch preview_images row: %w", err)
 	}
 	return thumbURL, nil

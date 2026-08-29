@@ -29,8 +29,19 @@ const (
 	previewSegments = 12  // number of smooth clips to stitch (each ~0.5s)
 )
 
+// ThumbnailResult holds the generated thumbnail, sprite, and preview URLs
+// along with their mirror URLs from all hosts.
+type ThumbnailResult struct {
+	ThumbURL       string
+	SpriteURL      string
+	PreviewURL     string
+	ThumbMirrors   map[string]string // host -> URL
+	SpriteMirrors  map[string]string // host -> URL
+	PreviewMirrors map[string]string // host -> URL
+}
+
 // generateThumbnail is the channel-scoped wrapper — logs go to the channel log.
-func (ch *Channel) generateThumbnail(videoPath string) (thumbURL, spriteURL, previewURL string) {
+func (ch *Channel) generateThumbnail(videoPath string) ThumbnailResult {
 	return generateThumbnailForFile(videoPath,
 		func(f string, a ...interface{}) { ch.Info(f, a...) },
 		func(f string, a ...interface{}) { ch.Error(f, a...) },
@@ -39,7 +50,7 @@ func (ch *Channel) generateThumbnail(videoPath string) (thumbURL, spriteURL, pre
 
 // GenerateThumbnailForFile is a standalone thumbnail generator that can be
 // called outside of a channel context (e.g. for pre-existing video files).
-func GenerateThumbnailForFile(videoPath string) (thumbURL, spriteURL, previewURL string) {
+func GenerateThumbnailForFile(videoPath string) ThumbnailResult {
 	return generateThumbnailForFile(videoPath,
 		func(f string, a ...interface{}) { log.Printf("[thumb] "+f, a...) },
 		func(f string, a ...interface{}) { log.Printf("[thumb:err] "+f, a...) },
@@ -118,22 +129,23 @@ func runFFmpegParallel(workers, n int, fn func(i int) error) error {
 	return firstErr
 }
 
-func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{})) (thumbURL, spriteURL, previewURL string) {
+func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{})) ThumbnailResult {
+	var result ThumbnailResult
 	ext := strings.ToLower(filepath.Ext(videoPath))
 	if ext != ".mp4" && ext != ".mkv" && ext != ".ts" {
-		return "", "", ""
+		return result
 	}
 
 	st, err := os.Stat(videoPath)
 	if err != nil {
 		errFn("thumb: file not found %s: %v", filepath.Base(videoPath), err)
-		return "", "", ""
+		return result
 	}
 	// Skip files too small to contain video frames — ffmpeg returns
 	// exit code -22 (EINVAL) on header-only fMP4 from failed streams.
 	if st.Size() < 100*1024 {
 		errFn("thumb: skipping %s: too small (%d bytes)", filepath.Base(videoPath), st.Size())
-		return "", "", ""
+		return result
 	}
 
 	baseName := filepath.Base(videoPath)
@@ -197,6 +209,10 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	thumbDone := make(chan string, 1)
 	spriteDone := make(chan string, 1)
 	previewDone := make(chan string, 1)
+
+	// Mirror URL maps — populated by goroutines, read after they complete.
+	var thumbMirrors, spriteMirrors, previewMirrors map[string]string
+	var mirrorsMu sync.Mutex
 
 	// ── Single thumbnail (static frame near the 10% mark) ──────────────────
 	// Independent 90-second context: seeking to a single frame is always fast.
@@ -276,14 +292,29 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 
 		imgUploader := uploader.NewMultiImageUploader()
-		if remoteURL, _, uploadErr := imgUploader.Upload(thumbJPG); uploadErr == nil {
-			info("thumb: ✓ %s", baseName)
-			thumbDone <- remoteURL
-		} else {
-			errFn("thumb: upload failed for %s: %v", baseName, uploadErr)
-			thumbDone <- ""
+		thumbURLs := imgUploader.UploadToAllURLs(thumbJPG)
+		if len(thumbURLs) > 0 {
+			mirrorsMu.Lock()
+			thumbMirrors = thumbURLs
+			mirrorsMu.Unlock()
+			// Pick the first successful URL as primary (prefer Catbox > Pixhost > freeimage.host).
+			for _, host := range []string{"Catbox", "Pixhost", "freeimage.host"} {
+				if url, ok := thumbURLs[host]; ok {
+					info("thumb: ✓ %s (uploaded to %d hosts: %s)", baseName, len(thumbURLs), host)
+					thumbDone <- url
+					return
+				}
+			}
+			// Fallback: just pick any successful URL.
+			for _, url := range thumbURLs {
+				info("thumb: ✓ %s (uploaded to %d hosts)", baseName, len(thumbURLs))
+				thumbDone <- url
+				return
+			}
 		}
-	}()
+		errFn("thumb: upload failed for %s — all hosts rejected", baseName)
+		thumbDone <- ""
+		}()
 
 	// ── Sprite sheet (4×4 grid covering the full video duration) ───────────
 	// Each frame is spriteFrameW×spriteFrameH px; total image is
@@ -453,14 +484,27 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 
 		imgUploader := uploader.NewMultiImageUploader()
-		if remoteURL, _, uploadErr := imgUploader.Upload(spriteJPG); uploadErr == nil {
-			info("sprite: ✓ %s", baseName)
-			spriteDone <- remoteURL
-		} else {
-			errFn("sprite: upload failed for %s: %v", baseName, uploadErr)
-			spriteDone <- ""
+		spriteURLs := imgUploader.UploadToAllURLs(spriteJPG)
+		if len(spriteURLs) > 0 {
+			mirrorsMu.Lock()
+			spriteMirrors = spriteURLs
+			mirrorsMu.Unlock()
+			for _, host := range []string{"Catbox", "Pixhost", "freeimage.host"} {
+				if url, ok := spriteURLs[host]; ok {
+					info("sprite: ✓ %s (uploaded to %d hosts: %s)", baseName, len(spriteURLs), host)
+					spriteDone <- url
+					return
+				}
+			}
+			for _, url := range spriteURLs {
+				info("sprite: ✓ %s (uploaded to %d hosts)", baseName, len(spriteURLs))
+				spriteDone <- url
+				return
+			}
 		}
-	}()
+		errFn("sprite: upload failed for %s — all hosts rejected", baseName)
+		spriteDone <- ""
+		}()
 
 	// ── Animated WEBP hover preview (smooth clips from across the video, 6s) ─
 	// Animated WEBP is used instead of GIF because:
@@ -705,27 +749,38 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 
 		previewGenerated = true
 
-		catboxUploader := uploader.NewCatboxUploader()
-		imgbbUploader := uploader.NewImgBBUploader()
-
-		remoteURL, uploadErr := catboxUploader.Upload(previewPath)
-		if uploadErr != nil {
-			errFn("preview: catbox failed for %s: %v, trying ImgBB fallback", baseName, uploadErr)
-			remoteURL, uploadErr = imgbbUploader.Upload(previewPath)
+		imgUploader := uploader.NewMultiImageUploader()
+		previewURLs := imgUploader.UploadToAllURLs(previewPath)
+		if len(previewURLs) > 0 {
+			mirrorsMu.Lock()
+			previewMirrors = previewURLs
+			mirrorsMu.Unlock()
+			for _, host := range []string{"Catbox", "freeimage.host"} {
+				if url, ok := previewURLs[host]; ok {
+					info("preview: ✓ %s (uploaded to %d hosts: %s)", baseName, len(previewURLs), host)
+					previewDone <- url
+					return
+				}
+			}
+			for _, url := range previewURLs {
+				info("preview: ✓ %s (uploaded to %d hosts)", baseName, len(previewURLs))
+				previewDone <- url
+				return
+			}
 		}
-
-		if uploadErr == nil {
-			info("preview: ✓ %s", baseName)
-			previewDone <- remoteURL
-		} else {
-			errFn("preview: all hosts failed for %s: %v (cosmetic — thumbnail+sprite still saved)", baseName, uploadErr)
-			previewDone <- ""
-		}
+		errFn("preview: all hosts failed for %s (cosmetic — thumbnail+sprite still saved)", baseName)
+		previewDone <- ""
 	}()
 
-	thumbURL = <-thumbDone
-	spriteURL = <-spriteDone
-	previewURL = <-previewDone
+	result.ThumbURL = <-thumbDone
+	result.SpriteURL = <-spriteDone
+	result.PreviewURL = <-previewDone
 
-	return thumbURL, spriteURL, previewURL
+	mirrorsMu.Lock()
+	result.ThumbMirrors = thumbMirrors
+	result.SpriteMirrors = spriteMirrors
+	result.PreviewMirrors = previewMirrors
+	mirrorsMu.Unlock()
+
+	return result
 }

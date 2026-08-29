@@ -773,15 +773,15 @@ func (m *Manager) ScanThumbnails() {
 			if seen && time.Since(last) < thumbRetryCooldown {
 				return nil
 			}
-			newThumb, newSprite, newPreview := channel.GenerateThumbnailForFile(path)
+			thumb := channel.GenerateThumbnailForFile(path)
 			// Record the attempt regardless of outcome so failures cool down
 			// too instead of burning host attempts on every single scan.
 			m.thumbThrottleMu.Lock()
 			m.thumbThrottle[path] = time.Now()
 			m.thumbThrottleMu.Unlock()
-			if newThumb != "" || newSprite != "" || newPreview != "" {
+			if thumb.ThumbURL != "" || thumb.SpriteURL != "" || thumb.PreviewURL != "" {
 				server.ClearThumbFailure(path)
-				if err := server.SavePreviewLinks(info.Name(), newThumb, newSprite, newPreview); err != nil {
+				if err := server.SavePreviewLinks(info.Name(), thumb.ThumbURL, thumb.SpriteURL, thumb.PreviewURL, thumb.ThumbMirrors, thumb.SpriteMirrors, thumb.PreviewMirrors); err != nil {
 					log.Printf("[thumb] failed to save preview links for %s: %v", info.Name(), err)
 				}
 				// Also sync the generated thumbnail onto the recordings row so
@@ -790,8 +790,8 @@ func (m *Manager) ScanThumbnails() {
 				// thumbnail was backfilled here (source file still on disk)
 				// never had their recordings row updated — leaving rows with a
 				// preview_images entry but a null thumbnail_url.
-				if newThumb != "" {
-					if err := server.UpdateRecordingThumbnails(info.Name(), newThumb, newSprite, newPreview); err != nil {
+				if thumb.ThumbURL != "" {
+					if err := server.UpdateRecordingThumbnails(info.Name(), thumb.ThumbURL, thumb.SpriteURL, thumb.PreviewURL); err != nil {
 						log.Printf("[thumb] failed to update recording thumbnails for %s: %v", info.Name(), err)
 					}
 				}

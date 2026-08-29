@@ -2,30 +2,53 @@ package uploader
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
 // MultiImageUploader uploads images to configured hosts in linear fallback
-// order: Pixhost.to → ImgBB → Catbox.moe.  Each host gets at most 3 attempts.
+// order: Catbox.moe → Pixhost.to → freeimage.host.  Each host gets at most
+// 3 attempts.
 //
 // Sequential fallback is preferred over parallel upload because:
 //   - Pixhost supports JPEG, PNG, and GIF (all formats we generate), so it
 //     succeeds in the vast majority of cases without wasting API calls.
-//   - Parallel upload to Pixhost + ImgBB triggered unnecessary rate limiting
-//     on ImgBB and made errors harder to diagnose.
+//   - Parallel uploads triggered unnecessary rate limiting and made errors
+//     harder to diagnose.
+//
+// All three hosts support adult/NSFW content and provide permanent hosting.
+// freeimage.host is the last resort before giving up (64 MB limit, no API
+// key needed, permanent storage, adult-friendly).
 type MultiImageUploader struct {
-	pixhost *ThumbnailUploader
-	imgbb   *ImgBBUploader
-	catbox  *CatboxUploader
+	catbox    *CatboxUploader
+	pixhost   *ThumbnailUploader
+	freeimage *FreeImageHostUploader
+	imgchest  *ImgChestUploader
+	imgbox    *ImgboxUploader
+	imgbb     *ImgBBUploader
+	skipHosts map[string]bool // hosts to skip in UploadToAll
+}
+
+// SetSkipHosts marks specific hosts to skip in UploadToAll.
+func (m *MultiImageUploader) SetSkipHosts(hosts ...string) {
+	if m.skipHosts == nil {
+		m.skipHosts = make(map[string]bool)
+	}
+	for _, h := range hosts {
+		m.skipHosts[h] = true
+	}
 }
 
 // NewMultiImageUploader creates a new image uploader that uploads to
-// Pixhost.to, ImgBB, and Catbox.moe (fallback order).
+// Catbox.moe, Pixhost.to, and freeimage.host (fallback order).
 func NewMultiImageUploader() *MultiImageUploader {
 	return &MultiImageUploader{
-		pixhost: NewThumbnailUploader(""),
-		imgbb:   NewImgBBUploader(),
-		catbox:  NewCatboxUploader(),
+		catbox:    NewCatboxUploader(),
+		pixhost:   NewThumbnailUploader(""),
+		freeimage: NewFreeImageHostUploader(),
+		imgchest:  NewImgChestUploader(),
+		imgbox:    NewImgboxUploader(),
+		imgbb:     NewImgBBUploader(),
 	}
 }
 
@@ -54,18 +77,26 @@ func uploadWithRetries(maxAttempts int, label string, fn func() (string, error))
 	return "", lastErr
 }
 
+// ImageUploadResult contains the result of an image upload to a specific host.
+type ImageUploadResult struct {
+	Host string
+	URL  string
+	Err  error
+}
+
 // Upload returns the first successful direct image URL. Order: Catbox.moe
-// FIRST, then Pixhost, then ImgBB as fallbacks.
+// FIRST, then Pixhost, then freeimage.host as fallbacks.
 //
+// All three hosts support adult/NSFW content and provide permanent hosting.
 // On the GitHub Actions runner Catbox MUST be reached through CATBOX_PROXY_URL
 // (a Cloudflare Worker), which leaves from Cloudflare's edge IPs that Catbox
 // does not block — making it the only image host that reliably succeeds from
-// the datacenter runner IPs (Pixhost.to and ImgBB otherwise block/rate-limit
-// the runner). They are kept only as fallbacks for the rare case the
-// proxy/Catbox is unavailable.
+// the datacenter runner IPs (Pixhost.to and freeimage.host otherwise
+// block/rate-limit the runner). They are kept only as fallbacks for the rare
+// case the proxy/Catbox is unavailable.
 func (m *MultiImageUploader) Upload(filePath string) (url, host string, err error) {
 	// Catbox.moe first — routed through CATBOX_PROXY_URL on the runner so it
-	// succeeds from datacenter IPs where Pixhost/ImgBB are blocked.
+	// succeeds from datacenter IPs where other hosts are blocked.
 	url, err = uploadWithRetries(3, "Catbox", func() (string, error) {
 		return m.catbox.Upload(filePath)
 	})
@@ -82,12 +113,137 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 	}
 	pixhostErr := err
 
-	url, err = uploadWithRetries(3, "ImgBB", func() (string, error) {
-		return m.imgbb.Upload(filePath)
+	url, err = uploadWithRetries(3, "freeimage.host", func() (string, error) {
+		return m.freeimage.Upload(filePath)
 	})
 	if err == nil {
-		return url, "ImgBB", nil
+		return url, "freeimage.host", nil
+	}
+	freeimageErr := err
+
+	// ImgChest — only if token is configured
+	if m.imgchest.HasToken() {
+		url, err = uploadWithRetries(3, "ImgChest", func() (string, error) {
+			return m.imgchest.Upload(filePath)
+		})
+		if err == nil {
+			return url, "ImgChest", nil
+		}
+		imgchestErr := err
+
+		// Imgbox — last resort
+		url, err = uploadWithRetries(3, "Imgbox", func() (string, error) {
+			return m.imgbox.Upload(filePath)
+		})
+		if err == nil {
+			return url, "Imgbox", nil
+		}
+		imgboxErr := err
+
+		// ImgBB — absolute last resort
+		if m.imgbb.keys.count() > 0 {
+			url, err = uploadWithRetries(3, "ImgBB", func() (string, error) {
+				return m.imgbb.Upload(filePath)
+			})
+			if err == nil {
+				return url, "ImgBB", nil
+			}
+			imgbbErr := err
+			return "", "", fmt.Errorf("catbox: %w (pixhost: %v, freeimage.host: %v, imgchest: %v, imgbox: %v, imgbb: %v)", catboxErr, pixhostErr, freeimageErr, imgchestErr, imgboxErr, imgbbErr)
+		}
+		return "", "", fmt.Errorf("catbox: %w (pixhost: %v, freeimage.host: %v, imgchest: %v, imgbox: %v)", catboxErr, pixhostErr, freeimageErr, imgchestErr, imgboxErr)
 	}
 
-	return "", "", fmt.Errorf("catbox: %w (pixhost: %v, imgbb: %v)", catboxErr, pixhostErr, err)
+	// Imgbox — fallback when ImgChest is not configured
+	url, err = uploadWithRetries(3, "Imgbox", func() (string, error) {
+		return m.imgbox.Upload(filePath)
+	})
+	if err == nil {
+		return url, "Imgbox", nil
+	}
+	imgboxErr := err
+
+	// ImgBB — absolute last resort
+	if m.imgbb.keys.count() > 0 {
+		url, err = uploadWithRetries(3, "ImgBB", func() (string, error) {
+			return m.imgbb.Upload(filePath)
+		})
+		if err == nil {
+			return url, "ImgBB", nil
+		}
+		imgbbErr := err
+		return "", "", fmt.Errorf("catbox: %w (pixhost: %v, freeimage.host: %v, imgbox: %v, imgbb: %v)", catboxErr, pixhostErr, freeimageErr, imgboxErr, imgbbErr)
+	}
+
+	return "", "", fmt.Errorf("catbox: %w (pixhost: %v, freeimage.host: %v, imgbox: %v)", catboxErr, pixhostErr, freeimageErr, imgboxErr)
+}
+
+// UploadToAll uploads the image to ALL configured hosts in parallel.
+// Returns a slice of results, one per host. The caller should pick the
+// first successful URL for the primary thumbnail_url, and can optionally
+// store additional mirror URLs for redundancy.
+//
+// This provides maximum redundancy: even if one host goes down, the
+// thumbnail is still available on the others.
+func (m *MultiImageUploader) UploadToAll(filePath string) []ImageUploadResult {
+	type hostJob struct {
+		name string
+		fn   func(string) (string, error)
+	}
+
+	jobs := []hostJob{}
+	// Add hosts, skipping any in skipHosts
+	addJob := func(name string, fn func(string) (string, error)) {
+		if m.skipHosts != nil && m.skipHosts[name] {
+			return
+		}
+		jobs = append(jobs, hostJob{name, fn})
+	}
+	addJob("Catbox", m.catbox.Upload)
+	addJob("Pixhost", m.pixhost.Upload)
+	addJob("freeimage.host", m.freeimage.Upload)
+	if m.imgchest.HasToken() {
+		addJob("ImgChest", m.imgchest.Upload)
+	}
+	addJob("Imgbox", m.imgbox.Upload)
+	if m.imgbb.keys.count() > 0 {
+		addJob("ImgBB", m.imgbb.Upload)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	results := make([]ImageUploadResult, 0, len(jobs))
+
+	for _, job := range jobs {
+		wg.Add(1)
+		go func(j hostJob) {
+			defer wg.Done()
+			url, err := uploadWithRetries(3, j.name, func() (string, error) {
+				return j.fn(filePath)
+			})
+			mu.Lock()
+			results = append(results, ImageUploadResult{
+				Host: j.name,
+				URL:  url,
+				Err:  err,
+			})
+			mu.Unlock()
+		}(job)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// UploadToAllURLs is a convenience wrapper that returns only the successful
+// URLs from UploadToAll, keyed by host name.
+func (m *MultiImageUploader) UploadToAllURLs(filePath string) map[string]string {
+	results := m.UploadToAll(filePath)
+	urls := make(map[string]string)
+	for _, r := range results {
+		if r.Err == nil && r.URL != "" {
+			urls[r.Host] = r.URL
+		}
+	}
+	return urls
 }

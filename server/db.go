@@ -607,20 +607,23 @@ func SaveRecordingsToDB(data []byte) error {
 
 	// Parse the JSON data
 	type RecordingEntry struct {
-			Filename     string            `json:"filename"`
-			Timestamp    string            `json:"timestamp"`
-			RoomTitle    string            `json:"room_title"`
-			Tags         []string          `json:"tags"`
-			Viewers      int               `json:"viewers"`
-			Resolution   string            `json:"resolution"`
-			Framerate    int               `json:"framerate"`
-			Links        map[string]string `json:"links"`
-			ThumbnailURL string            `json:"thumbnail_url"`
-			SpriteURL    string            `json:"sprite_url"`
-			PreviewURL   string            `json:"preview_url"`
-			EmbedURL     string            `json:"embed_url"`
-			Filesize     int64             `json:"filesize"`
-			EndReason    string            `json:"end_reason,omitempty"`
+			Filename         string            `json:"filename"`
+			Timestamp        string            `json:"timestamp"`
+			RoomTitle        string            `json:"room_title"`
+			Tags             []string          `json:"tags"`
+			Viewers          int               `json:"viewers"`
+			Resolution       string            `json:"resolution"`
+			Framerate        int               `json:"framerate"`
+			Links            map[string]string `json:"links"`
+			ThumbnailURL     string            `json:"thumbnail_url"`
+			SpriteURL        string            `json:"sprite_url"`
+			PreviewURL       string            `json:"preview_url"`
+			ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"`
+			SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`
+			PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`
+			EmbedURL         string            `json:"embed_url"`
+			Filesize         int64             `json:"filesize"`
+			EndReason        string            `json:"end_reason,omitempty"`
 		}
 
 		type ChannelRecordings struct {
@@ -642,19 +645,22 @@ func SaveRecordingsToDB(data []byte) error {
 	for username, chanData := range db.Channels {
 		for _, rec := range chanData.Recordings {
 			recording := &database.Recording{
-				Username:     username,
-				Filename:     rec.Filename,
-				Timestamp:    rec.Timestamp,
-				RoomTitle:    rec.RoomTitle,
-				Tags:         rec.Tags,
-				Viewers:      rec.Viewers,
-				Resolution:   rec.Resolution,
-				Framerate:    rec.Framerate,
-				Filesize:     rec.Filesize,
-				Gender:       chanData.Gender,
-				ThumbnailURL: rec.ThumbnailURL,
-				SpriteURL:    rec.SpriteURL,
-				EmbedURL:     rec.EmbedURL,
+				Username:           username,
+				Filename:           rec.Filename,
+				Timestamp:          rec.Timestamp,
+				RoomTitle:          rec.RoomTitle,
+				Tags:               rec.Tags,
+				Viewers:            rec.Viewers,
+				Resolution:         rec.Resolution,
+				Framerate:          rec.Framerate,
+				Filesize:           rec.Filesize,
+				Gender:             chanData.Gender,
+				ThumbnailURL:       rec.ThumbnailURL,
+				SpriteURL:          rec.SpriteURL,
+				EmbedURL:           rec.EmbedURL,
+				ThumbnailMirrors:   rec.ThumbnailMirrors,
+				SpriteMirrors:      rec.SpriteMirrors,
+				PreviewMirrors:     rec.PreviewMirrors,
 			}
 
 			if err := client.SaveRecording(recording); err != nil {
@@ -679,10 +685,13 @@ func SaveRecordingsToDB(data []byte) error {
 
 			if rec.ThumbnailURL != "" || rec.SpriteURL != "" {
 				img := &database.PreviewImage{
-					RecordingID:  savedRec.ID,
-					Filename:     rec.Filename,
-					ThumbnailURL: rec.ThumbnailURL,
-					SpriteURL:    rec.SpriteURL,
+					RecordingID:        savedRec.ID,
+					Filename:           rec.Filename,
+					ThumbnailURL:       rec.ThumbnailURL,
+					SpriteURL:          rec.SpriteURL,
+					ThumbnailMirrors:   rec.ThumbnailMirrors,
+					SpriteMirrors:      rec.SpriteMirrors,
+					PreviewMirrors:     rec.PreviewMirrors,
 				}
 				if err := client.SavePreviewImage(img); err != nil {
 					return fmt.Errorf("save preview image %s: %w", rec.Filename, err)
@@ -714,20 +723,23 @@ func LoadRecordingsFromDB() []byte {
 
 	// Convert to the old JSON format for compatibility
 	type RecordingEntry struct {
-			Filename     string            `json:"filename"`
-			Timestamp    string            `json:"timestamp"`
-			RoomTitle    string            `json:"room_title"`
-			Tags         []string          `json:"tags"`
-			Viewers      int               `json:"viewers"`
-			Resolution   string            `json:"resolution"`
-			Framerate    int               `json:"framerate"`
-			Links        map[string]string `json:"links"`
-			ThumbnailURL string            `json:"thumbnail_url"`
-			SpriteURL    string            `json:"sprite_url"`
-			PreviewURL   string            `json:"preview_url"`
-			EmbedURL     string            `json:"embed_url"`
-			Filesize     int64             `json:"filesize"`
-			EndReason    string            `json:"end_reason,omitempty"`
+			Filename         string            `json:"filename"`
+			Timestamp        string            `json:"timestamp"`
+			RoomTitle        string            `json:"room_title"`
+			Tags             []string          `json:"tags"`
+			Viewers          int               `json:"viewers"`
+			Resolution       string            `json:"resolution"`
+			Framerate        int               `json:"framerate"`
+			Links            map[string]string `json:"links"`
+			ThumbnailURL     string            `json:"thumbnail_url"`
+			SpriteURL        string            `json:"sprite_url"`
+			PreviewURL       string            `json:"preview_url"`
+			ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"`
+			SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`
+			PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`
+			EmbedURL         string            `json:"embed_url"`
+			Filesize         int64             `json:"filesize"`
+			EndReason        string            `json:"end_reason,omitempty"`
 		}
 
 		type ChannelRecordings struct {
@@ -1036,20 +1048,24 @@ func LoadCurrentTunnel() (string, error) {
 
 // ─── Preview Links ────────────────────────────────────────────────────────────
 
-// SavePreviewLinks saves preview image URLs to Supabase
-func SavePreviewLinks(filename, thumbnailURL, spriteURL, previewURL string) error {
+// SavePreviewLinks saves preview image URLs to Supabase.
+// The mirrors parameters are optional maps of host -> URL for redundancy.
+func SavePreviewLinks(filename, thumbnailURL, spriteURL, previewURL string, thumbnailMirrors, spriteMirrors, previewMirrors map[string]string) error {
 	client := GetDBClient()
 	if client == nil {
 		return fmt.Errorf("Supabase not configured")
 	}
 
 	img := &database.PreviewImage{
-		Filename:     filename,
-		ThumbnailURL: thumbnailURL,
-		SpriteURL:    spriteURL,
-		PreviewURL:   previewURL,
-		UploadedAt:   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
-		InstanceID:   DBInstanceID(),
+		Filename:         filename,
+		ThumbnailURL:     thumbnailURL,
+		SpriteURL:        spriteURL,
+		PreviewURL:       previewURL,
+		ThumbnailMirrors: thumbnailMirrors,
+		SpriteMirrors:    spriteMirrors,
+		PreviewMirrors:   previewMirrors,
+		UploadedAt:       time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		InstanceID:       DBInstanceID(),
 	}
 
 	if err := client.SavePreviewImage(img); err != nil {
