@@ -489,30 +489,30 @@ func (c *Client) DeleteChannelsNotIn(usernames []string) error {
 // ============================================================================
 
 type Recording struct {
-	ID           string   `json:"id,omitempty"`
-	ChannelID    string   `json:"channel_id,omitempty"`
-	Username     string   `json:"username"`
-	Filename     string   `json:"filename"`
-	Timestamp    string   `json:"timestamp"`
-	RoomTitle    string   `json:"room_title,omitempty"`
-	Tags         []string `json:"tags,omitempty"`
-	Viewers      int      `json:"viewers"`
-	Resolution   string   `json:"resolution,omitempty"`
-	Framerate    int      `json:"framerate"`
-	Filesize     int64    `json:"filesize"`
-	Duration     float64  `json:"duration,omitempty"`
-	Gender       string   `json:"gender,omitempty"`
+	ID         string   `json:"id,omitempty"`
+	ChannelID  string   `json:"channel_id,omitempty"`
+	Username   string   `json:"username"`
+	Filename   string   `json:"filename"`
+	Timestamp  string   `json:"timestamp"`
+	RoomTitle  string   `json:"room_title,omitempty"`
+	Tags       []string `json:"tags,omitempty"`
+	Viewers    int      `json:"viewers"`
+	Resolution string   `json:"resolution,omitempty"`
+	Framerate  int      `json:"framerate"`
+	Filesize   int64    `json:"filesize"`
+	Duration   float64  `json:"duration,omitempty"`
+	Gender     string   `json:"gender,omitempty"`
 	// EndReason records why the recording stopped (model went offline, stream
 	// session expired, max duration/filesize rotation, paused/stopped, session
 	// boundary). Empty when unknown (e.g. orphan-recovery uploads).
-	EndReason    string   `json:"end_reason,omitempty"`
-	ThumbnailURL string   `json:"thumbnail_url,omitempty"`
-	SpriteURL    string   `json:"sprite_url,omitempty"`
-	PreviewURL   string   `json:"preview_url,omitempty"`
-	EmbedURL     string   `json:"embed_url,omitempty"`
-	InstanceID   string   `json:"instance_id,omitempty"`
-	CreatedAt    string   `json:"created_at,omitempty"`
-	UpdatedAt    string   `json:"updated_at,omitempty"`
+	EndReason    string `json:"end_reason,omitempty"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+	SpriteURL    string `json:"sprite_url,omitempty"`
+	PreviewURL   string `json:"preview_url,omitempty"`
+	EmbedURL     string `json:"embed_url,omitempty"`
+	InstanceID   string `json:"instance_id,omitempty"`
+	CreatedAt    string `json:"created_at,omitempty"`
+	UpdatedAt    string `json:"updated_at,omitempty"`
 }
 
 // SaveRecording creates or updates a recording using Supabase's upsert functionality.
@@ -1123,10 +1123,10 @@ func (c *Client) DeletePipelineState(fileHash string) error {
 
 // Node represents a worker node in the distributed recording system.
 type Node struct {
-	NodeID          string `json:"node_id"`
-	Hostname        string `json:"hostname"`
-	InstanceLabel   string `json:"instance_label"`
-	SoftwareVersion string `json:"software_version"`
+	NodeID          string     `json:"node_id"`
+	Hostname        string     `json:"hostname"`
+	InstanceLabel   string     `json:"instance_label"`
+	SoftwareVersion string     `json:"software_version"`
 	Status          string     `json:"status"`
 	CurrentLoad     int        `json:"current_load"`
 	LastHeartbeat   string     `json:"last_heartbeat,omitempty"`
@@ -1297,13 +1297,27 @@ func (c *Client) TryAcquireControllerLease(nodeID string, ttlSeconds int) (bool,
 		body, _ := io.ReadAll(resp.Body)
 		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("read lease response: %w", err)
+	}
+
+	// 1. Try decoding as scalar bool (standard PostgREST RPC return for RETURNS boolean)
+	var scalarBool bool
+	if err := json.Unmarshal(body, &scalarBool); err == nil {
+		return scalarBool, nil
+	}
+
+	// 2. Fallback: table format ([]struct)
 	var rows []struct {
 		ClaimControllerLease bool `json:"claim_controller_lease"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
-		return false, fmt.Errorf("decode lease: %w", err)
+	if err := json.Unmarshal(body, &rows); err == nil {
+		return len(rows) > 0 && rows[0].ClaimControllerLease, nil
 	}
-	return len(rows) > 0 && rows[0].ClaimControllerLease, nil
+
+	return false, fmt.Errorf("decode lease response: %s", string(body))
 }
 
 // ReleaseControllerLease expires the lease early if this node currently holds
@@ -1347,39 +1361,26 @@ func (c *Client) SetAssignmentStatus(username, site, status string) error {
 	return nil
 }
 
-// ResetStaleRecordingAssignments returns every recording row that was reset to
-// claimed because its heartbeat was already stale in the database.  Keeping the
-// timestamp condition in the UPDATE itself is important: a row can become an
-// active recording after the controller has read its assignment snapshot.
-//
-// Recorder nodes use the service-role key, which is permitted to make this
-// conditional REST update.  The two requests cover old heartbeats and NULL
-// heartbeats without ever touching a fresh recording.
-func (c *Client) ResetStaleRecordingAssignments(before time.Time) ([]ChannelAssignment, error) {
-	paths := []string{
-		fmt.Sprintf("/channel_assignments?status=eq.recording&last_heartbeat=lt.%s",
-			url.QueryEscape(before.UTC().Format(time.RFC3339Nano))),
-		"/channel_assignments?status=eq.recording&last_heartbeat=is.null",
+// ResetStaleRecordingAssignments resets expired recording markers.
+// An active recording continuously refreshes its heartbeat every 30-60s via
+// MarkChannelRecording. Any row whose status is 'recording' and whose heartbeat
+// is older than `before` (or is null) is no longer recording, so it is safely
+// reset back to 'claimed'.
+func (c *Client) ResetStaleRecordingAssignments(before time.Time, protectedNodeIDs []string) ([]ChannelAssignment, error) {
+	path := fmt.Sprintf("/channel_assignments?status=eq.recording&or=(last_heartbeat.lt.%s,last_heartbeat.is.null)",
+		url.QueryEscape(before.UTC().Format(time.RFC3339Nano)))
+	resp, err := c.requestWithRetry("PATCH", path, map[string]interface{}{"status": "claimed"})
+	if err != nil {
+		return nil, err
 	}
-
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
 	var reset []ChannelAssignment
-	for _, path := range paths {
-		resp, err := c.requestWithRetry("PATCH", path, map[string]interface{}{"status": "claimed"})
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-		}
-		var rows []ChannelAssignment
-		err = json.NewDecoder(resp.Body).Decode(&rows)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("decode stale recording reset: %w", err)
-		}
-		reset = append(reset, rows...)
+	if err := json.NewDecoder(resp.Body).Decode(&reset); err != nil {
+		return nil, fmt.Errorf("decode stale recording reset: %w", err)
 	}
 	return reset, nil
 }

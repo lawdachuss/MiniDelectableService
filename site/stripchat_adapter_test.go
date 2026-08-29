@@ -5,67 +5,75 @@ import (
 	"testing"
 )
 
-// TestParseCamObjectForm verifies the live-model object shape parses fully.
-func TestParseCamObjectForm(t *testing.T) {
-	raw := json.RawMessage(`{"streamName":"abc_123","isCamActive":true,"viewServers":{"flashphoner-hls":"srv1"},"broadcastSettings":{"broadcastType":"public"},"topic":"#fun night"}`)
-	cam := parseCam(raw)
+// TestParsePageState verifies the live-model page state JSON parses fully.
+func TestParsePageState(t *testing.T) {
+	raw := `{
+		"viewCamBase": {
+			"model": {
+				"username": "Kira_Queen",
+				"status": "public",
+				"isLive": true,
+				"isOnline": true,
+				"broadcastGender": "female",
+				"previewUrlThumbBig": "https://img.doppiocdn.org/preview.jpg",
+				"snapshotTimestamp": 1788009810
+			}
+		},
+		"viewCam": {
+			"streamName": "abc_123",
+			"isCamActive": true,
+			"viewServers": {"flashphoner-hls": "srv1"},
+			"topic": "#fun night"
+		}
+	}`
+
+	var state scPageState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		t.Fatalf("unmarshal page state failed: %v", err)
+	}
+
+	m := state.ViewCamBase.Model
+	cam := state.ViewCam
+
+	if m.Username != "Kira_Queen" || !m.IsLive || m.Status != "public" {
+		t.Fatalf("unexpected model data: %+v", m)
+	}
 	if !cam.IsCamActive || cam.StreamName != "abc_123" {
-		t.Fatalf("unexpected cam: %+v", cam)
+		t.Fatalf("unexpected cam data: %+v", cam)
 	}
 	if cam.ViewServers["flashphoner-hls"] != "srv1" {
 		t.Fatalf("viewServers not parsed: %+v", cam.ViewServers)
 	}
-	if cam.Topic != "#fun night" {
-		t.Fatalf("topic not parsed: %+v", cam)
+}
+
+// TestFindJSONObjectEnd tests JSON object boundary detection.
+func TestFindJSONObjectEnd(t *testing.T) {
+	s := `window.__PRELOADED_STATE__ = {"a": {"b": 1}, "c": "}"}; window.other = 1;`
+	pos := 29 // start of {
+	end := findJSONObjectEnd(s, pos)
+	if end < 0 {
+		t.Fatalf("expected to find end of JSON object")
+	}
+	jsonStr := s[pos:end]
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
+		t.Fatalf("extracted JSON invalid: %s (err: %v)", jsonStr, err)
 	}
 }
 
-// TestParseCamArrayForm verifies the idle/offline array shape ([]) yields an
-// inactive cam instead of a parse error, and that null/missing are safe.
-func TestParseCamArrayForm(t *testing.T) {
-	if cam := parseCam(json.RawMessage(`[]`)); cam.IsCamActive {
-		t.Fatalf("empty array must yield inactive cam, got %+v", cam)
+// TestMapGender verifies gender string normalization.
+func TestMapGender(t *testing.T) {
+	cases := map[string]string{
+		"female": "f",
+		"male":   "m",
+		"couple": "c",
+		"trans":  "t",
+		"other":  "other",
 	}
-	if cam := parseCam(json.RawMessage(`null`)); cam.IsCamActive {
-		t.Fatalf("null must yield inactive cam, got %+v", cam)
-	}
-	if cam := parseCam(nil); cam.IsCamActive {
-		t.Fatalf("missing cam must yield inactive cam, got %+v", cam)
-	}
-}
-
-// TestParseCamArrayWithPayload verifies an array of cam payloads falls back to
-// the first element.
-func TestParseCamArrayWithPayload(t *testing.T) {
-	raw := json.RawMessage(`[{"streamName":"x","isCamActive":true}]`)
-	cam := parseCam(raw)
-	if !cam.IsCamActive || cam.StreamName != "x" {
-		t.Fatalf("first array element should win, got %+v", cam)
+	for in, want := range cases {
+		if got := mapGender(in); got != want {
+			t.Errorf("mapGender(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
-// TestCamResponseUnmarshalWithArrayCam is the exact production failure: the
-// Stripchat API now returns cam:[] for idle models, which used to abort the
-// whole response unmarshal (\"cannot unmarshal array into Go struct field
-// camResponse.cam\"). The response must now decode and keep the user data.
-func TestCamResponseUnmarshalWithArrayCam(t *testing.T) {
-	var resp camResponse
-	if err := json.Unmarshal([]byte(`{"cam":[],"user":{"user":{"username":"m","isOnline":false,"status":"offline"}}}`), &resp); err != nil {
-		t.Fatalf("unmarshal with array cam failed: %v", err)
-	}
-	if resp.User.User.Username != "m" || resp.User.User.Status != "offline" {
-		t.Fatalf("user data not parsed: %+v", resp.User.User)
-	}
-}
-
-// TestCamResponseUnmarshalWithObjectCam verifies the live shape still parses.
-func TestCamResponseUnmarshalWithObjectCam(t *testing.T) {
-	var resp camResponse
-	if err := json.Unmarshal([]byte(`{"cam":{"streamName":"abc","isCamActive":true},"user":{"user":{"username":"m","isOnline":true}}}`), &resp); err != nil {
-		t.Fatalf("unmarshal with object cam failed: %v", err)
-	}
-	cam := parseCam(resp.Cam)
-	if !cam.IsCamActive || cam.StreamName != "abc" {
-		t.Fatalf("object cam not parsed: %+v", cam)
-	}
-}

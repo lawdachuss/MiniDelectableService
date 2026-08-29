@@ -163,11 +163,11 @@ func (c *Coordinator) startHealthCheckLoop(ctx context.Context) {
 				return
 			case <-c.stopCh:
 				return
-		case <-ticker.C:
-		c.checkCycleHealth("reconcile", &c.cycleGuardReconcile)
-		c.checkCycleHealth("controller", &c.cycleGuardController)
-		c.checkCycleHealth("stuck-pause", &c.cycleGuardStuckPause)
-		}
+			case <-ticker.C:
+				c.checkCycleHealth("reconcile", &c.cycleGuardReconcile)
+				c.checkCycleHealth("controller", &c.cycleGuardController)
+				c.checkCycleHealth("stuck-pause", &c.cycleGuardStuckPause)
+			}
 		}
 	}()
 }
@@ -280,8 +280,8 @@ type Coordinator struct {
 	// written by the heartbeat tick and read by StartHeartbeatWatchdog to
 	// detect a wedged/frozen heartbeat path (a hung DVR that keep-alive's
 	// $dvr.HasExited check can never see).
-	lastHeartbeatOK   time.Time
-	lastHeartbeatMu   sync.Mutex
+	lastHeartbeatOK time.Time
+	lastHeartbeatMu sync.Mutex
 
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -294,15 +294,15 @@ type Coordinator struct {
 	// is slow — a cycle that hasn't finished when the next tick fires will
 	// skip its tick instead of launching a concurrent cycle that piles on
 	// more DB load.  lastRun timestamps feed the health-check watchdog.
-	cycleGuardClaim         cycleGuard
-	cycleGuardLiveCheck     cycleGuard
-	cycleGuardReaper        cycleGuard
-	cycleGuardShuffle       cycleGuard
-	cycleGuardDeadline      cycleGuard
-	cycleGuardReconcile     cycleGuard
-	cycleGuardStuckPause    cycleGuard
-	cycleGuardHoard         cycleGuard
-	cycleGuardController    cycleGuard
+	cycleGuardClaim      cycleGuard
+	cycleGuardLiveCheck  cycleGuard
+	cycleGuardReaper     cycleGuard
+	cycleGuardShuffle    cycleGuard
+	cycleGuardDeadline   cycleGuard
+	cycleGuardReconcile  cycleGuard
+	cycleGuardStuckPause cycleGuard
+	cycleGuardHoard      cycleGuard
+	cycleGuardController cycleGuard
 
 	// cbLiveCache caches per-channel chaturbate liveness probe results so the
 	// fallback liveness check (used when the bulk affiliate API is unset or
@@ -313,22 +313,22 @@ type Coordinator struct {
 
 	// assignerCfg is the cached assignment tunables (loaded once from
 	// app_settings.key='assigner_config'). Guarded by assignerCfgMu.
-	assignerCfg       *assignerConfig
-	assignerCfgMu     sync.Mutex
+	assignerCfg   *assignerConfig
+	assignerCfgMu sync.Mutex
 	// assignerColdStart marks when a cold-start hold began; while set and within
 	// the cold-start window the controller defers assignment so a slow-booting
 	// fleet doesn't let its fast nodes grab every channel. Guarded by
 	// assignerColdStartMu.
-	assignerColdStart    *time.Time
-	assignerColdStartMu  sync.Mutex
+	assignerColdStart   *time.Time
+	assignerColdStartMu sync.Mutex
 
 	// assignerAssigned is set once the one-time equal startup assignment has
 	// been performed (after every node was live). After that, channels are NOT
 	// continuously reshuffled; reassignment happens only when the fleet
 	// membership changes (a node joins/leaves). Guarded by assignerAssignMu.
-	assignerAssigned  bool
-	assignerFleetSig  string
-	assignerAssignMu  sync.Mutex
+	assignerAssigned bool
+	assignerFleetSig string
+	assignerAssignMu sync.Mutex
 
 	// stuckPauseSeen tracks consecutive observations of a paused-but-still-
 	// assigned channel (key nodeID/site/username → count). A channel must be
@@ -344,8 +344,8 @@ type Coordinator struct {
 	// it back to the pool, so a single flaky probe (affiliate API blip,
 	// rate-limited room status, transient network error) can never pause a
 	// live channel. Live and Unknown results reset the streak.
-	liveCheckMiss    map[string]int
-	liveCheckMissMu  sync.Mutex
+	liveCheckMiss   map[string]int
+	liveCheckMissMu sync.Mutex
 }
 
 // New creates a new Coordinator. If CHANNEL_POOL_MODE=pooled, Start() must
@@ -416,10 +416,10 @@ func (c *Coordinator) Stop() {
 		return
 	}
 
-	// Release all channel assignments
-	if err := c.Client.ReleaseNodeChannels(c.NodeID); err != nil {
-		log.Printf("[coordinator] error releasing channels: %v", err)
-	}
+	// Keep assignments on graceful shutdown.  A restart must not create a pool
+	// of unassigned channels or reshuffle a healthy fleet.  The controller only
+	// reclaims non-recording work after nodeReclaimGrace, while a recording
+	// remains pinned until its owner is genuinely offline.
 
 	// Mark node as offline
 	if err := c.Client.UpdateNodeStatus(c.NodeID, "offline"); err != nil {

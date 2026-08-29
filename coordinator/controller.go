@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -140,11 +141,21 @@ func (c *Coordinator) runControllerCycle() {
 
 	now := time.Now()
 	activeSet := map[string]bool{}
+	protectedOwnerSet := map[string]bool{}
 	reclaimSet := map[string]bool{} // nodes whose channels are freed + redistributed
 	heldSet := map[string]bool{}    // briefly-offline nodes: channels HELD during grace
 	var active, heldNodes, reclaim []database.Node
 	offlineCount := 0
 	for _, n := range nodes {
+		// A recording remains pinned while its owner is online or draining and
+		// has checked in within the offline grace window. This is intentionally
+		// broader than "active": a node being drained must finish its current
+		// file before anything can take the channel away.
+		if n.Status != "offline" {
+			if hb, err := time.Parse(time.RFC3339Nano, n.LastHeartbeat); err == nil && now.Sub(hb) < nodeReclaimGrace {
+				protectedOwnerSet[n.NodeID] = true
+			}
+		}
 		switch n.Status {
 		case "draining":
 			// Intentionally removed: free its channels immediately (no grace) so
@@ -261,7 +272,7 @@ func (c *Coordinator) runControllerCycle() {
 	// A cancelled runner leaves its final recording marker in the database.  A
 	// fresh marker is protected, while an expired one is made movable so a full
 	// restart can converge instead of preserving stale imbalance forever.
-	c.clearStaleRecordingLeases(all, now)
+	c.clearStaleRecordingLeases(all, now, protectedOwnerSet)
 
 	// Do not let the repair check bypass the cold-start gate.  In particular, an
 	// early worker must not claim the entire unassigned pool merely because it
@@ -300,8 +311,12 @@ func (c *Coordinator) runControllerCycle() {
 
 const recordingLeaseTTL = 2 * time.Minute
 
-func (c *Coordinator) clearStaleRecordingLeases(all []database.ChannelAssignment, now time.Time) {
-	reset, err := c.Client.ResetStaleRecordingAssignments(now.Add(-recordingLeaseTTL))
+func (c *Coordinator) clearStaleRecordingLeases(all []database.ChannelAssignment, now time.Time, protectedOwnerSet map[string]bool) {
+	protected := make([]string, 0, len(protectedOwnerSet))
+	for nodeID := range protectedOwnerSet {
+		protected = append(protected, nodeID)
+	}
+	reset, err := c.Client.ResetStaleRecordingAssignments(now.Add(-recordingLeaseTTL), protected)
 	if err != nil {
 		log.Printf("[controller] clear stale recording leases: %v", err)
 		return
@@ -558,54 +573,121 @@ func (c *Coordinator) checkStripchatBatch(ctx context.Context, cfg assignerConfi
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			live, known := fetchStripchatLive(client, u)
-			if known {
-				mu.Lock()
-				out[u] = scLiveResult{live: live, known: true}
-				mu.Unlock()
-			}
+				if known {
+					mu.Lock()
+					out[u] = scLiveResult{live: live, known: true}
+					mu.Unlock()
+				}
 		}(ca.Username)
 	}
 	wg.Wait()
 	return out
 }
 
-// fetchStripchatLive queries the public Stripchat cam endpoint. A model is
-// "live for recording" only when status=="public" AND isLive==true (private/
-// group shows are not publicly recordable). Unknown/error → (false, false).
 func fetchStripchatLive(client *http.Client, username string) (live, known bool) {
-	url := "https://stripchat.com/api/front/v2/models/username/" + username + "/cam"
-	req, err := http.NewRequest("GET", url, nil)
+	// Use the shared httpcloak transport wrapping a standard http.Client so the
+	// Chrome TLS fingerprint bypasses Stripchat's Cloudflare bot detection.
+	cloakClient := &http.Client{Transport: internal.CreateTransport()}
+	pageURL := "https://stripchat.com/" + username
+	req, err := http.NewRequest("GET", pageURL, nil)
 	if err != nil {
 		return false, false
 	}
 	req.Header.Set("User-Agent", controllerUA)
-	req.Header.Set("Referer", "https://stripchat.com/"+username)
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	resp, err := client.Do(req)
+	resp, err := cloakClient.Do(req)
 	if err != nil {
 		return false, false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return false, false
-	}
-	var data struct {
-		User struct {
-			User struct {
-				Status string `json:"status"`
-				IsLive bool   `json:"isLive"`
-			} `json:"user"`
-		} `json:"user"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return false, false
-	}
-	u := data.User.User
-	if u.Status == "" && !u.IsLive {
+
+	// 404 = model doesn't exist (treat as known offline)
+	if resp.StatusCode == http.StatusNotFound {
 		return false, true
 	}
-	return u.IsLive && u.Status == "public", true
+	if resp.StatusCode != http.StatusOK {
+		return false, false
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, false
+	}
+	html := string(b)
+
+	// Parse window.__PRELOADED_STATE__.viewCamBase.model
+	const stateMarker = "window.__PRELOADED_STATE__"
+	idx := strings.Index(html, stateMarker)
+	if idx < 0 {
+		return false, false
+	}
+	start := idx + len(stateMarker)
+	for start < len(html) && (html[start] == ' ' || html[start] == '=') {
+		start++
+	}
+	end := findControllerJSONEnd(html, start)
+	if end < 0 {
+		return false, false
+	}
+
+	var state struct {
+		ViewCamBase struct {
+			Model struct {
+				Status   string `json:"status"`
+				IsLive   bool   `json:"isLive"`
+				IsOnline bool   `json:"isOnline"`
+			} `json:"model"`
+		} `json:"viewCamBase"`
+	}
+	if err := json.Unmarshal([]byte(html[start:end]), &state); err != nil {
+		return false, false
+	}
+
+	m := state.ViewCamBase.Model
+	if m.Status == "" && !m.IsLive && !m.IsOnline {
+		return false, true
+	}
+	return m.IsLive && m.Status == "public", true
+}
+
+// findControllerJSONEnd returns the index after the closing } of the JSON object
+// starting at pos. Returns -1 if not found.
+func findControllerJSONEnd(s string, pos int) int {
+	if pos >= len(s) || s[pos] != '{' {
+		return -1
+	}
+	depth := 0
+	inStr := false
+	escape := false
+	for i := pos; i < len(s); i++ {
+		c := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if c == '\\' && inStr {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
 }
 
 // balanceSite distributes the ENTIRE pool (live + offline) of one site evenly

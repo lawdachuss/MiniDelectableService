@@ -447,16 +447,14 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 	}
 
 	// Duplicate-recording guard. If the DB assignment is already status=
-	// 'recording' but we are NOT the node actively recording it, another node
-	// owns the live recording (the assignment may have been reassigned to us
-	// while it was mid-recording elsewhere — e.g. by an external autopilot).
-	// Starting it here would produce a second, overlapping recording, so skip
-	// it; the owning node keeps recording until the stream/session ends. A
-	// freshly claimed or reassigned channel arrives with status='claimed', so
-	// legitimate starts are never blocked by this guard.
+	// 'recording' on ANOTHER node, skip starting it locally so we do not produce
+	// an overlapping recording. If it is assigned to this node, start monitoring
+	// it normally (a stale recording status in DB will not block this node).
 	if ca.Status == "recording" && !m.IsRecording(ca.Username) {
-		log.Printf("[manager] assignment %s/%s is status=recording on another node — not starting duplicate recording", ca.Site, ca.Username)
-		return nil
+		if m.Coordinator != nil && ca.AssignedNode != "" && ca.AssignedNode != m.Coordinator.NodeID {
+			log.Printf("[manager] assignment %s/%s is status=recording on node %s — not starting duplicate recording", ca.Site, ca.Username, ca.AssignedNode)
+			return nil
+		}
 	}
 
 	conf := coordinator.ConfigFromAssignment(ca)

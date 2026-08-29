@@ -1,7 +1,6 @@
-package site
+﻿package site
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,54 +17,102 @@ func NewStripchatSite() *StripchatSite {
 	return &StripchatSite{}
 }
 
-type camResponse struct {
-	// Stripchat returns an object here while a model is live and an array
-	// ([]) when it is idle/offline. RawMessage keeps the top-level unmarshal
-	// from failing on either shape; parseCam decodes it leniently below.
-	Cam json.RawMessage `json:"cam"`
-	User struct {
-		User struct {
-			ID                 int64  `json:"id"`
+// scPageState holds the minimal slice of window.__PRELOADED_STATE__ we need.
+// Stripchat SSR embeds this JSON in every model page - it is the only endpoint
+// reliably reachable from datacenter IPs under Cloudflare bot-scoring.
+// The /api/front/v2/models/username/{username}/cam endpoint returns HTTP 418 for
+// any non-residential IP regardless of headers or TLS fingerprint.
+type scPageState struct {
+	ViewCamBase struct {
+		Model struct {
 			Username           string `json:"username"`
-			IsOnline           bool   `json:"isOnline"`
-			IsLive             bool   `json:"isLive"`
 			Status             string `json:"status"`
+			IsLive             bool   `json:"isLive"`
+			IsOnline           bool   `json:"isOnline"`
 			BroadcastGender    string `json:"broadcastGender"`
 			PreviewUrlThumbBig string `json:"previewUrlThumbBig"`
 			SnapshotTimestamp  int64  `json:"snapshotTimestamp"`
-		} `json:"user"`
-	} `json:"user"`
+		} `json:"model"`
+	} `json:"viewCamBase"`
+	ViewCam struct {
+		StreamName  string            `json:"streamName"`
+		ViewServers map[string]string `json:"viewServers"`
+		IsCamActive bool              `json:"isCamActive"`
+		Topic       string            `json:"topic"`
+	} `json:"viewCam"`
 }
 
-// camData is the object form of the "cam" field (present while live).
-type camData struct {
-	StreamName        string            `json:"streamName"`
-	IsCamActive       bool              `json:"isCamActive"`
-	ViewServers       map[string]string `json:"viewServers"`
-	BroadcastSettings struct {
-		BroadcastType string `json:"broadcastType"`
-	} `json:"broadcastSettings"`
-	Topic string `json:"topic"`
+// fetchStripchatPage fetches the Stripchat model page and parses embedded SSR state.
+// Returns the parsed state and HTTP status (200 = model exists, 404 = not found).
+// Uses the shared httpcloak Chrome-fingerprint transport - NOT http.DefaultTransport.
+// (stripchat.com was removed from directHosts in httpcloak_transport.go.)
+func fetchStripchatPage(ctx context.Context, req *internal.Req, username string) (*scPageState, int, error) {
+	pageURL := "https://stripchat.com/" + username
+
+	body, statusCode, err := req.GetBytesWithStatus(ctx, pageURL)
+	if err != nil {
+		return nil, 0, fmt.Errorf("stripchat: fetch page: %w", err)
+	}
+
+	html := string(body)
+	const stateMarker = "window.__PRELOADED_STATE__"
+	idx := strings.Index(html, stateMarker)
+	if idx < 0 {
+		return nil, statusCode, fmt.Errorf("stripchat: __PRELOADED_STATE__ not found in page (HTTP %d, len %d)", statusCode, len(html))
+	}
+
+	start := idx + len(stateMarker)
+	for start < len(html) && (html[start] == ' ' || html[start] == '=') {
+		start++
+	}
+	end := findJSONObjectEnd(html, start)
+	if end < 0 {
+		return nil, statusCode, fmt.Errorf("stripchat: could not find end of __PRELOADED_STATE__ JSON")
+	}
+
+	var state scPageState
+	if err := json.Unmarshal([]byte(html[start:end]), &state); err != nil {
+		return nil, statusCode, fmt.Errorf("stripchat: parse state: %w", err)
+	}
+	return &state, statusCode, nil
 }
 
-// parseCam decodes the raw "cam" field. Stripchat returns an object while a
-// model is live and an array ([]) when idle/offline, so an array simply means
-// "no active cam" — the zero value is returned in that case. If the array
-// ever carries cam payloads, the first element wins. Never fails: an
-// unparseable shape is treated as "no active cam".
-func parseCam(raw json.RawMessage) camData {
-	var c camData
-	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return c
+// findJSONObjectEnd returns the index after the closing } of the JSON object
+// starting at pos in s. Returns -1 if not found or pos does not point at '{'.
+func findJSONObjectEnd(s string, pos int) int {
+	if pos >= len(s) || s[pos] != '{' {
+		return -1
 	}
-	if err := json.Unmarshal(raw, &c); err == nil {
-		return c
+	depth := 0
+	inStr := false
+	escape := false
+	for i := pos; i < len(s); i++ {
+		c := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if c == '\\' && inStr {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
 	}
-	var arr []camData
-	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
-		return arr[0]
-	}
-	return c
+	return -1
 }
 
 func mapGender(g string) string {
@@ -83,31 +130,40 @@ func mapGender(g string) string {
 	}
 }
 
+// mouflonPDKey returns the manual Stripchat PD key if configured, otherwise
+// "auto" so FetchPlaylist resolves the pkey from the master playlist and
+// extracts/verifies the pdkey automatically.
+func mouflonPDKey() string {
+	if server.Config != nil && server.Config.StripchatPDKey != "" {
+		return server.Config.StripchatPDKey
+	}
+	return "auto"
+}
+
 func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, username string) (*StreamInfo, error) {
-	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam", username)
-
-	body, err := req.Get(ctx, apiURL)
+	state, httpStatus, err := fetchStripchatPage(ctx, req, username)
 	if err != nil {
-		return nil, fmt.Errorf("stripchat: fetch cam: %w", err)
+		return nil, fmt.Errorf("stripchat: fetch stream: %w", err)
 	}
 
-	var resp camResponse
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return nil, fmt.Errorf("stripchat: parse cam response: %w", err)
+	m := state.ViewCamBase.Model
+	cam := state.ViewCam
+
+	// 404 page = model does not exist
+	if httpStatus == 404 {
+		return nil, internal.ErrNotFound
 	}
 
-	u := resp.User.User
-	cam := parseCam(resp.Cam)
-
-	// Build room status string from Stripchat's status field.
-	roomStatus := u.Status
-	if !u.IsOnline && !u.IsLive {
-		if roomStatus == "" {
+	// Build room status: Stripchat page state uses "off", "public", "private", etc.
+	roomStatus := m.Status
+	if roomStatus == "off" || (!m.IsOnline && !m.IsLive) {
+		if roomStatus == "" || roomStatus == "off" {
 			roomStatus = StatusOffline
 		}
 	}
 
-	tags := []string{}
+	// Parse tags from topic
+	var tags []string
 	if cam.Topic != "" {
 		for _, word := range strings.Fields(cam.Topic) {
 			if strings.HasPrefix(word, "#") {
@@ -120,17 +176,13 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 		}
 	}
 
-	// Set LiveThumbURL to the preview image so the frontend renders the
-	// <img src="/api/thumb/:username"> tag. The ServeLiveThumb handler will
-	// first extract a frame from the recording file via ffmpeg (giving a live
-	// stream frame), and fall back to proxying this URL when no recording is
-	// active (showing the static profile image rather than nothing at all).
-	thumbURL := u.PreviewUrlThumbBig
+	// Thumbnail URL with cache-buster
+	thumbURL := m.PreviewUrlThumbBig
 	if thumbURL != "" {
 		if strings.Contains(thumbURL, "?") {
-			thumbURL = fmt.Sprintf("%s&t=%d", thumbURL, u.SnapshotTimestamp)
+			thumbURL = fmt.Sprintf("%s&t=%d", thumbURL, m.SnapshotTimestamp)
 		} else {
-			thumbURL = fmt.Sprintf("%s?t=%d", thumbURL, u.SnapshotTimestamp)
+			thumbURL = fmt.Sprintf("%s?t=%d", thumbURL, m.SnapshotTimestamp)
 		}
 	}
 
@@ -138,7 +190,7 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 		RoomStatus:   roomStatus,
 		RoomTitle:    cam.Topic,
 		Tags:         tags,
-		Gender:       mapGender(u.BroadcastGender),
+		Gender:       mapGender(m.BroadcastGender),
 		LiveThumbURL: thumbURL,
 		// Stripchat CDNs require a stripchat.com Referer/Origin for media
 		// requests, and MOUFLON segment decryption needs a pdkey.
@@ -146,7 +198,8 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 		MouflonPDKey: mouflonPDKey(),
 	}
 
-	if !u.IsOnline && !u.IsLive {
+	// Model must be live and in a public show to record
+	if !m.IsOnline && !m.IsLive {
 		return info, internal.ErrChannelOffline
 	}
 	if !cam.IsCamActive {
@@ -156,13 +209,17 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 		return info, internal.ErrChannelOffline
 	}
 
+	// Build HLS URL from page-embedded stream data
 	streamName := cam.StreamName
+	if streamName == "" {
+		return info, internal.ErrChannelOffline
+	}
 
 	var hlsURL string
-	if server, ok := cam.ViewServers["flashphoner-hls"]; ok && server != "" {
+	if svr, ok := cam.ViewServers["flashphoner-hls"]; ok && svr != "" {
 		hlsURL = fmt.Sprintf(
 			"https://b-%s.doppiocdn.com/hls/%s/master_%s.m3u8",
-			server, streamName, streamName,
+			svr, streamName, streamName,
 		)
 	} else {
 		hlsURL = fmt.Sprintf(
@@ -175,45 +232,32 @@ func (s *StripchatSite) FetchStream(ctx context.Context, req *internal.Req, user
 	return info, nil
 }
 
-// mouflonPDKey returns the manual Stripchat PD key if configured, otherwise
-// "auto" so FetchPlaylist resolves the pkey from the master playlist and
-// extracts/verifies the pdkey automatically.
-func mouflonPDKey() string {
-	if server.Config != nil && server.Config.StripchatPDKey != "" {
-		return server.Config.StripchatPDKey
-	}
-	return "auto"
-}
-
-// FetchLastBroadcast implements site.Site. Stripchat's model API does not
-// expose a last_broadcast timestamp in a usable form, so this returns 0.
+// FetchLastBroadcast implements site.Site. Stripchat does not expose a
+// last_broadcast timestamp in a usable form, so this returns 0.
 func (s *StripchatSite) FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error) {
 	return 0, nil
 }
 
-// FetchProfile implements site.Site. Stripchat's front API exposes no public
-// biocontext-style profile endpoint, so this returns nil, nil and callers skip
-// the profile DB write for Stripchat channels.
+// FetchProfile implements site.Site. Stripchat exposes no public biocontext-style
+// profile endpoint, so this returns nil, nil and callers skip the profile DB write.
 func (s *StripchatSite) FetchProfile(ctx context.Context, req *internal.Req, username string) (*database.ChannelProfile, error) {
 	return nil, nil
 }
 
 func (s *StripchatSite) GetRoomStatus(ctx context.Context, req *internal.Req, username string) (string, error) {
-	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam", username)
-
-	body, err := req.Get(ctx, apiURL)
+	state, httpStatus, err := fetchStripchatPage(ctx, req, username)
 	if err != nil {
 		return "", fmt.Errorf("stripchat: get room status: %w", err)
 	}
 
-	var resp camResponse
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return "", fmt.Errorf("stripchat: parse cam response: %w", err)
+	if httpStatus == 404 {
+		return StatusOffline, nil
 	}
 
-	status := resp.User.User.Status
-	if status == "" {
-		if !resp.User.User.IsOnline && !resp.User.User.IsLive {
+	m := state.ViewCamBase.Model
+	status := m.Status
+	if status == "off" || status == "" {
+		if !m.IsOnline && !m.IsLive {
 			return StatusOffline, nil
 		}
 		return "unknown", nil

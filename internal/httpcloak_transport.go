@@ -101,12 +101,10 @@ var cdnHostSuffixes = []string{
 }
 
 // directHosts lists hosts that should always use http.DefaultTransport.
-// Stripchat has no age-verification wall, so it doesn't need the Chrome
-// fingerprint client.
-var directHosts = []string{
-	"stripchat.com",
-	".stripchat.com",
-}
+// NOTE: stripchat.com was previously here but has been removed — Stripchat's
+// Cloudflare configuration returns HTTP 418 for Go's native TLS fingerprint.
+// All stripchat.com requests now go through the httpcloak Chrome fingerprint client.
+var directHosts = []string{}
 
 func isCDNHost(host string) bool {
 	host = strings.ToLower(host)

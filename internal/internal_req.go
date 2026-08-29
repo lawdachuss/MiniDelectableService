@@ -250,6 +250,38 @@ func (h *Req) GetBytes(ctx context.Context, url string) ([]byte, error) {
 	return b, nil
 }
 
+// GetBytesWithStatus is like GetBytes but also returns the HTTP status code.
+// Unlike GetBytes it does NOT treat 404 as ErrNotFound — it returns the body
+// and status so callers can inspect both (e.g. Stripchat page scraping that
+// distinguishes a 200 live page from a 404 "model not found" page).
+func (h *Req) GetBytesWithStatus(ctx context.Context, url string) ([]byte, int, error) {
+	req, cancel, err := h.CreateRequest(ctx, url)
+	if err != nil {
+		cancel()
+		return nil, 0, fmt.Errorf("new request: %w", err)
+	}
+	defer cancel()
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("client do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
+
+	// Block actual Cloudflare challenges (418, 429, 503 + challenge body markers).
+	// Do NOT block bare 403/404 — those are valid model-page states.
+	if IsCloudflareChallenge(resp.StatusCode, string(b)) && resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusForbidden {
+		return nil, resp.StatusCode, ErrCloudflareBlocked
+	}
+
+	return b, resp.StatusCode, nil
+}
+
 // Head sends an HTTP HEAD request and returns the status code.
 func (h *Req) Head(ctx context.Context, url string) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
