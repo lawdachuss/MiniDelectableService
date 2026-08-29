@@ -125,6 +125,7 @@ func main() {
 	// Pre-check ImgBB availability
 	if *skipImgBB {
 		log.Printf("skipping ImgBB uploads (--skip-imgbb)")
+		imgUploader.SetSkipHosts("ImgBB")
 	} else {
 		log.Printf("pre-checking ImgBB availability...")
 		tmpImg, _ := os.CreateTemp("", "imgbb-check-*.jpg")
