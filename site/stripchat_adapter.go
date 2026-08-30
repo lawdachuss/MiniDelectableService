@@ -99,11 +99,52 @@ func fetchStripchatPage(ctx context.Context, req *internal.Req, username string)
 	return fetchStripchatSSRPage(ctx, req, username)
 }
 
+// fetchStripchatModelID resolves a Stripchat username to a numeric model ID
+// via the hu.stripchat.com user-ids endpoint. This endpoint is on a separate
+// subdomain that is NOT blocked by Cloudflare's bot detection (unlike the
+// main stripchat.com API).
+func fetchStripchatModelID(ctx context.Context, req *internal.Req, username string) (int, error) {
+	apiURL := fmt.Sprintf("https://hu.stripchat.com/api/front/users/user-ids/%s", username)
+
+	body, statusCode, err := req.GetBytesWithStatus(ctx, apiURL)
+	if err != nil {
+		return 0, fmt.Errorf("stripchat: model ID lookup: %w", err)
+	}
+	if statusCode == http.StatusNotFound {
+		return 0, internal.ErrNotFound
+	}
+	if statusCode != http.StatusOK {
+		return 0, fmt.Errorf("stripchat: model ID lookup: HTTP %d", statusCode)
+	}
+
+	var result struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, fmt.Errorf("stripchat: model ID parse: %w", err)
+	}
+	if result.ID == 0 {
+		return 0, fmt.Errorf("stripchat: model ID not found for %s", username)
+	}
+	return result.ID, nil
+}
+
 // fetchStripchatV2API queries the Stripchat v2 cam endpoint and normalises
-// the response into an scPageState. This is the primary method used by
-// StreaMonitor and works reliably from datacenter IPs under httpcloak.
+// the response into an scPageState. Uses the two-step flow:
+//  1. Resolve username → model ID via hu.stripchat.com (not blocked by Cloudflare)
+//  2. Fetch cam data via /api/front/v2/models/{modelId}/cam (model-ID-based, works)
+//
+// The username-based endpoint (/username/{username}/cam) returns HTTP 418 from
+// datacenter IPs even with httpcloak — the model-ID-based endpoint does not.
 func fetchStripchatV2API(ctx context.Context, req *internal.Req, username string) (*scPageState, int, error) {
-	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam?uniq=%s", username, scUniq())
+	// Step 1: Resolve username to model ID.
+	modelID, err := fetchStripchatModelID(ctx, req, username)
+	if err != nil {
+		return nil, 0, fmt.Errorf("stripchat: v2 api: %w", err)
+	}
+
+	// Step 2: Fetch cam data by model ID.
+	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/%d/cam?uniq=%s", modelID, scUniq())
 
 	body, statusCode, err := req.GetBytesWithStatus(ctx, apiURL)
 	if err != nil {

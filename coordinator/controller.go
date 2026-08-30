@@ -600,9 +600,43 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 }
 
 // fetchStripchatLiveV2 queries the Stripchat v2 cam API and returns live status.
+// Uses the two-step flow: resolve username → model ID via hu.stripchat.com,
+// then fetch cam data by model ID (the username-based endpoint returns 418).
 func fetchStripchatLiveV2(client *http.Client, username string) (live, known bool) {
 	cloakClient := &http.Client{Transport: internal.CreateTransport()}
-	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam?uniq=%s", username, controllerUniq())
+
+	// Step 1: Resolve username to model ID.
+	modelIDURL := fmt.Sprintf("https://hu.stripchat.com/api/front/users/user-ids/%s", username)
+	modelReq, err := http.NewRequest("GET", modelIDURL, nil)
+	if err != nil {
+		return false, false
+	}
+	modelReq.Header.Set("User-Agent", controllerUA)
+	modelReq.Header.Set("Accept", "application/json")
+	modelResp, err := cloakClient.Do(modelReq)
+	if err != nil {
+		return false, false
+	}
+	defer modelResp.Body.Close()
+	if modelResp.StatusCode == http.StatusNotFound {
+		return false, true
+	}
+	if modelResp.StatusCode != http.StatusOK {
+		return false, false
+	}
+	modelBody, err := io.ReadAll(modelResp.Body)
+	if err != nil {
+		return false, false
+	}
+	var modelResult struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(modelBody, &modelResult); err != nil || modelResult.ID == 0 {
+		return false, false
+	}
+
+	// Step 2: Fetch cam data by model ID.
+	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/%d/cam?uniq=%s", modelResult.ID, controllerUniq())
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return false, false
