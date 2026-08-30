@@ -56,17 +56,17 @@ func TestVidaraUploadCanonicalLinks(t *testing.T) {
 		{
 			"docs shape: view link in url, code in filecode",
 			"https://vidara.so/v/AbC123xY", "AbC123xY",
-			"https://vidara.so/v/AbC123xY",
+			"https://vidara.so/e/AbC123xY",
 		},
 		{
 			"observed shape: embed link in url, code in filecode",
 			"https://vidara.to/e/XyZ987abc", "XyZ987abc",
-			"https://vidara.so/v/XyZ987abc",
+			"https://vidara.so/e/XyZ987abc",
 		},
 		{
 			"observed shape: embed link in filecode, url empty",
 			"", "https://vidara.to/e/QwErTy12345",
-			"https://vidara.so/v/QwErTy12345",
+			"https://vidara.so/e/QwErTy12345",
 		},
 	}
 

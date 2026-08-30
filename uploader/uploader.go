@@ -109,6 +109,9 @@ type MultiHostUploader struct {
 	streamtape *StreamtapeUploader
 	mixdrop    *MixdropUploader
 	vidara     *VidaraUploader
+	anonmp4    *AnonMP4Uploader
+	filemoon   *FileMoonUploader
+	udrop      *UDropUploader
 	log           Logger
 	hostInitOnce  sync.Once
 	hosts         map[string]uploaderFunc // host name -> upload function, lazy-init
@@ -158,6 +161,16 @@ func (m *MultiHostUploader) initHosts() {
 		if m.vidara != nil && m.vidara.apiKey != "" {
 			m.hosts["Vidara"] = m.vidara.UploadWithProgress
 		}
+		// AnonMP4: always available (no API key required)
+		if m.anonmp4 != nil {
+			m.hosts["AnonMP4"] = m.anonmp4.UploadWithProgress
+		}
+		if m.filemoon != nil && m.filemoon.HasToken() {
+			m.hosts["FileMoon"] = m.filemoon.UploadWithProgress
+		}
+		if m.udrop != nil && m.udrop.HasKeys() {
+			m.hosts["UDrop"] = m.udrop.UploadWithProgress
+		}
 	})
 }
 
@@ -172,6 +185,9 @@ func NewMultiHostUploader(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEm
 		streamtape: NewStreamtapeUploader(streamtapeLogin, streamtapeKey),
 		mixdrop:    NewMixdropUploader(mixdropEmail, mixdropToken),
 		vidara:     NewVidaraUploader(vidaraKey),
+		anonmp4:    NewAnonMP4Uploader(),
+		filemoon:   NewFileMoonUploader(),
+		udrop:      NewUDropUploader(),
 		log:        log,
 	}
 }

@@ -71,6 +71,9 @@ jobs:
       CATBOX_USERHASH: ${{ secrets.CATBOX_USERHASH }}
       IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
       IMGCHEST_TOKEN: ${{ secrets.IMGCHEST_TOKEN }}
+      FILEMOON_API_TOKEN: ${{ secrets.FILEMOON_API_TOKEN }}
+      UDROP_KEY1: ${{ secrets.UDROP_KEY1 }}
+      UDROP_KEY2: ${{ secrets.UDROP_KEY2 }}
 
     steps:
       - uses: actions/checkout@v4

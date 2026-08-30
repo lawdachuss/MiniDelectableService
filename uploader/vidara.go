@@ -176,18 +176,17 @@ func (u *VidaraUploader) uploadFile(filePath string, progress ProgressFunc) (str
 	// The API has returned every one of these shapes at different times:
 	//   * {"filecode":"AbC123xY", "url":"https://vidara.so/v/AbC123xY"}  (docs)
 	//   * {"filecode":"AbC123xY", "url":"https://vidara.to/e/AbC123xY"}  (embed in url)
-	//   * {"filecode":"https://vidara.to/e/AbC123xY", "url":""}          (embed in filecode)
-	// So blindly returning uploadResp.URL (or prefixing vidara.so/v/ onto
-	// Filecode) produced mangled links like
-	// "https://vidara.so/v/https://vidara.to/e/CODE". Extract the trailing
-	// file code from whichever field carries it and build the canonical
-	// view link instead.
+	//   * {"filecode":"https://vidara.to/e/AbC123xY", "url":""}          (embed in filecode)// So blindly returning uploadResp.URL (or prefixing vidara.so/v/ onto
+// Filecode) produced mangled links like
+// "https://vidara.so/v/https://vidara.to/e/CODE". Extract the trailing
+// file code from whichever field carries it and build the canonical
+// embed link instead.
 	code := vidaraFileCode(uploadResp.Filecode)
 	if code == "" {
 		code = vidaraFileCode(uploadResp.URL)
 	}
 	if code != "" {
-		return "https://vidara.so/v/" + code, nil
+		return "https://vidara.so/e/" + code, nil
 	}
 	if uploadResp.URL != "" {
 		return uploadResp.URL, nil
