@@ -55,14 +55,30 @@ func (u *UDropUploader) HasKeys() bool {
 	return u.key1 != "" && u.key2 != ""
 }
 
-// udropAuthResponse is the JSON response from /authorize
+// udropAuthResponse is the JSON response from /authorize.
+// UDrop's API changed account_id from string to number, so we unmarshal
+// into interface{} and stringify to handle both shapes.
 type udropAuthResponse struct {
 	Data struct {
-		AccessToken string `json:"access_token"`
-		AccountID   string `json:"account_id"`
+		AccessToken string      `json:"access_token"`
+		AccountID   interface{} `json:"account_id"`
 	} `json:"data"`
-	Status   string `json:"_status"`
-	Error    string `json:"response,omitempty"`
+	Status string `json:"_status"`
+	Error  string `json:"response,omitempty"`
+}
+
+// accountIDString converts the AccountID field (may be string or number) to a string.
+func (r *udropAuthResponse) accountIDString() string {
+	switch v := r.Data.AccountID.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // udropUploadResponse is the JSON response from /file/upload
@@ -139,7 +155,7 @@ func (u *UDropUploader) authenticate() (string, string, error) {
 	}
 
 	u.accessToken = result.Data.AccessToken
-	u.accountID = result.Data.AccountID
+	u.accountID = result.accountIDString()
 	u.tokenExpiry = time.Now().Add(55 * time.Minute) // Token valid ~1 hour
 
 	return u.accessToken, u.accountID, nil

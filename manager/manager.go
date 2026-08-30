@@ -1157,7 +1157,7 @@ func (m *Manager) StartSession(d time.Duration) {
 // session loop decides the final drain must start early.  It covers finalize
 // delays (close/merge/enqueue), throughput-estimate error, and the
 // keep-alive's exit grace.
-const earlyDrainMargin = 20 * time.Minute
+const earlyDrainMargin = 30 * time.Minute
 
 // sessionResumeMin is the minimum remaining time worth starting a new session
 // for after a session-boundary rebalance. Below this we stay stopped so we
@@ -1174,6 +1174,12 @@ const defaultUploadThroughput = 10_000_000 // 10 MB/s
 // required for the pending upload backlog to finish before the run deadline.
 // On ephemeral GitHub runners the VM is destroyed at the deadline, so files
 // still uploading at that moment are lost.
+//
+// The throughput is scaled by 0.8 to be pessimistic — real upload speeds
+// fluctuate (host rate-limits, network jitter, concurrent pipeline
+// contention), so using the observed average directly would underestimate
+// the time needed.  The 20 % headroom, combined with earlyDrainMargin,
+// ensures the drain starts well before the deadline.
 func shouldTriggerEarlyFinalDrain(now, runDeadline time.Time, pendingBytes int64, throughput float64) bool {
 	if runDeadline.IsZero() || pendingBytes <= 0 {
 		return false
@@ -1181,6 +1187,7 @@ func shouldTriggerEarlyFinalDrain(now, runDeadline time.Time, pendingBytes int64
 	if throughput < 1_000_000 {
 		throughput = defaultUploadThroughput
 	}
+	throughput *= 0.8 // conservative: real speed will be lower than observed average
 	eta := time.Duration(float64(pendingBytes) / throughput * float64(time.Second))
 	return now.Add(eta + earlyDrainMargin).After(runDeadline)
 }
@@ -1240,7 +1247,7 @@ func (m *Manager) sessionLoop(d time.Duration) {
 	// 15-minute cadence: logs progress AND re-evaluates whether the upload
 	// backlog needs the final drain to start early (big files need more
 	// drain time than the natural boundary leaves).
-	progress := time.NewTicker(15 * time.Minute)
+	progress := time.NewTicker(5 * time.Minute)
 
 sessionWait:
 	for {

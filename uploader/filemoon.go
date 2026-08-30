@@ -1,15 +1,18 @@
 package uploader
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/sardanioss/httpcloak"
 )
 
 const (
@@ -34,20 +37,75 @@ type FileMoonUploader struct {
 // Token is read from FILEMOON_API_TOKEN environment variable.
 func NewFileMoonUploader() *FileMoonUploader {
 	token := os.Getenv("FILEMOON_API_TOKEN")
+	// Use a dedicated httpcloak client with Chrome 146 TLS fingerprint to
+	// bypass Cloudflare bot detection on filemoon.org. The plain Go TLS
+	// fingerprint triggers Cloudflare challenges (502/302 redirects).
+	//
+	// Unlike the shared httpcloak transport, this streams the request body
+	// directly through httpcloak (no io.ReadAll into memory) and uses a
+	// 2-hour timeout for large video uploads.
+	cloakClient := httpcloak.New("chrome-146-windows", httpcloak.WithTimeout(120*time.Minute))
 	return &FileMoonUploader{
 		apiToken: token,
-		client: &http.Client{
-			Timeout: 120 * time.Minute, // Long timeout for large video uploads
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  true,
-				TLSHandshakeTimeout: 30 * time.Second,
-				DialContext:         (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
-			},
-		},
+		client:   &http.Client{Transport: &filemoonTransport{client: cloakClient}},
 	}
+}
+
+// filemoonTransport wraps httpcloak.Client as an http.RoundTripper that
+// streams the request body directly through httpcloak (no full-body buffering)
+// and supports long timeouts for large video uploads.
+type filemoonTransport struct {
+	client *httpcloak.Client
+}
+
+func (t *filemoonTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	// Use a long timeout for upload requests (default 30s is too short).
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 120*time.Minute)
+		defer cancel()
+	}
+
+	// Build the httpcloak request, streaming the body directly.
+	cloakReq := &httpcloak.Request{
+		Method:  req.Method,
+		URL:     req.URL.String(),
+		Headers: req.Header,
+	}
+	if req.Body != nil {
+		// Stream body directly — do NOT io.ReadAll into memory.
+		// For large video uploads (2-5 GB) this avoids OOM.
+		cloakReq.Body = req.Body
+	}
+
+	cloakResp, err := t.client.Do(ctx, cloakReq)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response body is small (JSON), safe to buffer.
+	body, bodyErr := cloakResp.Bytes()
+	if bodyErr != nil {
+		cloakResp.Close()
+		return nil, bodyErr
+	}
+	cloakResp.Close()
+
+	resp := &http.Response{
+		StatusCode: cloakResp.StatusCode,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    req,
+	}
+	if cloakResp.Headers != nil {
+		for k, vs := range cloakResp.Headers {
+			for _, v := range vs {
+				resp.Header.Add(k, v)
+			}
+		}
+	}
+	return resp, nil
 }
 
 // HasToken returns true if a FileMoon API token is configured.

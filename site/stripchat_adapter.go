@@ -2,8 +2,11 @@
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math/big"
+	"net/http"
 	"strings"
 
 	"github.com/teacat/chaturbate-dvr/database"
@@ -17,11 +20,10 @@ func NewStripchatSite() *StripchatSite {
 	return &StripchatSite{}
 }
 
-// scPageState holds the minimal slice of window.__PRELOADED_STATE__ we need.
-// Stripchat SSR embeds this JSON in every model page - it is the only endpoint
-// reliably reachable from datacenter IPs under Cloudflare bot-scoring.
-// The /api/front/v2/models/username/{username}/cam endpoint returns HTTP 418 for
-// any non-residential IP regardless of headers or TLS fingerprint.
+// scPageState holds the model page state needed to build an HLS recording URL.
+// It normalises two data sources:
+//  1. The v2 API: /api/front/v2/models/username/{username}/cam
+//  2. The legacy SSR: window.__PRELOADED_STATE__ embedded in the HTML page.
 type scPageState struct {
 	ViewCamBase struct {
 		Model struct {
@@ -42,11 +44,110 @@ type scPageState struct {
 	} `json:"viewCam"`
 }
 
-// fetchStripchatPage fetches the Stripchat model page and parses embedded SSR state.
-// Returns the parsed state and HTTP status (200 = model exists, 404 = not found).
-// Uses the shared httpcloak Chrome-fingerprint transport - NOT http.DefaultTransport.
-// (stripchat.com was removed from directHosts in httpcloak_transport.go.)
+// scV2CamResponse is the JSON structure returned by the Stripchat v2 cam API:
+// /api/front/v2/models/username/{username}/cam?uniq={random}
+type scV2CamResponse struct {
+	User struct {
+		User struct {
+			Username string `json:"username"`
+			Status   string `json:"status"`
+			IsLive   bool   `json:"isLive"`
+			IsOnline bool   `json:"isOnline"`
+			Gender   string `json:"gender"`
+		} `json:"user"`
+	} `json:"user"`
+	Cam struct {
+		StreamName       string            `json:"streamName"`
+		ViewServers      map[string]string `json:"viewServers"`
+		IsCamActive      bool              `json:"isCamActive"`
+		IsCamAvailable   bool              `json:"isCamAvailable"`
+		Topic            string            `json:"topic"`
+		PreviewURL       string            `json:"previewUrl"`
+		SnapshotTs       int64             `json:"snapshotTs"`
+	} `json:"cam"`
+	Error *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+// scUniq generates a random alphanumeric string to defeat CDN caching on
+// Stripchat API calls (same approach as StreaMonitor).
+func scUniq() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 16)
+	for i := range b {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
+		b[i] = chars[n.Int64()]
+	}
+	return string(b)
+}
+
+// fetchStripchatPage fetches model data from Stripchat. It tries two sources
+// in order:
+//  1. The v2 cam API (JSON, fast, reliable under httpcloak).
+//  2. Legacy SSR page parsing (window.__PRELOADED_STATE__ as fallback).
+//
+// Returns a normalised scPageState and HTTP status.
 func fetchStripchatPage(ctx context.Context, req *internal.Req, username string) (*scPageState, int, error) {
+	// Try the v2 cam API first.
+	if state, status, err := fetchStripchatV2API(ctx, req, username); err == nil {
+		return state, status, nil
+	}
+
+	// Fall back to SSR page parsing.
+	return fetchStripchatSSRPage(ctx, req, username)
+}
+
+// fetchStripchatV2API queries the Stripchat v2 cam endpoint and normalises
+// the response into an scPageState. This is the primary method used by
+// StreaMonitor and works reliably from datacenter IPs under httpcloak.
+func fetchStripchatV2API(ctx context.Context, req *internal.Req, username string) (*scPageState, int, error) {
+	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam?uniq=%s", username, scUniq())
+
+	body, statusCode, err := req.GetBytesWithStatus(ctx, apiURL)
+	if err != nil {
+		return nil, statusCode, fmt.Errorf("stripchat: v2 api: %w", err)
+	}
+
+	if statusCode != http.StatusOK {
+		return nil, statusCode, fmt.Errorf("stripchat: v2 api: HTTP %d", statusCode)
+	}
+
+	var resp scV2CamResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, statusCode, fmt.Errorf("stripchat: v2 api parse: %w", err)
+	}
+
+	// Check for API-level errors.
+	if resp.Error != nil {
+		if resp.Error.Code == "NOT_FOUND" || resp.Error.Message == "Not Found" {
+			return nil, 404, internal.ErrNotFound
+		}
+		return nil, statusCode, fmt.Errorf("stripchat: v2 api error: %s: %s", resp.Error.Code, resp.Error.Message)
+	}
+
+	// Normalise to scPageState.
+	state := &scPageState{}
+	state.ViewCamBase.Model.Username = resp.User.User.Username
+	state.ViewCamBase.Model.Status = resp.User.User.Status
+	state.ViewCamBase.Model.IsLive = resp.User.User.IsLive
+	state.ViewCamBase.Model.IsOnline = resp.User.User.IsOnline
+	state.ViewCamBase.Model.BroadcastGender = resp.User.User.Gender
+	state.ViewCamBase.Model.PreviewUrlThumbBig = resp.Cam.PreviewURL
+	state.ViewCamBase.Model.SnapshotTimestamp = resp.Cam.SnapshotTs
+	state.ViewCam.StreamName = resp.Cam.StreamName
+	state.ViewCam.ViewServers = resp.Cam.ViewServers
+	state.ViewCam.IsCamActive = resp.Cam.IsCamActive
+	state.ViewCam.Topic = resp.Cam.Topic
+
+	return state, statusCode, nil
+}
+
+// fetchStripchatSSRPage parses the model page HTML for window.__PRELOADED_STATE__.
+// This is the legacy method — Stripchat removed __PRELOADED_STATE__ from their
+// SSR output around August 2026, so this now serves as a fallback only.
+func fetchStripchatSSRPage(ctx context.Context, req *internal.Req, username string) (*scPageState, int, error) {
 	pageURL := "https://stripchat.com/" + username
 
 	body, statusCode, err := req.GetBytesWithStatus(ctx, pageURL)
@@ -55,26 +156,29 @@ func fetchStripchatPage(ctx context.Context, req *internal.Req, username string)
 	}
 
 	html := string(body)
-	const stateMarker = "window.__PRELOADED_STATE__"
-	idx := strings.Index(html, stateMarker)
-	if idx < 0 {
-		return nil, statusCode, fmt.Errorf("stripchat: __PRELOADED_STATE__ not found in page (HTTP %d, len %d)", statusCode, len(html))
+
+	// Try multiple known SSR state variable names.
+	for _, marker := range []string{"window.__PRELOADED_STATE__", "window.__INITIAL_STATE__", "window.__APP_STATE__"} {
+		idx := strings.Index(html, marker)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(marker)
+		for start < len(html) && (html[start] == ' ' || html[start] == '=') {
+			start++
+		}
+		end := findJSONObjectEnd(html, start)
+		if end < 0 {
+			continue
+		}
+		var state scPageState
+		if err := json.Unmarshal([]byte(html[start:end]), &state); err != nil {
+			continue
+		}
+		return &state, statusCode, nil
 	}
 
-	start := idx + len(stateMarker)
-	for start < len(html) && (html[start] == ' ' || html[start] == '=') {
-		start++
-	}
-	end := findJSONObjectEnd(html, start)
-	if end < 0 {
-		return nil, statusCode, fmt.Errorf("stripchat: could not find end of __PRELOADED_STATE__ JSON")
-	}
-
-	var state scPageState
-	if err := json.Unmarshal([]byte(html[start:end]), &state); err != nil {
-		return nil, statusCode, fmt.Errorf("stripchat: parse state: %w", err)
-	}
-	return &state, statusCode, nil
+	return nil, statusCode, fmt.Errorf("stripchat: no SSR state found in page (HTTP %d, len %d)", statusCode, len(html))
 }
 
 // findJSONObjectEnd returns the index after the closing } of the JSON object

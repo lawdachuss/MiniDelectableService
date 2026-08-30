@@ -954,6 +954,37 @@ func SaveRecordingBasics(username, filename, timestamp, roomTitle string, tags [
 	return nil
 }
 
+// GetRecordingID returns the Supabase ID for a recording by filename.
+// Call once and reuse the result for all per-host saves to avoid N+1
+// GetRecording queries.
+func GetRecordingID(filename string) (string, error) {
+	client := GetDBClient()
+	if client == nil {
+		return "", fmt.Errorf("Supabase not configured")
+	}
+	rec, err := client.GetRecording(filename)
+	if err != nil {
+		return "", fmt.Errorf("get recording for upload link: %w", err)
+	}
+	return rec.ID, nil
+}
+
+// SaveUploadLinkByID persists a single upload link to Supabase immediately.
+// The recordingID should be obtained once via GetRecordingID and reused for
+// all hosts to avoid redundant lookups.
+func SaveUploadLinkByID(recordingID, host, url string) error {
+	client := GetDBClient()
+	if client == nil {
+		return fmt.Errorf("Supabase not configured")
+	}
+	return client.SaveUploadLinks([]database.UploadLink{{
+		RecordingID: recordingID,
+		Host:        host,
+		URL:         url,
+		InstanceID:  DBInstanceID(),
+	}})
+}
+
 // ─── Pipeline States ──────────────────────────────────────────────────────────
 
 // SavePipelineState persists the current pipeline state for crash recovery.

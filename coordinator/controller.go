@@ -2,9 +2,12 @@ package coordinator
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"sort"
 	"strings"
@@ -585,8 +588,97 @@ func (c *Coordinator) checkStripchatBatch(ctx context.Context, cfg assignerConfi
 }
 
 func fetchStripchatLive(client *http.Client, username string) (live, known bool) {
-	// Use the shared httpcloak transport wrapping a standard http.Client so the
-	// Chrome TLS fingerprint bypasses Stripchat's Cloudflare bot detection.
+	// Try the v2 cam API first — this is the working endpoint used by
+	// StreaMonitor and other scrapers. Stripchat removed __PRELOADED_STATE__
+	// from their SSR pages around August 2026.
+	if l, k := fetchStripchatLiveV2(client, username); k {
+		return l, k
+	}
+
+	// Fall back to SSR page parsing (legacy).
+	return fetchStripchatLiveSSR(client, username)
+}
+
+// fetchStripchatLiveV2 queries the Stripchat v2 cam API and returns live status.
+func fetchStripchatLiveV2(client *http.Client, username string) (live, known bool) {
+	cloakClient := &http.Client{Transport: internal.CreateTransport()}
+	apiURL := fmt.Sprintf("https://stripchat.com/api/front/v2/models/username/%s/cam?uniq=%s", username, controllerUniq())
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return false, false
+	}
+	req.Header.Set("User-Agent", controllerUA)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Origin", "https://stripchat.com")
+	req.Header.Set("Referer", "https://stripchat.com/")
+
+	resp, err := cloakClient.Do(req)
+	if err != nil {
+		return false, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return false, true
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, false
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, false
+	}
+
+	var data struct {
+		User struct {
+			User struct {
+				Status   string `json:"status"`
+				IsLive   bool   `json:"isLive"`
+				IsOnline bool   `json:"isOnline"`
+			} `json:"user"`
+		} `json:"user"`
+		Cam struct {
+		} `json:"cam"`
+		Error *struct {
+			Code string `json:"code"`
+		} `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(b, &data); err != nil {
+		return false, false
+	}
+
+	// API-level errors (e.g. "NOT_FOUND").
+	if data.Error != nil {
+		if data.Error.Code == "NOT_FOUND" {
+			return false, true
+		}
+		return false, false
+	}
+
+	m := data.User.User
+	// No cam data = model doesn't exist or is offline.
+	if m.Status == "" && !m.IsLive && !m.IsOnline {
+		return false, true
+	}
+	return m.IsLive && m.Status == "public", true
+}
+
+// controllerUniq generates a random alphanumeric string to defeat CDN caching.
+func controllerUniq() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 16)
+	for i := range b {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
+		b[i] = chars[n.Int64()]
+	}
+	return string(b)
+}
+
+// fetchStripchatLiveSSR is the legacy SSR parser for window.__PRELOADED_STATE__.
+func fetchStripchatLiveSSR(client *http.Client, username string) (live, known bool) {
 	cloakClient := &http.Client{Transport: internal.CreateTransport()}
 	pageURL := "https://stripchat.com/" + username
 	req, err := http.NewRequest("GET", pageURL, nil)
@@ -603,7 +695,6 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 	}
 	defer resp.Body.Close()
 
-	// 404 = model doesn't exist (treat as known offline)
 	if resp.StatusCode == http.StatusNotFound {
 		return false, true
 	}
@@ -617,39 +708,40 @@ func fetchStripchatLive(client *http.Client, username string) (live, known bool)
 	}
 	html := string(b)
 
-	// Parse window.__PRELOADED_STATE__.viewCamBase.model
-	const stateMarker = "window.__PRELOADED_STATE__"
-	idx := strings.Index(html, stateMarker)
-	if idx < 0 {
-		return false, false
-	}
-	start := idx + len(stateMarker)
-	for start < len(html) && (html[start] == ' ' || html[start] == '=') {
-		start++
-	}
-	end := findControllerJSONEnd(html, start)
-	if end < 0 {
-		return false, false
+	// Try multiple known SSR state variable names.
+	for _, stateMarker := range []string{"window.__PRELOADED_STATE__", "window.__INITIAL_STATE__", "window.__APP_STATE__"} {
+		idx := strings.Index(html, stateMarker)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(stateMarker)
+		for start < len(html) && (html[start] == ' ' || html[start] == '=') {
+			start++
+		}
+		end := findControllerJSONEnd(html, start)
+		if end < 0 {
+			continue
+		}
+		var state struct {
+			ViewCamBase struct {
+				Model struct {
+					Status   string `json:"status"`
+					IsLive   bool   `json:"isLive"`
+					IsOnline bool   `json:"isOnline"`
+				} `json:"model"`
+			} `json:"viewCamBase"`
+		}
+		if err := json.Unmarshal([]byte(html[start:end]), &state); err != nil {
+			continue
+		}
+		m := state.ViewCamBase.Model
+		if m.Status == "" && !m.IsLive && !m.IsOnline {
+			return false, true
+		}
+		return m.IsLive && m.Status == "public", true
 	}
 
-	var state struct {
-		ViewCamBase struct {
-			Model struct {
-				Status   string `json:"status"`
-				IsLive   bool   `json:"isLive"`
-				IsOnline bool   `json:"isOnline"`
-			} `json:"model"`
-		} `json:"viewCamBase"`
-	}
-	if err := json.Unmarshal([]byte(html[start:end]), &state); err != nil {
-		return false, false
-	}
-
-	m := state.ViewCamBase.Model
-	if m.Status == "" && !m.IsLive && !m.IsOnline {
-		return false, true
-	}
-	return m.IsLive && m.Status == "public", true
+	return false, false
 }
 
 // findControllerJSONEnd returns the index after the closing } of the JSON object

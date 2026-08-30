@@ -194,7 +194,15 @@ func mergeTwoFiles(a, b string) (string, error) {
 	_ = os.Remove(tmpPath)
 
 	listPath := mergedPath + ".concat.txt"
-	list := fmt.Sprintf("file '%s'\nfile '%s'\n", escapeConcatPath(a), escapeConcatPath(b))
+	// Use absolute paths so ffmpeg's concat demuxer doesn't resolve them
+	// relative to the concat file's directory (which would double the prefix
+	// when the inputs are already under videos/).
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		absA, absB = a, b // fall back to raw paths
+	}
+	list := fmt.Sprintf("file '%s'\nfile '%s'\n", escapeConcatPath(absA), escapeConcatPath(absB))
 	if err := os.WriteFile(listPath, []byte(list), 0666); err != nil {
 		return "", fmt.Errorf("write concat list: %w", err)
 	}

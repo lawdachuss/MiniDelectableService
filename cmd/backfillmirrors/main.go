@@ -132,7 +132,7 @@ func main() {
 		tmpImg.Write([]byte{0xFF, 0xD8, 0xFF, 0xD9})
 		tmpImg.Close()
 		// Test ImgBB directly (not the full fallback chain)
-		results := imgUploader.UploadToAll(tmpImg.Name())
+		results := imgUploader.UploadToAll(tmpImg.Name(), nil)
 		os.Remove(tmpImg.Name())
 		imgbbOK := false
 		for _, r := range results {
@@ -217,7 +217,7 @@ func main() {
 			}
 
 			// Upload to all hosts in parallel
-			results := imgUploader.UploadToAll(tmpFile)
+			results := imgUploader.UploadToAll(tmpFile, nil)
 
 			// Collect successful URLs and log failures
 			successURLs := make(map[string]string)

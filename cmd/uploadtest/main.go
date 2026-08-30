@@ -32,7 +32,7 @@ func main() {
 
 	// Test UploadToAll (parallel upload to all hosts)
 	fmt.Println("=== Testing UploadToAll (parallel) ===")
-	results := imgUploader.UploadToAll(filePath)
+	results := imgUploader.UploadToAll(filePath, nil)
 
 	fmt.Printf("\nResults (%d hosts):\n", len(results))
 	for _, r := range results {

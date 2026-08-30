@@ -40,11 +40,19 @@ type ThumbnailResult struct {
 	PreviewMirrors map[string]string // host -> URL
 }
 
+// OnHostUploadFunc is called the instant a single host finishes uploading
+// a thumbnail/sprite/preview asset.  The caller can persist the URL to the
+// database immediately instead of waiting for all hosts to finish.
+type OnHostUploadFunc func(assetType, host, url string)
+
 // generateThumbnail is the channel-scoped wrapper — logs go to the channel log.
-func (ch *Channel) generateThumbnail(videoPath string) ThumbnailResult {
+// If onHost is non-nil it is called the instant each host succeeds for each
+// asset (thumb, sprite, preview) so the caller can save to DB immediately.
+func (ch *Channel) generateThumbnail(videoPath string, onHost OnHostUploadFunc) ThumbnailResult {
 	return generateThumbnailForFile(videoPath,
 		func(f string, a ...interface{}) { ch.Info(f, a...) },
 		func(f string, a ...interface{}) { ch.Error(f, a...) },
+		onHost,
 	)
 }
 
@@ -54,6 +62,7 @@ func GenerateThumbnailForFile(videoPath string) ThumbnailResult {
 	return generateThumbnailForFile(videoPath,
 		func(f string, a ...interface{}) { log.Printf("[thumb] "+f, a...) },
 		func(f string, a ...interface{}) { log.Printf("[thumb:err] "+f, a...) },
+		nil,
 	)
 }
 
@@ -129,7 +138,7 @@ func runFFmpegParallel(workers, n int, fn func(i int) error) error {
 	return firstErr
 }
 
-func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{})) ThumbnailResult {
+func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{}), onHost OnHostUploadFunc) ThumbnailResult {
 	var result ThumbnailResult
 	ext := strings.ToLower(filepath.Ext(videoPath))
 	if ext != ".mp4" && ext != ".mkv" && ext != ".ts" {
@@ -292,7 +301,11 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 
 		imgUploader := uploader.NewMultiImageUploader()
-		thumbURLs := imgUploader.UploadToAllURLs(thumbJPG)
+		thumbURLs := imgUploader.UploadToAllURLs(thumbJPG, func(host, url string) {
+			if onHost != nil {
+				onHost("thumb", host, url)
+			}
+		})
 		if len(thumbURLs) > 0 {
 			mirrorsMu.Lock()
 			thumbMirrors = thumbURLs
@@ -484,7 +497,11 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 
 		imgUploader := uploader.NewMultiImageUploader()
-		spriteURLs := imgUploader.UploadToAllURLs(spriteJPG)
+		spriteURLs := imgUploader.UploadToAllURLs(spriteJPG, func(host, url string) {
+			if onHost != nil {
+				onHost("sprite", host, url)
+			}
+		})
 		if len(spriteURLs) > 0 {
 			mirrorsMu.Lock()
 			spriteMirrors = spriteURLs
@@ -750,7 +767,11 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		previewGenerated = true
 
 		imgUploader := uploader.NewMultiImageUploader()
-		previewURLs := imgUploader.UploadToAllURLs(previewPath)
+		previewURLs := imgUploader.UploadToAllURLs(previewPath, func(host, url string) {
+			if onHost != nil {
+				onHost("preview", host, url)
+			}
+		})
 		if len(previewURLs) > 0 {
 			mirrorsMu.Lock()
 			previewMirrors = previewURLs

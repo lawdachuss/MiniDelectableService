@@ -214,20 +214,74 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	if p.ThumbURL != "" && p.SpriteURL != "" && p.PreviewURL != "" {
 		return nil
 	}
-	thumb := ch.generateThumbnail(p.FilePath)
+
+	// onHostSave is called the instant a host succeeds for thumb/sprite/preview.
+	// It persists the URL to Supabase immediately so the thumbnail appears in
+	// the UI without waiting for slower hosts to finish.
+	//
+	// mirrors accumulates each host URL as it succeeds, so the DB write
+	// always includes every mirror seen so far (never loses a host).
+	mirrors := map[string]map[string]string{
+		"thumb":   {},
+		"sprite":  {},
+		"preview": {},
+	}
+	// primary records whether we've picked the primary URL for each asset
+	// (first host by priority: Catbox > Pixhost > freeimage.host > …).
+	primary := map[string]bool{"thumb": false, "sprite": false, "preview": false}
+	onHostSave := func(assetType, host, url string) {
+		p.mu.Lock()
+		// Set primary URL on first success.
+		if !primary[assetType] {
+			switch assetType {
+			case "thumb":
+				p.ThumbURL = url
+			case "sprite":
+				p.SpriteURL = url
+			case "preview":
+				p.PreviewURL = url
+			}
+			primary[assetType] = true
+		}
+		// Accumulate mirror.
+		mirrors[assetType][host] = url
+
+		// Snapshot under lock — including mirror count for the log line.
+		thumbURL, spriteURL, previewURL := p.ThumbURL, p.SpriteURL, p.PreviewURL
+		thumbMirrors := copyMap(mirrors["thumb"])
+		spriteMirrors := copyMap(mirrors["sprite"])
+		previewMirrors := copyMap(mirrors["preview"])
+		mirrorCount := len(mirrors[assetType])
+		p.mu.Unlock()
+
+		// Save primary + ALL mirrors seen so far.  Each host success
+		// overwrites with one more mirror — the DB always has the
+		// latest complete set, not a stale partial one.
+		if err := server.SavePreviewLinks(p.Filename, thumbURL, spriteURL, previewURL, thumbMirrors, spriteMirrors, previewMirrors); err != nil {
+			ch.Warn("pipeline: could not save %s URL from %s for %s: %v", assetType, host, p.Filename, err)
+		} else {
+			ch.Info("pipeline: saved %s URL from %s for %s (%d mirrors)", assetType, host, p.Filename, mirrorCount)
+		}
+	}
+
+	thumb := ch.generateThumbnail(p.FilePath, onHostSave)
 	// Fill in only the pieces still missing so a partial failure (e.g. the
 	// preview generated but the thumbnail did not) never discards work that
 	// already succeeded.
-	if p.ThumbURL == "" {
+	// Always prefer the priority-ordered primary URL from generateThumbnail
+	// (Catbox > Pixhost > freeimage.host) over the non-deterministic first-
+	// to-succeed value that onHostSave may have set.
+	if thumb.ThumbURL != "" {
 		p.ThumbURL = thumb.ThumbURL
 	}
-	if p.SpriteURL == "" {
+	if thumb.SpriteURL != "" {
 		p.SpriteURL = thumb.SpriteURL
 	}
-	if p.PreviewURL == "" {
+	if thumb.PreviewURL != "" {
 		p.PreviewURL = thumb.PreviewURL
 	}
-	// Store mirror URLs for redundancy.
+	// Merge mirror URLs: callback already accumulated per-host mirrors,
+	// but generateThumbnail's result is the authoritative full set.
 	if len(thumb.ThumbMirrors) > 0 {
 		p.ThumbMirrors = thumb.ThumbMirrors
 	}
@@ -238,10 +292,8 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 		p.PreviewMirrors = thumb.PreviewMirrors
 	}
 
-	// Persist whatever succeeded right away — the thumbnail must not wait for
-	// the (slow or failing) video upload to complete.  Best-effort: if the DB
-	// write fails, stageSaveMetadata retries it and the throttled
-	// ScanThumbnails backfill is a final safety net.
+	// Final persist — covers any URLs the onHostSave callback missed
+	// (e.g. if all hosts failed and we got nothing).
 	if p.ThumbURL != "" || p.SpriteURL != "" || p.PreviewURL != "" {
 		if err := server.SavePreviewLinks(p.Filename, p.ThumbURL, p.SpriteURL, p.PreviewURL, p.ThumbMirrors, p.SpriteMirrors, p.PreviewMirrors); err != nil {
 			ch.Warn("pipeline: could not save preview links early for %s: %v", p.Filename, err)
@@ -420,7 +472,30 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 
 	// Use RetryManager to handle upload retries in background
 	err := DoWithRetry("upload-"+p.FileHash, func() error {
-		attemptResults := upl.UploadSelected(filePath, hostsToTry)
+		// recordingID is resolved once (via sync.Once) and reused for all per-host
+		// saves to avoid N+1 GetRecording queries (one per host succeeding).
+		var recordingID string
+		var recordingIDOnce sync.Once
+		attemptResults := upl.UploadSelectedWithCallback(filePath, hostsToTry, func(host, url string) {
+			// Save the upload link to Supabase the instant a host succeeds —
+			// don't wait for all hosts.  If the runner VM dies before other
+			// hosts finish, this link survives.
+			recordingIDOnce.Do(func() {
+				var lookupErr error
+				recordingID, lookupErr = server.GetRecordingID(filename)
+				if lookupErr != nil {
+					ch.Warn("upload: could not find recording ID for %s: %v", filename, lookupErr)
+				}
+			})
+			if recordingID == "" {
+				return
+			}
+			if saveErr := server.SaveUploadLinkByID(recordingID, host, url); saveErr != nil {
+				ch.Warn("upload: could not save link from %s for %s immediately: %v", host, filename, saveErr)
+			} else {
+				ch.Info("upload: saved link from %s for %s immediately", host, filename)
+			}
+		})
 		results = append(results, attemptResults...)
 
 		// Save journal entries for each result
@@ -513,7 +588,7 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 	// host-hammering loop that causes the fleet-wide rate-limit failures.
 	// A missing sprite/preview is cosmetic; a missing thumbnail is not.
 	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
-		thumb := ch.generateThumbnail(p.FilePath)
+		thumb := ch.generateThumbnail(p.FilePath, nil)
 		generated := false
 		if p.ThumbURL == "" && thumb.ThumbURL != "" {
 			p.ThumbURL = thumb.ThumbURL
@@ -1328,4 +1403,17 @@ func formatSpeed(bytesPerSec float64) string {
 	default:
 		return fmt.Sprintf("%.0f B/s", bytesPerSec)
 	}
+}
+
+// copyMap returns a shallow copy of m so the caller can snapshot a mirror
+// map without holding the lock during the DB write.
+func copyMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
 }

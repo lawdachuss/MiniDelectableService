@@ -173,7 +173,7 @@ func backfillOne(e manifestEntry, partialMB int, seek float64, tailMB int, workD
 
 	// 3. Upload through the standard image pipeline (all hosts in parallel).
 	imgUploader := uploader.NewMultiImageUploader()
-	thumbURLs := imgUploader.UploadToAllURLs(thumbPath)
+	thumbURLs := imgUploader.UploadToAllURLs(thumbPath, nil)
 	var thumbURL string
 	for _, host := range []string{"Catbox", "Pixhost", "freeimage.host"} {
 		if url, ok := thumbURLs[host]; ok {

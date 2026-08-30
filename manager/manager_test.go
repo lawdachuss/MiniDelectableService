@@ -493,23 +493,38 @@ func TestCreateChannelFromAssignmentDeclinesAfterFinalDrain(t *testing.T) {
 // TestShouldTriggerEarlyFinalDrain verifies the early-drain decision: a
 // multi-GB backlog that can't finish before the run deadline must trigger,
 // while a small backlog, no deadline, or no pending bytes never does.
+//
+// NOTE: the function applies a 0.8x conservative factor to observed
+// throughput, so ETA calculations use pessimistic estimates.
 func TestShouldTriggerEarlyFinalDrain(t *testing.T) {
 	now := time.Now()
 	deadline := now.Add(30 * time.Minute)
 
-	// 10 GB pending, no throughput signal yet → default 10 MB/s → ETA ~17 min
-	// + 20 min margin = 37 min > 30 min remaining → trigger.
+	// 10 GB pending, no throughput signal yet → default 10 MB/s × 0.8 = 8 MB/s
+	// → ETA ~20.8 min + 30 min margin = 50.8 min > 30 min remaining → trigger.
 	if !shouldTriggerEarlyFinalDrain(now, deadline, 10_000_000_000, 0) {
 		t.Fatal("multi-GB backlog near the deadline must trigger the early drain")
 	}
-	// Same backlog with healthy real throughput (50 MB/s → ETA ~3.3 min + 20
-	// min margin = 23 min < 30 min) → no trigger.
-	if shouldTriggerEarlyFinalDrain(now, deadline, 10_000_000_000, 50_000_000) {
-		t.Fatal("backlog draining at healthy throughput must not trigger")
+	// Same backlog with healthy real throughput (50 MB/s × 0.8 = 40 MB/s
+	// → ETA ~4.2 min + 30 min margin = 34.2 min > 30 min) → still triggers
+	// because the conservative factor makes the margin tight.
+	if !shouldTriggerEarlyFinalDrain(now, deadline, 10_000_000_000, 50_000_000) {
+		t.Fatal("backlog at 50 MB/s with conservative factor should still trigger near deadline")
 	}
-	// Small backlog fits easily.
-	if shouldTriggerEarlyFinalDrain(now, deadline, 100_000_000, 10_000_000) {
-		t.Fatal("small backlog must not trigger")
+	// Same backlog with very high throughput (200 MB/s × 0.8 = 160 MB/s
+	// → ETA ~1.0 min + 30 min margin = 31 min > 30 min) → trigger.
+	if !shouldTriggerEarlyFinalDrain(now, deadline, 10_000_000_000, 200_000_000) {
+		t.Fatal("backlog at very high throughput near deadline should trigger")
+	}
+	// Small backlog: 100 MB @ 10 MB/s × 0.8 = 8 MB/s → ETA ~12.5s + 30 min
+	// ≈ 30.2 min > 30 min → trigger (aggressive margin catches even small
+	// backlogs when deadline is tight).
+	if !shouldTriggerEarlyFinalDrain(now, deadline, 100_000_000, 10_000_000) {
+		t.Fatal("small backlog near deadline with aggressive margin should trigger")
+	}
+	// 1 hour remaining, 100 MB backlog → comfortably fits.
+	if shouldTriggerEarlyFinalDrain(now, now.Add(1*time.Hour), 100_000_000, 10_000_000) {
+		t.Fatal("small backlog with plenty of time must not trigger")
 	}
 	// No run deadline (local dev) → never trigger.
 	if shouldTriggerEarlyFinalDrain(now, time.Time{}, 10_000_000_000, 0) {

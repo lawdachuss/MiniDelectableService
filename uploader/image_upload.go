@@ -201,14 +201,23 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 	return "", "", fmt.Errorf("catbox: %w (pixhost: %v, freeimage.host: %v, imgbox: %v)", catboxErr, pixhostErr, freeimageErr, imgboxErr)
 }
 
+// OnSuccessFunc is called the moment a single host finishes uploading,
+// receiving the host name and URL.  Used to persist metadata (Supabase
+// PATCH) immediately instead of waiting for every host to finish.
+type OnSuccessFunc func(host, url string)
+
 // UploadToAll uploads the image to ALL configured hosts in parallel.
 // Returns a slice of results, one per host. The caller should pick the
 // first successful URL for the primary thumbnail_url, and can optionally
 // store additional mirror URLs for redundancy.
 //
+// If onHost is non-nil it is called the instant each host succeeds,
+// before the next host finishes — so the caller can persist the URL
+// (e.g. Supabase upsert) without waiting for slower hosts.
+//
 // This provides maximum redundancy: even if one host goes down, the
 // thumbnail is still available on the others.
-func (m *MultiImageUploader) UploadToAll(filePath string) []ImageUploadResult {
+func (m *MultiImageUploader) UploadToAll(filePath string, onHost OnSuccessFunc) []ImageUploadResult {
 	type hostJob struct {
 		name string
 		fn   func(string) (string, error)
@@ -250,6 +259,9 @@ func (m *MultiImageUploader) UploadToAll(filePath string) []ImageUploadResult {
 			if err != nil {
 				log.Printf("UploadToAll: %s failed for %s: %v", j.name, filepath.Base(filePath), err)
 			}
+			if err == nil && url != "" && onHost != nil {
+				onHost(j.name, url)
+			}
 			mu.Lock()
 			results = append(results, ImageUploadResult{
 				Host: j.name,
@@ -265,9 +277,10 @@ func (m *MultiImageUploader) UploadToAll(filePath string) []ImageUploadResult {
 }
 
 // UploadToAllURLs is a convenience wrapper that returns only the successful
-// URLs from UploadToAll, keyed by host name.
-func (m *MultiImageUploader) UploadToAllURLs(filePath string) map[string]string {
-	results := m.UploadToAll(filePath)
+// URLs from UploadToAll, keyed by host name.  If onHost is non-nil it is
+// called the instant each host succeeds (see UploadToAll).
+func (m *MultiImageUploader) UploadToAllURLs(filePath string, onHost OnSuccessFunc) map[string]string {
+	results := m.UploadToAll(filePath, onHost)
 	urls := make(map[string]string)
 	for _, r := range results {
 		if r.Err == nil && r.URL != "" {

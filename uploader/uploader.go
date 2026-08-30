@@ -235,6 +235,24 @@ func isFailFastError(err error) bool {
 		strings.Contains(msg, "eof")
 }
 
+// isHostDead reports whether an upload error indicates the host is permanently
+// unreachable (DNS resolution succeeded but TCP connection failed — the server
+// is down, not just slow).  Unlike isFailFastError, this excludes transient
+// errors (rate limits, EOF) that might succeed on retry.  Hosts flagged by
+// this check are auto-disabled for the rest of the run to avoid wasting time
+// retrying dead services (e.g. AnonMP4 whose server stopped responding).
+func isHostDead(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// Connection timeout with a resolved IP = server is down
+	return (strings.Contains(msg, "dial tcp") && strings.Contains(msg, "timeout")) ||
+		(strings.Contains(msg, "dial tcp") && strings.Contains(msg, "connectex")) ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host")
+}
+
 // uploadBackoff returns the appropriate backoff duration based on whether
 // the error was a rate-limit hit. Rate limits get a longer 30s+10s/attempt,
 // while other errors use standard exponential delay.
@@ -267,6 +285,14 @@ func (m *MultiHostUploader) UploadToAll(filePath string) []UploadResult {
 // UploadSelected uploads a file to the specified hosts in parallel.
 // Host names that are not configured are silently skipped.
 func (m *MultiHostUploader) UploadSelected(filePath string, hosts []string) []UploadResult {
+	return m.UploadSelectedWithCallback(filePath, hosts, nil)
+}
+
+// UploadSelectedWithCallback uploads to all selected hosts in parallel.
+// If onHost is non-nil it is called the instant each host succeeds,
+// receiving the host name and download URL — so the caller can persist
+// the link to Supabase immediately without waiting for slower hosts.
+func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []string, onHost func(host, url string)) []UploadResult {
 	m.initHosts()
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -292,9 +318,15 @@ func (m *MultiHostUploader) UploadSelected(filePath string, hosts []string) []Up
 				if isVoeStorageFull(err) {
 					m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
 					m.DisableHost(host)
+				} else if isHostDead(err) {
+					m.log.Error("upload: %s is permanently unreachable — disabling it for the rest of this run", host)
+					m.DisableHost(host)
 				}
 			} else {
 				m.log.Info("upload: %s successful for %s: %s", host, filePath, link)
+				if onHost != nil {
+					onHost(host, link)
+				}
 			}
 			mu.Lock()
 			results = append(results, UploadResult{
@@ -345,6 +377,9 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 			m.log.Error("upload: %s (priority) failed for %s: %v", host, filePath, err)
 			if isVoeStorageFull(err) {
 				m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
+				m.DisableHost(host)
+			} else if isHostDead(err) {
+				m.log.Error("upload: %s is permanently unreachable — disabling it for the rest of this run", host)
 				m.DisableHost(host)
 			}
 		} else {
