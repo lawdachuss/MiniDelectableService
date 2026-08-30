@@ -204,7 +204,7 @@
                 <img src="{{ .ThumbnailURL | proxy }}" alt="" loading="lazy" />
                 {{ end }}
                 {{ if .PreviewURL }}
-                <div class="sprite-overlay">{{ if isWebp .PreviewURL }}<img src="{{ .PreviewURL | proxy }}" class="preview-gif" alt="" loading="lazy" decoding="async" />{{ else }}<video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video>{{ end }}</div>
+                <div class="sprite-overlay"><video src="{{ .PreviewURL | proxy }}" class="preview-gif" autoplay muted loop playsinline></video></div>
                 {{ end }}
                 {{ if .FullPath }}
                 <div class="play-btn-wrap">
