@@ -166,10 +166,19 @@ func (u *FreeImageHostUploader) uploadOnce(filePath string) (string, error) {
 		return "", fmt.Errorf("freeimage.host: API error: %s", msg)
 	}
 
-	// Prefer display_url (medium size), fall back to full image URL.
-	imageURL := strings.TrimSpace(result.Image.DisplayURL)
-	if imageURL == "" {
+	// For animated .webp files, freeimage.host's display_url returns the
+	// .th.webp thumbnail which is a static single frame — always use
+	// image.url (the original uploaded file) to preserve animation.
+	// For other formats (jpg, png) display_url returns a medium-sized
+	// version that's fine for static thumbnails.
+	var imageURL string
+	if strings.EqualFold(filepath.Ext(filePath), ".webp") {
 		imageURL = strings.TrimSpace(result.Image.URL)
+	} else {
+		imageURL = strings.TrimSpace(result.Image.DisplayURL)
+		if imageURL == "" {
+			imageURL = strings.TrimSpace(result.Image.URL)
+		}
 	}
 	if imageURL == "" {
 		return "", fmt.Errorf("freeimage.host: no image URL in response")

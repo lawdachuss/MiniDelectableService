@@ -15,30 +15,55 @@ import (
 
 const imgbbAPIURL = "https://api.imgbb.com/1/upload"
 
-// imgbbGlobal throttling: ImgBB's free tier rate-limits bursts (~1 upload/s
-// per key, ~50/h per key).  During a host outage (e.g. Catbox 520) or a mass
-// thumbnail backfill, every preview falls back to ImgBB; an unthrottled burst
-// exhausts the key ring in seconds (the fleet-wide "imgbb: HTTP 400: rate
-// limit reached" failures).  Spacing calls process-wide turns the burst into
-// a steady trickle that stays within quota.
+// imgbbGlobal throttling: ImgBB's free tier rate-limits by IP address, not
+// by API key.  All keys from the same server share one rate-limit bucket.
+// The exact limit is undocumented but empirically ~50–100 uploads/h per IP;
+// exceeding it returns HTTP 400 {"error":{"message":"Rate limit reached.","code":100}}.
+// During a host outage or mass backfill every preview falls back to ImgBB;
+// an unthrottled burst exhausts the bucket in seconds and all keys fail
+// simultaneously.  Spacing calls process-wide keeps the throughput within
+// quota.
 var (
 	imgbbMu         sync.Mutex
 	imgbbLastUpload time.Time
+	// imgbbBackoffUntil records when a rate-limit error was last seen.
+	// While active, throttleImgBB uses the longer imgbbCooldownInterval
+	// instead of imgbbMinInterval to give the IP-level bucket time to
+	// refill.
+	imgbbBackoffUntil time.Time
 )
 
-// imgbbMinInterval is the minimum spacing between ImgBB API calls.  With a
-// 6-key ring and ~50 uploads/h per key the aggregate quota is ~300/h, so 1s
-// spacing (3600/h ceiling) still exceeds quota during an outage — the uploads
-// then fail fast and are retried later by the throttled ScanThumbnails pass.
-// The point is to stop the second-long burst that burns every key at once.
-const imgbbMinInterval = time.Second
+// imgbbMinInterval is the normal minimum spacing between ImgBB API calls.
+// ~50–100 uploads/h per IP → 36–72 s between calls; 12 s gives ~300/h
+// ceiling which stays well under quota during normal (non-backfill) usage.
+const imgbbMinInterval = 12 * time.Second
 
-// throttleImgBB sleeps until imgbbMinInterval has elapsed since the previous
-// ImgBB API call, then records the call time.  Safe for concurrent callers.
+// imgbbCooldownInterval is the spacing used after a rate-limit error.
+// It is intentionally longer than imgbbMinInterval to let the IP-level
+// bucket recover before resuming normal pacing.
+const imgbbCooldownInterval = 72 * time.Second
+
+// markImgBBRateLimited records a rate-limit hit so throttleImgBB uses the
+// longer cooldown interval for subsequent calls.
+func markImgBBRateLimited() {
+	imgbbMu.Lock()
+	defer imgbbMu.Unlock()
+	// Keep the cooldown window alive: extend it on every hit so a sustained
+	// burst doesn't resume too early.
+	imgbbBackoffUntil = time.Now().Add(imgbbCooldownInterval)
+}
+
+// throttleImgBB sleeps until the appropriate interval has elapsed since the
+// previous ImgBB API call, then records the call time.  Safe for concurrent
+// callers.  After a rate-limit error the longer cooldown interval is used.
 func throttleImgBB() {
 	imgbbMu.Lock()
 	defer imgbbMu.Unlock()
-	if d := imgbbMinInterval - time.Since(imgbbLastUpload); d > 0 {
+	interval := imgbbMinInterval
+	if time.Now().Before(imgbbBackoffUntil) {
+		interval = imgbbCooldownInterval
+	}
+	if d := interval - time.Since(imgbbLastUpload); d > 0 {
 		time.Sleep(d)
 	}
 	imgbbLastUpload = time.Now()
@@ -169,6 +194,7 @@ func (u *ImgBBUploader) Upload(filePath string) (string, error) {
 
 		if resp.StatusCode == 429 {
 			lastErr = fmt.Errorf("imgbb: rate limited (HTTP 429)")
+			markImgBBRateLimited()
 			u.keys.rotate()
 			continue
 		}
@@ -181,6 +207,7 @@ func (u *ImgBBUploader) Upload(filePath string) (string, error) {
 			// (invalid image format, file too large) which fails for
 			// every key and rotating would waste attempts.
 			if isRateLimitError(resp.StatusCode, body) || resp.StatusCode == 403 {
+				markImgBBRateLimited()
 				u.keys.rotate()
 				continue
 			}
@@ -208,6 +235,7 @@ func (u *ImgBBUploader) Upload(filePath string) (string, error) {
 			err = fmt.Errorf("imgbb: error: %s", msg)
 			lastErr = err
 			if isRateLimitError(result.Status, []byte(msg)) {
+				markImgBBRateLimited()
 				u.keys.rotate()
 				continue
 			}

@@ -2,6 +2,9 @@ package uploader
 
 import (
 	"fmt"
+	"log"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -11,14 +14,19 @@ import (
 // 3 attempts.
 //
 // Sequential fallback is preferred over parallel upload because:
-//   - Pixhost supports JPEG, PNG, and GIF (all formats we generate), so it
-//     succeeds in the vast majority of cases without wasting API calls.
+//   - Pixhost supports JPEG, PNG, GIF, WebP, and AVIF (all formats we
+//     generate), so it succeeds in the vast majority of cases without
+//     wasting API calls.
 //   - Parallel uploads triggered unnecessary rate limiting and made errors
 //     harder to diagnose.
 //
 // All three hosts support adult/NSFW content and provide permanent hosting.
 // freeimage.host is the last resort before giving up (64 MB limit, no API
 // key needed, permanent storage, adult-friendly).
+//
+// Format-specific host skipping:
+//   - Imgbox only accepts JPG, PNG, GIF — .webp files are automatically
+//     skipped to avoid wasted API calls.
 type MultiImageUploader struct {
 	catbox    *CatboxUploader
 	pixhost   *ThumbnailUploader
@@ -37,6 +45,17 @@ func (m *MultiImageUploader) SetSkipHosts(hosts ...string) {
 	for _, h := range hosts {
 		m.skipHosts[h] = true
 	}
+}
+
+// hostSupportsExtension reports whether the given host accepts files with
+// the specified extension.  This avoids wasting API calls on hosts that
+// are known to reject certain formats.
+func hostSupportsExtension(host, ext string) bool {
+	// Imgbox only accepts JPG, PNG, GIF — no WebP.
+	if host == "Imgbox" && strings.EqualFold(ext, ".webp") {
+		return false
+	}
+	return true
 }
 
 // NewMultiImageUploader creates a new image uploader that uploads to
@@ -131,12 +150,14 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 		}
 		imgchestErr := err
 
-		// Imgbox — last resort
-		url, err = uploadWithRetries(3, "Imgbox", func() (string, error) {
-			return m.imgbox.Upload(filePath)
-		})
-		if err == nil {
-			return url, "Imgbox", nil
+		// Imgbox — last resort (skip for .webp which Imgbox rejects)
+		if hostSupportsExtension("Imgbox", filepath.Ext(filePath)) {
+			url, err = uploadWithRetries(3, "Imgbox", func() (string, error) {
+				return m.imgbox.Upload(filePath)
+			})
+			if err == nil {
+				return url, "Imgbox", nil
+			}
 		}
 		imgboxErr := err
 
@@ -154,12 +175,14 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 		return "", "", fmt.Errorf("catbox: %w (pixhost: %v, freeimage.host: %v, imgchest: %v, imgbox: %v)", catboxErr, pixhostErr, freeimageErr, imgchestErr, imgboxErr)
 	}
 
-	// Imgbox — fallback when ImgChest is not configured
-	url, err = uploadWithRetries(3, "Imgbox", func() (string, error) {
-		return m.imgbox.Upload(filePath)
-	})
-	if err == nil {
-		return url, "Imgbox", nil
+	// Imgbox — fallback when ImgChest is not configured (skip for .webp)
+	if hostSupportsExtension("Imgbox", filepath.Ext(filePath)) {
+		url, err = uploadWithRetries(3, "Imgbox", func() (string, error) {
+			return m.imgbox.Upload(filePath)
+		})
+		if err == nil {
+			return url, "Imgbox", nil
+		}
 	}
 	imgboxErr := err
 
@@ -205,7 +228,10 @@ func (m *MultiImageUploader) UploadToAll(filePath string) []ImageUploadResult {
 	if m.imgchest.HasToken() {
 		addJob("ImgChest", m.imgchest.Upload)
 	}
-	addJob("Imgbox", m.imgbox.Upload)
+	// Skip Imgbox for .webp files — Imgbox only accepts JPG, PNG, GIF.
+	if hostSupportsExtension("Imgbox", filepath.Ext(filePath)) {
+		addJob("Imgbox", m.imgbox.Upload)
+	}
 	if m.imgbb.keys.count() > 0 {
 		addJob("ImgBB", m.imgbb.Upload)
 	}
@@ -221,6 +247,9 @@ func (m *MultiImageUploader) UploadToAll(filePath string) []ImageUploadResult {
 			url, err := uploadWithRetries(3, j.name, func() (string, error) {
 				return j.fn(filePath)
 			})
+			if err != nil {
+				log.Printf("UploadToAll: %s failed for %s: %v", j.name, filepath.Base(filePath), err)
+			}
 			mu.Lock()
 			results = append(results, ImageUploadResult{
 				Host: j.name,
