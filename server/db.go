@@ -1014,6 +1014,26 @@ func DeletePipelineState(fileHash string) error {
 	return client.DeletePipelineState(fileHash)
 }
 
+// ─── Orphan Cleanup ─────────────────────────────────────────────────────
+
+// CleanupOrphanedRecordings deletes DB rows for recordings that have no
+// thumbnail_url, no embed_url, and no upload links, AND are older than
+// orphanAge.  These are created when SaveRecordingBasics runs at enqueue
+// time but the runner is killed before the pipeline completes.  The
+// threshold avoids touching recordings that are still being processed.
+func CleanupOrphanedRecordings(orphanAge time.Duration) int {
+	client := GetDBClient()
+	if client == nil {
+		return 0
+	}
+	deleted, err := client.DeleteOrphanedRecordings(orphanAge)
+	if err != nil {
+		fmt.Printf("[startup] orphan cleanup: %v\n", err)
+		return 0
+	}
+	return deleted
+}
+
 // ─── Tunnels ──────────────────────────────────────────────────────────────────
 
 // SaveTunnelToDB saves a tunnel URL to Supabase

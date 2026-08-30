@@ -716,6 +716,19 @@ func start(c *cli.Context) error {
 	// Route disk-threshold alerts through the notifier (Discord/ntfy).
 	server.DiskAlert = notifier.Notify
 
+	// ── Startup orphan cleanup ──────────────────────────────────────────
+	// Delete DB rows left behind when a previous runner was killed mid-pipeline.
+	// SaveRecordingBasics creates a row at enqueue time; if the runner dies
+	// before stageSaveMetadata, the row has no thumbnail, no embed_url, and
+	// no upload links — an orphan that shows as a broken entry on the site.
+	// Only deletes rows older than 30 min (so in-flight recordings survive).
+	go func() {
+		orphanAge := 30 * time.Minute
+		if deleted := server.CleanupOrphanedRecordings(orphanAge); deleted > 0 {
+			fmt.Printf("[startup] orphan cleanup: deleted %d stale recording(s) from previous run\n", deleted)
+		}
+	}()
+
 	// ── Distributed coordinator ──────────────────────────────────────────
 	var coord *coordinator.Coordinator
 	var mgr *manager.Manager

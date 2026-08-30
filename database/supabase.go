@@ -619,6 +619,65 @@ func (c *Client) DeleteRecording(filename string) error {
 	return c.delete(fmt.Sprintf("/recordings?filename=eq.%s", url.QueryEscape(filename)))
 }
 
+// DeleteOrphanedRecordings finds and deletes recording rows that have no
+// thumbnail_url, no embed_url, no upload links, and are older than orphanAge.
+// These are created when SaveRecordingBasics runs at enqueue time but the
+// runner is killed before the pipeline completes.  Returns the number deleted.
+func (c *Client) DeleteOrphanedRecordings(orphanAge time.Duration) (int, error) {
+	cutoff := time.Now().UTC().Add(-orphanAge).Format(time.RFC3339)
+
+	// 1. Find candidates: no thumbnail, no embed, old enough.
+	var candidates []Recording
+	err := c.get(fmt.Sprintf(
+		"/recordings?select=id,username,filename"+
+			"&thumbnail_url=is.null&embed_url=is.null"+
+			"&created_at=lt.%s"+
+			"&order=created_at.desc&limit=500",
+		url.QueryEscape(cutoff)), &candidates)
+	if err != nil {
+		return 0, fmt.Errorf("query orphans: %w", err)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	// 2. For each candidate, verify zero upload_links.
+	var orphanIDs []string
+	for _, rec := range candidates {
+		var links []UploadLink
+		err := c.get(fmt.Sprintf("/upload_links?select=id&recording_id=eq.%s&limit=1", rec.ID), &links)
+		if err != nil {
+			continue
+		}
+		if len(links) == 0 {
+			orphanIDs = append(orphanIDs, rec.ID)
+		}
+	}
+
+	if len(orphanIDs) == 0 {
+		return 0, nil
+	}
+
+	// 3. Delete in batches.
+	deleted := 0
+	batchSize := 50
+	for i := 0; i < len(orphanIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(orphanIDs) {
+			end = len(orphanIDs)
+		}
+		batch := orphanIDs[i:end]
+		idFilter := strings.Join(batch, ",")
+		err := c.delete(fmt.Sprintf("/recordings?id=in.(%s)", idFilter))
+		if err != nil {
+			continue
+		}
+		deleted += len(batch)
+	}
+
+	return deleted, nil
+}
+
 // GetRecordingsWithCatboxThumbnails retrieves only recordings whose thumbnail_url
 // contains "catbox.moe" — used by backfillmirrors to avoid loading all 11K+ rows.
 func (c *Client) GetRecordingsWithCatboxThumbnails() ([]Recording, error) {
