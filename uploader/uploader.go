@@ -247,10 +247,19 @@ func isHostDead(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	// Connection timeout with a resolved IP = server is down
-	return (strings.Contains(msg, "dial tcp") && strings.Contains(msg, "timeout")) ||
+	if (strings.Contains(msg, "dial tcp") && strings.Contains(msg, "timeout")) ||
 		(strings.Contains(msg, "dial tcp") && strings.Contains(msg, "connectex")) ||
 		strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "no such host")
+		strings.Contains(msg, "no such host") {
+		return true
+	}
+	// HTTP 500 from the token/upload endpoint = service-side failure.
+	// If ALL 3 retry attempts hit 500, the host is effectively down
+	// (e.g. Imgbox's token endpoint has been 500 for weeks).
+	if strings.Contains(msg, "http 500") || strings.Contains(msg, "status 500") {
+		return true
+	}
+	return false
 }
 
 // uploadBackoff returns the appropriate backoff duration based on whether
