@@ -1,6 +1,7 @@
 ﻿package site
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -57,19 +58,26 @@ type scV2CamResponse struct {
 			Gender   string `json:"gender"`
 		} `json:"user"`
 	} `json:"user"`
-	Cam struct {
-		StreamName       string            `json:"streamName"`
-		ViewServers      map[string]string `json:"viewServers"`
-		IsCamActive      bool              `json:"isCamActive"`
-		IsCamAvailable   bool              `json:"isCamAvailable"`
-		Topic            string            `json:"topic"`
-		PreviewURL       string            `json:"previewUrl"`
-		SnapshotTs       int64             `json:"snapshotTs"`
-	} `json:"cam"`
+	// Cam is json.RawMessage because Stripchat sometimes returns an object and
+	// sometimes an empty array (e.g. "cam": [] for an offline/unavailable model).
+	// A concrete struct here made json.Unmarshal fail with "cannot unmarshal
+	// array into Go struct field scV2CamResponse.cam of type struct {...}".
+	Cam json.RawMessage `json:"cam"`
 	Error *struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
+}
+
+// scV2Cam holds the parsed cam object fields (see scV2CamResponse.Cam).
+type scV2Cam struct {
+	StreamName     string            `json:"streamName"`
+	ViewServers    map[string]string `json:"viewServers"`
+	IsCamActive    bool              `json:"isCamActive"`
+	IsCamAvailable bool              `json:"isCamAvailable"`
+	Topic          string            `json:"topic"`
+	PreviewURL     string            `json:"previewUrl"`
+	SnapshotTs     int64             `json:"snapshotTs"`
 }
 
 // scUniq generates a random alphanumeric string to defeat CDN caching on
@@ -195,6 +203,16 @@ func fetchStripchatV2API(ctx context.Context, req *internal.Req, username string
 		return nil, statusCode, fmt.Errorf("stripchat: v2 api error: %s: %s", resp.Error.Code, resp.Error.Message)
 	}
 
+	// Parse the cam object. Stripchat returns "cam": [] (empty array) for
+	// offline/unavailable models — treat that as an offline model rather than
+	// failing the whole fetch.
+	var cam scV2Cam
+	if len(resp.Cam) > 0 && !bytes.Equal(bytes.TrimSpace(resp.Cam), []byte("[]")) {
+		if err := json.Unmarshal(resp.Cam, &cam); err != nil {
+			return nil, statusCode, fmt.Errorf("stripchat: v2 api parse: %w", err)
+		}
+	}
+
 	// Normalise to scPageState.
 	state := &scPageState{}
 	state.ViewCamBase.Model.Username = resp.User.User.Username
@@ -202,12 +220,12 @@ func fetchStripchatV2API(ctx context.Context, req *internal.Req, username string
 	state.ViewCamBase.Model.IsLive = resp.User.User.IsLive
 	state.ViewCamBase.Model.IsOnline = resp.User.User.IsOnline
 	state.ViewCamBase.Model.BroadcastGender = resp.User.User.Gender
-	state.ViewCamBase.Model.PreviewUrlThumbBig = resp.Cam.PreviewURL
-	state.ViewCamBase.Model.SnapshotTimestamp = resp.Cam.SnapshotTs
-	state.ViewCam.StreamName = resp.Cam.StreamName
-	state.ViewCam.ViewServers = resp.Cam.ViewServers
-	state.ViewCam.IsCamActive = resp.Cam.IsCamActive
-	state.ViewCam.Topic = resp.Cam.Topic
+	state.ViewCamBase.Model.PreviewUrlThumbBig = cam.PreviewURL
+	state.ViewCamBase.Model.SnapshotTimestamp = cam.SnapshotTs
+	state.ViewCam.StreamName = cam.StreamName
+	state.ViewCam.ViewServers = cam.ViewServers
+	state.ViewCam.IsCamActive = cam.IsCamActive
+	state.ViewCam.Topic = cam.Topic
 
 	return state, statusCode, nil
 }
