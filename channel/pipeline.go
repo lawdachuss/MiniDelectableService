@@ -112,7 +112,8 @@ type Pipeline struct {
 	SpriteMirrors  map[string]string `json:"sprite_mirrors,omitempty"`  // host -> URL
 	PreviewMirrors map[string]string `json:"preview_mirrors,omitempty"` // host -> URL
 	EmbedURL       string            `json:"embed_url"`
-	Links          map[string]string `json:"links"` // host -> download URL
+	Links          map[string]string `json:"links"`   // host -> download URL
+	NodeID         string            `json:"node_id"` // node that owns this pipeline
 
 	mu sync.Mutex
 }
@@ -126,6 +127,7 @@ func newPipeline(filePath, fileHash, filename, username string, fileSize int64) 
 		FileSize:     fileSize,
 		CurrentStage: StageThumbnailUpload,
 		Links:        make(map[string]string),
+		NodeID:       server.NodeID(),
 	}
 }
 
@@ -166,6 +168,7 @@ func (p *Pipeline) toDBState() *database.PipelineState {
 		PreviewMirrors: p.PreviewMirrors,
 		EmbedURL:       p.EmbedURL,
 		LinksJSON:      string(linksJSON),
+		NodeID:         p.NodeID,
 	}
 }
 
@@ -189,6 +192,7 @@ func pipelineFromDBState(s *database.PipelineState) *Pipeline {
 		PreviewMirrors: s.PreviewMirrors,
 		EmbedURL:       s.EmbedURL,
 		Links:          make(map[string]string),
+		NodeID:         s.NodeID,
 	}
 	if s.LinksJSON != "" {
 		json.Unmarshal([]byte(s.LinksJSON), &p.Links)

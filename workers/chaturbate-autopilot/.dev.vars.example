@@ -1,0 +1,10 @@
+# Copy this file to `.dev.vars` and fill in real values for LOCAL dev only.
+# `.dev.vars` is gitignored — never commit secrets.
+# For production use `wrangler secret put <NAME>` instead.
+
+SUPABASE_URL = "https://supabase.chuglii.in"
+CB_DOMAIN = "https://chaturbate.com"
+CB_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+SUPABASE_ANON_KEY = "your-supabase-anon-key"
+CB_COOKIES = "csrftoken=...; sessionid=...; cf_clearance=..."
+CB_ALERT_WEBHOOK = ""

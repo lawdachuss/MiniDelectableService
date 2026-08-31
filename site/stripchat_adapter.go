@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/internal"
@@ -88,15 +89,41 @@ func scUniq() string {
 //  1. The v2 cam API (JSON, fast, reliable under httpcloak).
 //  2. Legacy SSR page parsing (window.__PRELOADED_STATE__ as fallback).
 //
+// The v2 API is tried up to 2 times (with a brief backoff) because datacenter
+// IPs can receive a transient 418/403 that succeeds on the next attempt.
 // Returns a normalised scPageState and HTTP status.
 func fetchStripchatPage(ctx context.Context, req *internal.Req, username string) (*scPageState, int, error) {
-	// Try the v2 cam API first.
-	if state, status, err := fetchStripchatV2API(ctx, req, username); err == nil {
-		return state, status, nil
+	// Try the v2 cam API (up to 2 attempts — transient 418s from Cloudflare
+	// datacenter detection succeed on retry because httpcloak's TLS fingerprint
+	// rotates per connection).
+	var lastV2Err error
+	var lastV2Status int
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			// Brief backoff before retry (100ms, then 250ms).
+			time.Sleep(time.Duration(100+150*attempt) * time.Millisecond)
+		}
+		state, status, err := fetchStripchatV2API(ctx, req, username)
+		if err == nil {
+			return state, status, nil
+		}
+		lastV2Err = err
+		lastV2Status = status
 	}
 
 	// Fall back to SSR page parsing.
-	return fetchStripchatSSRPage(ctx, req, username)
+	// NOTE: Stripchat removed __PRELOADED_STATE__ from SSR output in August
+	// 2026, so this fallback always fails now. The error is surfaced only if
+	// the caller needs it for diagnostics — callers should treat SSR failure
+	// as "model is not publicly streamable" rather than a hard error.
+	state, status, ssrErr := fetchStripchatSSRPage(ctx, req, username)
+	if ssrErr == nil {
+		return state, status, nil
+	}
+
+	// Both methods failed. Return the v2 error (primary method) rather than
+	// the SSR error (expected to always fail now).
+	return nil, lastV2Status, fmt.Errorf("stripchat: v2 api failed: %w; ssr fallback also failed: %w", lastV2Err, ssrErr)
 }
 
 // fetchStripchatModelID resolves a Stripchat username to a numeric model ID

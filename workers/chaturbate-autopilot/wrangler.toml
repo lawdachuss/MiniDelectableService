@@ -1,0 +1,34 @@
+name = "chaturbate-autopilot"
+main = "src/index.js"
+compatibility_date = "2025-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# Headless browser used to mint a fresh cf_clearance for the Worker's egress IP
+# (Chaturbate's anti-bot challenge blocks plain fetch). Requires the Browser
+# Rendering entitlement on the Cloudflare account.
+[browser]
+binding = "BROWSER"
+
+# Caches the freshly minted Chaturbate session (cf_clearance) between runs so
+# the next scan can skip the anti-bot challenge faster and hit fewer rate limits.
+[[kv_namespaces]]
+binding = "AUTOPILOT"
+id = "6267b96f4531434ab3eb6c246e025bab"
+
+# Plaintext vars — safe to commit. Fill in SUPABASE_URL for your project.
+[vars]
+SUPABASE_URL = "https://supabase.chuglii.in"
+CB_DOMAIN = "https://chaturbate.com"
+CB_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+# Secrets — set locally with `wrangler secret put <NAME>` (or copy .dev.vars.example -> .dev.vars):
+#   SUPABASE_ANON_KEY  = your Supabase anon / project API key (RLS allows all ops here)
+#   CB_COOKIES         = chaturbate cookies: csrftoken=...; sessionid=...; cf_clearance=...
+#   CB_ALERT_WEBHOOK   = (optional) webhook URL fired on scan failure / stale heartbeat
+#   CB_SUCCESS_WEBHOOK = (optional) webhook URL fired when channels are auto-added
+
+# Run the scan every 15 minutes, plus a separate 20-min health check that
+# alerts if the last successful scan is older than the configured threshold.
+[triggers]
+crons = ["0 * * * *", "*/20 * * * *"]
+

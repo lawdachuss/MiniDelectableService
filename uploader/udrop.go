@@ -81,18 +81,38 @@ func (r *udropAuthResponse) accountIDString() string {
 	}
 }
 
-// udropUploadResponse is the JSON response from /file/upload
+// udropUploadResponse is the JSON response from /file/upload.
+// Size is interface{} because UDrop alternates between returning a string
+// ("12345678") and a number (12345678); using a concrete string here made
+// json.Unmarshal fail with "cannot unmarshal number into Go struct field
+// .data.size of type string", which silently killed every upload attempt
+// on files that actually succeeded. Stringify via sizeString().
 type udropUploadResponse struct {
 	Response string `json:"response"`
 	Data     []struct {
-		Name    string `json:"name"`
-		Size    string `json:"size"`
-		URL     string `json:"url"`
-		Error   string `json:"error"`
-		ShortURL string `json:"short_url"`
+		Name     string      `json:"name"`
+		Size     interface{} `json:"size"`
+		URL      string      `json:"url"`
+		Error    string      `json:"error"`
+		ShortURL string      `json:"short_url"`
 	} `json:"data"`
 	Status string `json:"_status"`
 	Error  string `json:"response,omitempty"`
+}
+
+// sizeString coerces the Size field (string or number) to its string form.
+func (r *udropUploadResponse) sizeString() string {
+	if len(r.Data) == 0 || r.Data[0].Size == nil {
+		return ""
+	}
+	switch v := r.Data[0].Size.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // authenticate obtains or refreshes the access token
@@ -276,7 +296,14 @@ func (u *UDropUploader) uploadOnce(filePath string, progress ProgressFunc) (stri
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("udrop: HTTP %d: %s", resp.StatusCode, string(raw))
+		// 5xx responses from UDrop are frequently a bare Cloudflare/POSIX HTML
+		// error page rather than JSON. Include the first chunk so the operator
+		// can see what was actually returned instead of a generic "HTTP 500".
+		body := strings.TrimSpace(string(raw))
+		if len(body) > 200 {
+			body = body[:200] + "..."
+		}
+		return "", fmt.Errorf("udrop: HTTP %d: %s", resp.StatusCode, body)
 	}
 
 	var result udropUploadResponse
@@ -289,6 +316,9 @@ func (u *UDropUploader) uploadOnce(filePath string, progress ProgressFunc) (stri
 		if msg == "" {
 			msg = result.Response
 		}
+		if msg == "" {
+			msg = "unknown error (empty response body)"
+		}
 		return "", fmt.Errorf("udrop: upload error: %s", msg)
 	}
 
@@ -298,7 +328,7 @@ func (u *UDropUploader) uploadOnce(filePath string, progress ProgressFunc) (stri
 
 	fileData := result.Data[0]
 	if fileData.Error != "" {
-		return "", fmt.Errorf("udrop: file error: %s", fileData.Error)
+		return "", fmt.Errorf("udrop: file error: %s (size %s)", fileData.Error, result.sizeString())
 	}
 
 	// Return the URL

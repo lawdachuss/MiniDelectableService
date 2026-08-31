@@ -436,12 +436,34 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					config.AcquireFFmpeg()
 					err = config.FFmpegCommandContext(spriteCtx, slowArgs...).Run()
 					config.ReleaseFFmpeg()
-					if err != nil {
-						return fmt.Errorf("tile %d at %.0fs: %w", i, pos, err)
-					}
 				}
-				if !fileExists(tilePath) {
-					return fmt.Errorf("tile %d at %.0fs never appeared", i, pos)
+				// If the tile still failed, generate a blank (black) frame so
+				// the 4×4 grid is complete and the sprite can still be used.
+				// This happens on certain keyframes where the codec/container
+				// is corrupted (exit 1 even with slow seek) — e.g. node-4 and
+				// node-13 show "tile 9 at 6076s: exit status 1" on long
+				// recordings where a mid-stream IDR frame is unreadable.
+				if err != nil || !fileExists(tilePath) {
+					errFn("sprite: tile %d at %.0fs skipped (both seeks failed): %v", i, pos, err)
+					blankArgs := []string{
+						"-y",
+						"-f", "lavfi",
+						"-i", fmt.Sprintf("color=c=black:s=%dx%d:d=0.04:r=1", spriteFrameW, spriteFrameH),
+						"-frames:v", "1",
+						"-c:v", "mjpeg",
+						"-q:v", "5",
+						tilePath,
+					}
+					config.AcquireFFmpeg()
+					_ = config.FFmpegCommandContext(spriteCtx, blankArgs...).Run()
+					config.ReleaseFFmpeg()
+					if !fileExists(tilePath) {
+						// Even the blank-frame fallback failed — log but do not
+						// abort the entire sprite; the grid will have a missing
+						// tile but is still usable.
+						errFn("sprite: tile %d at %.0fs: blank fallback also failed", i, pos)
+					}
+					return nil // non-fatal: grid is still usable with a missing tile
 				}
 				return nil
 			}
@@ -675,8 +697,28 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						config.AcquireFFmpeg()
 						seekErr = config.FFmpegCommandContext(previewCtx, slowArgs...).Run()
 						config.ReleaseFFmpeg()
-						if seekErr != nil {
-							return fmt.Errorf("clip %d at %.2fs: %w", i, start, seekErr)
+						if seekErr != nil || !fileExists(clipPath) {
+							// Both fast and slow seek failed — generate a black
+							// placeholder clip so the concat step can still run.
+							// This happens on corrupted keyframes in long recordings.
+							errFn("preview: clip %d at %.2fs skipped (both seeks failed): %v", i, start, seekErr)
+							blackArgs := []string{
+								"-y",
+								"-f", "lavfi",
+								"-i", fmt.Sprintf("color=c=black:s=%dx%d:d=%.3f:r=15", previewWidth, previewWidth*9/16, segDuration),
+								"-c:v", "libx264",
+								"-preset", "ultrafast",
+								"-crf", "23",
+								"-an",
+								clipPath,
+							}
+							config.AcquireFFmpeg()
+							_ = config.FFmpegCommandContext(previewCtx, blackArgs...).Run()
+							config.ReleaseFFmpeg()
+							if !fileExists(clipPath) {
+								return fmt.Errorf("clip %d at %.2fs: both seeks and blank fallback failed", i, start)
+							}
+							return nil // non-fatal: preview still usable with blank segment
 						}
 					}
 					if !fileExists(clipPath) {

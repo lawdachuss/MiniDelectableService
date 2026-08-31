@@ -1,0 +1,16 @@
+{
+  "name": "chaturbate-autopilot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that auto-adds the top-viewed Chaturbate female/couple channels to the shared DVR pool",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.1.0"
+  }
+}
