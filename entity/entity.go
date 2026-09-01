@@ -226,6 +226,11 @@ type Config struct {
 	VidaraKey       string
 	CatboxProxyURL  string
 
+	// DisabledUploadHosts lists upload hosts that must never be attempted this
+	// run (e.g. permanent/size-cap failures), regardless of whether their API
+	// keys are configured. Comma-separated e.g. "AnonMP4,UDrop".
+	DisabledUploadHosts []string
+
 	// Upload throughput tuning.
 	UploadMaxConcurrent   int // max video files uploading concurrently (0 = auto, VM-sized)
 	UploadHostConcurrency int // max concurrent uploads per host (0 = auto, VM-sized; GoFile gets 1.5×)

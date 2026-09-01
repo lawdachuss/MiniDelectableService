@@ -6,6 +6,7 @@ import (
 
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/server"
+	"github.com/teacat/chaturbate-dvr/uploader"
 )
 
 // TestConfiguredUploadHostsIsDelegated is a regression test for a data-loss
@@ -81,5 +82,45 @@ func TestConfiguredUploadHostsOnlyGoFile(t *testing.T) {
 	}
 	if (os.Getenv("UDROP_KEY1") != "" || os.Getenv("UDROP_KEY2") != "") && !has("UDrop") {
 		t.Fatalf("UDrop missing but UDROP_KEY* is set; got %v", hosts)
+	}
+}
+
+// TestConfiguredUploadHostsHonorsDisabledList verifies that the DISABLED_UPLOAD_HOSTS
+// deadlist flows all the way through to configuredUploadHosts(): a deadlisted host is
+// neither attempted on upload nor required by IsAlreadyFullyUploaded (both delegate to
+// AvailableHosts), so files aren't kept forever waiting for a link we'll never make.
+func TestConfiguredUploadHostsHonorsDisabledList(t *testing.T) {
+	oldConfig := server.Config
+	defer func() { server.Config = oldConfig }()
+	server.Config = &entity.Config{
+		VoeSXAPIKey:     "key",
+		StreamtapeLogin: "user",
+		StreamtapeKey:   "pass",
+		MixdropEmail:    "a@b.c",
+		MixdropToken:    "tok",
+		VidaraKey:       "vid-key",
+	}
+
+	uploader.SetDisabledHosts([]string{"AnonMP4", "Vidara"})
+	defer uploader.SetDisabledHosts(nil)
+
+	hosts := configuredUploadHosts()
+	has := func(name string) bool {
+		for _, h := range hosts {
+			if h == name {
+				return true
+			}
+		}
+		return false
+	}
+	for _, disabled := range []string{"AnonMP4", "Vidara"} {
+		if has(disabled) {
+			t.Errorf("disabled host %q still in configuredUploadHosts(); got %v", disabled, hosts)
+		}
+	}
+	for _, want := range []string{"GoFile", "VOE.sx", "Streamtape", "Mixdrop"} {
+		if !has(want) {
+			t.Errorf("configuredUploadHosts() missing %q; got %v", want, hosts)
+		}
 	}
 }

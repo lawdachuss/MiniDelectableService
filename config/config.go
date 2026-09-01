@@ -450,6 +450,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		MixdropEmail:            c.String("mixdrop-email"),
 		MixdropToken:            c.String("mixdrop-token"),
 		VidaraKey:               c.String("vidara-key"),
+		DisabledUploadHosts:     splitCommaList(c.String("disabled-upload-hosts")),
 		CatboxProxyURL:          c.String("catbox-proxy-url"),
 		UploadMaxConcurrent:     c.Int("upload-max-concurrent"),
 		UploadHostConcurrency:   c.Int("upload-host-concurrency"),
@@ -462,25 +463,25 @@ func New(c *cli.Context) (*entity.Config, error) {
 		StripchatPDKey:         c.String("stripchat-pdkey"),
 		AffiliateWM:            c.String("affiliate-wm"),
 
-		CompletedDir:        c.String("completed-dir"),
-		FinalizeMode:        entity.NormalizeFinalizeMode(c.String("finalize-mode")),
-		FFmpegEncoder:       c.String("ffmpeg-encoder"),
-		FFmpegContainer:     c.String("ffmpeg-container"),
-		FFmpegQuality:       c.Int("ffmpeg-quality"),
-		FFmpegPreset:        c.String("ffmpeg-preset"),
-		Debug:               c.Bool("debug"),
-		NtfyURL:             c.String("ntfy-url"),
-		NtfyTopic:           c.String("ntfy-topic"),
-		NtfyToken:           c.String("ntfy-token"),
-		DiscordWebhookURL:   c.String("discord-webhook-url"),
-		CFChannelThreshold:  c.Int("cf-channel-threshold"),
-		CFGlobalThreshold:   c.Int("cf-global-threshold"),
-		CFRetryMinutes:      c.Int("cf-retry-minutes"),
-		CFStarvedThreshold:  c.Int("cf-starved-threshold"),
+		CompletedDir:          c.String("completed-dir"),
+		FinalizeMode:          entity.NormalizeFinalizeMode(c.String("finalize-mode")),
+		FFmpegEncoder:         c.String("ffmpeg-encoder"),
+		FFmpegContainer:       c.String("ffmpeg-container"),
+		FFmpegQuality:         c.Int("ffmpeg-quality"),
+		FFmpegPreset:          c.String("ffmpeg-preset"),
+		Debug:                 c.Bool("debug"),
+		NtfyURL:               c.String("ntfy-url"),
+		NtfyTopic:             c.String("ntfy-topic"),
+		NtfyToken:             c.String("ntfy-token"),
+		DiscordWebhookURL:     c.String("discord-webhook-url"),
+		CFChannelThreshold:    c.Int("cf-channel-threshold"),
+		CFGlobalThreshold:     c.Int("cf-global-threshold"),
+		CFRetryMinutes:        c.Int("cf-retry-minutes"),
+		CFStarvedThreshold:    c.Int("cf-starved-threshold"),
 		CFSessionCutThreshold: c.Int("cf-session-cut-threshold"),
-		CFRefreshMin:        c.Int("cf-refresh-min"),
-		NotifyCooldownHours: c.Int("notify-cooldown-hours"),
-		NotifyStreamOnline:  c.Bool("notify-stream-online"),
+		CFRefreshMin:          c.Int("cf-refresh-min"),
+		NotifyCooldownHours:   c.Int("notify-cooldown-hours"),
+		NotifyStreamOnline:    c.Bool("notify-stream-online"),
 	}
 
 	// If user provided a custom ffmpeg path, set it globally
@@ -507,4 +508,19 @@ func New(c *cli.Context) (*entity.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// splitCommaList splits a comma-separated string into trimmed, non-empty
+// entries (e.g. DISABLED_UPLOAD_HOSTS "AnonMP4,UDrop" -> [AnonMP4, UDrop]).
+func splitCommaList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }

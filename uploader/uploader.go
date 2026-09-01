@@ -104,20 +104,52 @@ type UploadResult struct {
 
 // MultiHostUploader handles uploading to multiple hosts simultaneously
 type MultiHostUploader struct {
-	gofile     *GoFileUploader
-	voesx      *VoeSXUploader
-	streamtape *StreamtapeUploader
-	mixdrop    *MixdropUploader
-	vidara     *VidaraUploader
-	anonmp4    *AnonMP4Uploader
-	filemoon   *FileMoonUploader
-	udrop      *UDropUploader
+	gofile        *GoFileUploader
+	voesx         *VoeSXUploader
+	streamtape    *StreamtapeUploader
+	mixdrop       *MixdropUploader
+	vidara        *VidaraUploader
+	anonmp4       *AnonMP4Uploader
+	filemoon      *FileMoonUploader
+	udrop         *UDropUploader
 	log           Logger
 	hostInitOnce  sync.Once
 	hosts         map[string]uploaderFunc // host name -> upload function, lazy-init
 	progress      ProgressFunc
-	disabledHosts map[string]bool         // hosts disabled for the rest of this run
+	disabledHosts map[string]bool // hosts disabled for the rest of this run
 	disabledMu    sync.Mutex
+}
+
+// package-level set of upload hosts that must never be attempted this run,
+// regardless of whether their API keys are configured. Populated once at
+// startup from DISABLED_UPLOAD_HOSTS (e.g. dead host "AnonMP4", locked
+// "UDrop"). The per-instance disabledHosts map is for runtime failures; this
+// config-level set is for operator-declared deadlist entries and is consulted
+// in initHosts so a listed host is never even registered.
+var (
+	globallyDisabled    map[string]bool
+	globallyDisabledRWM sync.RWMutex
+)
+
+// SetDisabledHosts records host names that must never be attempted. Call once
+// at startup before any upload goroutines run. Names are matched exactly
+// against the configured host set (e.g. "AnonMP4", "UDrop", "VOE.sx").
+func SetDisabledHosts(names []string) {
+	globallyDisabledRWM.Lock()
+	defer globallyDisabledRWM.Unlock()
+	globallyDisabled = make(map[string]bool, len(names))
+	for _, name := range names {
+		if v := strings.TrimSpace(name); v != "" {
+			globallyDisabled[v] = true
+		}
+	}
+}
+
+// isGloballyDisabled reports whether the named host is operator-deadlisted.
+func isGloballyDisabled(name string) bool {
+	globallyDisabledRWM.RLock()
+	defer globallyDisabledRWM.RUnlock()
+	return globallyDisabled[name]
 }
 
 // DisableHost marks a host as unavailable for the remainder of this run (e.g.
@@ -148,27 +180,29 @@ func (m *MultiHostUploader) initHosts() {
 			return
 		}
 		m.hosts = map[string]uploaderFunc{}
-		m.hosts["GoFile"] = m.gofile.UploadWithProgress
-		if m.voesx != nil && m.voesx.apiKey != "" {
+		if !isGloballyDisabled("GoFile") {
+			m.hosts["GoFile"] = m.gofile.UploadWithProgress
+		}
+		if m.voesx != nil && m.voesx.apiKey != "" && !isGloballyDisabled("VOE.sx") {
 			m.hosts["VOE.sx"] = m.voesx.UploadWithProgress
 		}
-		if m.streamtape != nil && m.streamtape.login != "" && m.streamtape.key != "" {
+		if m.streamtape != nil && m.streamtape.login != "" && m.streamtape.key != "" && !isGloballyDisabled("Streamtape") {
 			m.hosts["Streamtape"] = m.streamtape.UploadWithProgress
 		}
-		if m.mixdrop != nil && m.mixdrop.email != "" && m.mixdrop.token != "" {
+		if m.mixdrop != nil && m.mixdrop.email != "" && m.mixdrop.token != "" && !isGloballyDisabled("Mixdrop") {
 			m.hosts["Mixdrop"] = m.mixdrop.UploadWithProgress
 		}
-		if m.vidara != nil && m.vidara.apiKey != "" {
+		if m.vidara != nil && m.vidara.apiKey != "" && !isGloballyDisabled("Vidara") {
 			m.hosts["Vidara"] = m.vidara.UploadWithProgress
 		}
 		// AnonMP4: always available (no API key required)
-		if m.anonmp4 != nil {
+		if m.anonmp4 != nil && !isGloballyDisabled("AnonMP4") {
 			m.hosts["AnonMP4"] = m.anonmp4.UploadWithProgress
 		}
-		if m.filemoon != nil && m.filemoon.HasToken() {
+		if m.filemoon != nil && m.filemoon.HasToken() && !isGloballyDisabled("FileMoon") {
 			m.hosts["FileMoon"] = m.filemoon.UploadWithProgress
 		}
-		if m.udrop != nil && m.udrop.HasKeys() {
+		if m.udrop != nil && m.udrop.HasKeys() && !isGloballyDisabled("UDrop") {
 			m.hosts["UDrop"] = m.udrop.UploadWithProgress
 		}
 	})

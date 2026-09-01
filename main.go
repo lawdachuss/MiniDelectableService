@@ -226,9 +226,9 @@ func main() {
 				Value: "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}",
 			},
 			&cli.IntFlag{
-			Name:  "max-duration",
-			Usage: "Split video into segments every N minutes ('0' to disable)",
-			Value: 90,
+				Name:  "max-duration",
+				Usage: "Split video into segments every N minutes ('0' to disable)",
+				Value: 90,
 			},
 			&cli.IntFlag{
 				Name:  "max-filesize",
@@ -371,6 +371,12 @@ func main() {
 				Name:    "vidara-key",
 				Usage:   "API key for Vidara uploads",
 				EnvVars: []string{"VIDARA_KEY"},
+				Value:   "",
+			},
+			&cli.StringFlag{
+				Name:    "disabled-upload-hosts",
+				Usage:   "Comma-separated upload hosts to never attempt this run (e.g. \"AnonMP4,UDrop\")",
+				EnvVars: []string{"DISABLED_UPLOAD_HOSTS"},
 				Value:   "",
 			},
 			&cli.StringFlag{
@@ -617,6 +623,10 @@ func start(c *cli.Context) error {
 	channel.SetRetryWorkers(retryW)
 	channel.SetUploadConcurrency(uploadSem)
 	uploader.SetHostConcurrencyTiered(goFile, other)
+	uploader.SetDisabledHosts(server.Config.DisabledUploadHosts)
+	if len(server.Config.DisabledUploadHosts) > 0 {
+		fmt.Printf("[startup] disabled upload hosts (never attempted): %v\n", server.Config.DisabledUploadHosts)
+	}
 	channel.SetPipelineWorkers(pipelineW)
 	fmt.Printf("[startup] upload concurrency (VM-sized, %d vCPU): %d files max, %d/%d per host (GoFile/other), %d retry workers, %d pipelines/channel\n",
 		runtime.NumCPU(), uploadSem, goFile, other, retryW, pipelineW)
