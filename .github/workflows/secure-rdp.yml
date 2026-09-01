@@ -74,6 +74,10 @@ jobs:
       FILEMOON_API_TOKEN: ${{ secrets.FILEMOON_API_TOKEN }}
       UDROP_KEY1: ${{ secrets.UDROP_KEY1 }}
       UDROP_KEY2: ${{ secrets.UDROP_KEY2 }}
+      # Comma-separated upload hosts to never attempt this run (e.g. a dead
+      # "AnonMP4" or a locked "UDrop"). Backed by the DISABLED_UPLOAD_HOSTS
+      # deadlist feature in main.go.
+      DISABLED_UPLOAD_HOSTS: ${{ secrets.DISABLED_UPLOAD_HOSTS }}
 
     steps:
       - uses: actions/checkout@v4
