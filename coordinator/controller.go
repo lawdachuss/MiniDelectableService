@@ -61,28 +61,30 @@ import (
 const controllerUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 type assignerConfig struct {
-	CycleIntervalSec    int  `json:"cycle_interval_sec"`
-	HeartbeatTimeoutSec int  `json:"heartbeat_timeout_sec"`
-	ColdStartOfflineThr int  `json:"cold_start_offline_threshold"`
-	ColdStartWaitSec    int  `json:"cold_start_wait_sec"`
-	SCConcurrency       int  `json:"sc_concurrency"`
-	SCCheckTimeoutSec   int  `json:"sc_check_timeout_sec"`
-	SCStaleMin          int  `json:"sc_stale_min"`
-	CBEnabled           bool `json:"cb_enabled"`
-	LeaseTTLSec         int  `json:"lease_ttl_sec"`
+	CycleIntervalSec           int `json:"cycle_interval_sec"`
+	HeartbeatTimeoutSec        int `json:"heartbeat_timeout_sec"`
+	ColdStartOfflineThr        int `json:"cold_start_offline_threshold"`
+	ColdStartWaitSec           int `json:"cold_start_wait_sec"`
+	SCConcurrency              int `json:"sc_concurrency"`
+	SCCheckTimeoutSec          int `json:"sc_check_timeout_sec"`
+	SCStaleMin                 int `json:"sc_stale_min"`
+	CBEnabled                  bool `json:"cb_enabled"`
+	LeaseTTLSec                int `json:"lease_ttl_sec"`
+	DeadlineMigrationWindowMin int `json:"deadline_migration_window_min"`
 }
 
 func defaultAssignerConfig() assignerConfig {
 	return assignerConfig{
-		CycleIntervalSec:    60,
-		HeartbeatTimeoutSec: 180,
-		ColdStartOfflineThr: 5,
-		ColdStartWaitSec:    300,
-		SCConcurrency:       4,
-		SCCheckTimeoutSec:   10,
-		SCStaleMin:          10,
-		CBEnabled:           true,
-		LeaseTTLSec:         120,
+		CycleIntervalSec:           60,
+		HeartbeatTimeoutSec:        180,
+		ColdStartOfflineThr:        5,
+		ColdStartWaitSec:           300,
+		SCConcurrency:              4,
+		SCCheckTimeoutSec:          10,
+		SCStaleMin:                 10,
+		CBEnabled:                  true,
+		LeaseTTLSec:                120,
+		DeadlineMigrationWindowMin: 15,
 	}
 }
 
@@ -147,7 +149,8 @@ func (c *Coordinator) runControllerCycle() {
 	protectedOwnerSet := map[string]bool{}
 	reclaimSet := map[string]bool{} // nodes whose channels are freed + redistributed
 	heldSet := map[string]bool{}    // briefly-offline nodes: channels HELD during grace
-	var active, heldNodes, reclaim []database.Node
+	deadlineMigrateSet := map[string]bool{} // nodes whose session deadline is near/past
+	var active, heldNodes, reclaim, deadlineMigrate []database.Node
 	offlineCount := 0
 	for _, n := range nodes {
 		// A recording remains pinned while its owner is online or draining and
@@ -180,6 +183,24 @@ func (c *Coordinator) runControllerCycle() {
 		}
 		// Fresh receiver only if explicitly online with a recent heartbeat.
 		fresh := n.Status == "online" && perr == nil && off <= time.Duration(cfg.HeartbeatTimeoutSec)*time.Second
+
+		// Deadline migration: a node whose session deadline is within the
+		// migration window (or has already passed) but is STILL up and
+		// heartbeating must not keep or receive channels that a healthier node
+		// can record — the runner will be hard-killed (GitHub's ~6h cap) and
+		// anything left on it is cut off abruptly. Excluding it from `active`
+		// makes balanceSite redistribute its non-recording channels onto the
+		// live fleet BEFORE the kill. In-progress recordings on a node that is
+		// still online stay pinned (protectedOwnerSet) so the file isn't cut
+		// mid-stream; once the node actually dies, the normal reaper reclaims
+		// any remainder. A node that is already briefly unreachable is NOT
+		// deadline-migrated — the reaper handles a genuinely-dead node.
+		if fresh && n.SessionDeadline != nil && !now.Add(time.Duration(cfg.DeadlineMigrationWindowMin)*time.Minute).Before(*n.SessionDeadline) {
+			deadlineMigrate = append(deadlineMigrate, n)
+			deadlineMigrateSet[n.NodeID] = true
+			continue
+		}
+
 		if fresh {
 			active = append(active, n)
 			activeSet[n.NodeID] = true
@@ -196,6 +217,18 @@ func (c *Coordinator) runControllerCycle() {
 			heldNodes = append(heldNodes, n)
 			heldSet[n.NodeID] = true
 		}
+	}
+
+	if len(deadlineMigrate) > 0 {
+		var names, deadlines []string
+		for _, n := range deadlineMigrate {
+			names = append(names, n.NodeID)
+			if n.SessionDeadline != nil {
+				deadlines = append(deadlines, n.SessionDeadline.Format(time.RFC3339))
+			}
+		}
+		log.Printf("[controller] deadline migration: %d node(s) entering migration (deadline within/min passed): %s (deadlines: %s)",
+			len(deadlineMigrate), strings.Join(names, ","), strings.Join(deadlines, ","))
 	}
 
 	all, err := c.Client.GetAllAssignments()
@@ -245,7 +278,7 @@ func (c *Coordinator) runControllerCycle() {
 	// NOT trigger a rebalance. Crossing the grace (or a node joining/leaving)
 	// changes the signature → one rebalance.
 	inFleet := append(append([]database.Node{}, active...), heldNodes...)
-	fleetSig := fleetSignature(inFleet, reclaim)
+	fleetSig := fleetSignature(inFleet, reclaim, deadlineMigrate)
 	c.assignerAssignMu.Lock()
 	if !c.assignerAssigned {
 		// Cold-start: wait until ALL nodes are live before the one-time split,
@@ -291,7 +324,7 @@ func (c *Coordinator) runControllerCycle() {
 	// Whole-pool splitting guarantees a max difference of one with no unassigned
 	// rows, and only moves existing assignments while repairing an imbalance.
 	if canAssign && len(active) > 0 {
-		needAssignment = needAssignment || c.hasMovableImbalance(all, active, activeSet, heldSet)
+		needAssignment = needAssignment || c.hasMovableImbalance(all, active, activeSet, heldSet, protectedOwnerSet)
 		renewLease := func() bool {
 			held, err := c.Client.TryAcquireControllerLease(c.NodeID, cfg.LeaseTTLSec)
 			if err != nil {
@@ -300,7 +333,7 @@ func (c *Coordinator) runControllerCycle() {
 			}
 			return held
 		}
-		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, needAssignment, renewLease)
+		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, protectedOwnerSet, needAssignment, renewLease)
 	}
 	if needAssignment {
 		c.assignerAssignMu.Lock()
@@ -351,13 +384,17 @@ func recordingLeaseFresh(lastHeartbeat string, now time.Time) bool {
 // a sorted list.  Equal counts are already balanced even when a different
 // perfectly-valid prior allocation gave a particular channel to another node.
 // That distinction is what prevents a stable fleet from shuffling channels.
-func (c *Coordinator) hasMovableImbalance(all []database.ChannelAssignment, active []database.Node, activeSet, heldSet map[string]bool) bool {
+func (c *Coordinator) hasMovableImbalance(all []database.ChannelAssignment, active []database.Node, activeSet, heldSet, protectedOwnerSet map[string]bool) bool {
 	if len(active) == 0 || len(all) == 0 {
 		return false
 	}
 	pool := make([]database.ChannelAssignment, 0, len(all))
 	for _, ca := range all {
-		if !heldSet[ca.AssignedNode] {
+		// Exclude HELD channels and in-progress recordings whose owner is still
+		// alive (online/draining within the grace). Neither is movable, so
+		// neither should count toward an imbalance; a deadline-migrating node's
+		// pinned recording is not "misplaced" work — it finishes on its owner.
+		if !heldSet[ca.AssignedNode] && !(ca.Status == "recording" && protectedOwnerSet[ca.AssignedNode]) {
 			pool = append(pool, ca)
 		}
 	}
@@ -380,13 +417,17 @@ func (c *Coordinator) hasMovableImbalance(all []database.ChannelAssignment, acti
 }
 
 // fleetSignature returns a stable string describing the current fleet
-// membership (which nodes are active vs dead). It changes exactly when a node
-// joins or leaves, and is used to trigger a one-time rebalance only on such a
-// membership change rather than on every liveness tick.
-func fleetSignature(active, dead []database.Node) string {
+// membership (which nodes are active, migrating, or dead). It changes exactly
+// when a node joins, leaves, or enters/exits the deadline-migration window,
+// and is used to trigger a one-time rebalance only on such a membership
+// change rather than on every liveness tick.
+func fleetSignature(active, migrate, dead []database.Node) string {
 	act := make([]string, 0, len(active))
 	for _, n := range active {
 		act = append(act, "A:"+n.NodeID)
+	}
+	for _, n := range migrate {
+		act = append(act, "M:"+n.NodeID)
 	}
 	d := make([]string, 0, len(dead))
 	for _, n := range dead {
@@ -831,13 +872,16 @@ func findControllerJSONEnd(s string, pos int) int {
 // HELD (briefly-offline, within the grace window) node (a transient blip must
 // not trigger a mass reassignment). Everything else is moved onto its equal slot,
 // so the fleet converges to an exact even split with zero unassigned channels.
-func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, doRebalance bool, renewLease func() bool) {
+func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment, active []database.Node, activeSet map[string]bool, reclaimSet map[string]bool, heldSet map[string]bool, protectedOwnerSet map[string]bool, doRebalance bool, renewLease func() bool) {
 	// Rows held for a briefly offline node are deliberately outside this sweep.
 	// The rest of the pool is balanced only by count, which preserves stable
-	// ownership while still ensuring no channel is left unassigned.
+	// ownership while still ensuring no channel is left unassigned. A
+	// deadline-migrating node's in-progress recordings are also pinned (their
+	// owner is still alive), but its claimed channels remain in the pool so
+	// they move onto live nodes before the runner is killed.
 	var pool []database.ChannelAssignment
 	for _, ca := range all {
-		if (site == "" || ca.Site == site) && !heldSet[ca.AssignedNode] {
+		if (site == "" || ca.Site == site) && !heldSet[ca.AssignedNode] && !(ca.Status == "recording" && protectedOwnerSet[ca.AssignedNode]) {
 			pool = append(pool, ca)
 		}
 	}
@@ -1032,6 +1076,9 @@ func (c *Coordinator) assignerConfig() assignerConfig {
 			}
 			if v, ok := raw["lease_ttl_sec"]; ok && v > 0 {
 				cfg.LeaseTTLSec = v
+			}
+			if v, ok := raw["deadline_migration_window_min"]; ok && v > 0 {
+				cfg.DeadlineMigrationWindowMin = v
 			}
 		}
 	}
