@@ -1,7 +1,6 @@
 package channel
 
 import (
-	"os"
 	"testing"
 
 	"github.com/teacat/chaturbate-dvr/entity"
@@ -49,15 +48,14 @@ func TestConfiguredUploadHostsIsDelegated(t *testing.T) {
 // that IsAlreadyFullyUploaded's "len(hosts) == 0 -> false" guard is never hit
 // when GoFile (always available) is the only configured host.
 //
-// AnonMP4 (no auth), FileMoon (FILEMOON_API_TOKEN env), and UDrop (UDROP_KEY*
-// env) are also always-on when their env vars are set, so we allow them.
+// AnonMP4 is also always-on (no auth), so we allow it.
 func TestConfiguredUploadHostsOnlyGoFile(t *testing.T) {
 	oldConfig := server.Config
 	defer func() { server.Config = oldConfig }()
 	server.Config = &entity.Config{} // no API keys in Config
 
 	hosts := configuredUploadHosts()
-	// GoFile is always available. AnonMP4/FileMoon/UDrop are env-var-based.
+	// GoFile is always available. AnonMP4 is always available (no auth).
 	has := func(name string) bool {
 		for _, h := range hosts {
 			if h == name {
@@ -69,19 +67,9 @@ func TestConfiguredUploadHostsOnlyGoFile(t *testing.T) {
 	if !has("GoFile") {
 		t.Fatalf("GoFile missing; got %v", hosts)
 	}
-	// Env-var-based hosts that are always available
-	expectedAlways := []string{"AnonMP4"}
-	for _, h := range expectedAlways {
-		if !has(h) {
-			t.Fatalf("expected always-available host %q missing; got %v", h, hosts)
-		}
-	}
-	// Env-var-based hosts: present only if their env vars are set
-	if os.Getenv("FILEMOON_API_TOKEN") != "" && !has("FileMoon") {
-		t.Fatalf("FileMoon missing but FILEMOON_API_TOKEN is set; got %v", hosts)
-	}
-	if (os.Getenv("UDROP_KEY1") != "" || os.Getenv("UDROP_KEY2") != "") && !has("UDrop") {
-		t.Fatalf("UDrop missing but UDROP_KEY* is set; got %v", hosts)
+	// AnonMP4 is always available with no auth required
+	if !has("AnonMP4") {
+		t.Fatalf("expected always-available host AnonMP4 missing; got %v", hosts)
 	}
 }
 

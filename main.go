@@ -375,7 +375,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:    "disabled-upload-hosts",
-				Usage:   "Comma-separated upload hosts to never attempt this run (e.g. \"AnonMP4,UDrop\")",
+				Usage:   "Comma-separated upload hosts to never attempt this run (e.g. \"AnonMP4\")",
 				EnvVars: []string{"DISABLED_UPLOAD_HOSTS"},
 				Value:   "",
 			},

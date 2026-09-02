@@ -228,7 +228,7 @@ type Config struct {
 
 	// DisabledUploadHosts lists upload hosts that must never be attempted this
 	// run (e.g. permanent/size-cap failures), regardless of whether their API
-	// keys are configured. Comma-separated e.g. "AnonMP4,UDrop".
+	// keys are configured. Comma-separated e.g. "AnonMP4,VOE.sx".
 	DisabledUploadHosts []string
 
 	// Upload throughput tuning.

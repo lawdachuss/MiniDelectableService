@@ -12,7 +12,7 @@ func TestSetDisabledHostsExcludesHostsFromAvailable(t *testing.T) {
 	globallyDisabled = nil
 	defer func() { globallyDisabled = old }()
 
-	SetDisabledHosts([]string{"AnonMP4", "UDrop", "Streamtape"})
+	SetDisabledHosts([]string{"AnonMP4", "Vidara", "Streamtape"})
 	defer SetDisabledHosts(nil)
 
 	upl := NewMultiHostUploader("voe", "st-user", "st-key", "mix@a.c", "mix-tok", "vid-key", nil)
@@ -22,12 +22,12 @@ func TestSetDisabledHostsExcludesHostsFromAvailable(t *testing.T) {
 		hosts[h] = true
 	}
 
-	for _, disabled := range []string{"AnonMP4", "UDrop", "Streamtape"} {
+	for _, disabled := range []string{"AnonMP4", "Vidara", "Streamtape"} {
 		if hosts[disabled] {
 			t.Errorf("disabled host %q still present in AvailableHosts(): %v", disabled, upl.AvailableHosts())
 		}
 	}
-	for _, enabled := range []string{"GoFile", "VOE.sx", "Mixdrop", "Vidara"} {
+	for _, enabled := range []string{"GoFile", "VOE.sx", "Mixdrop"} {
 		if !hosts[enabled] {
 			t.Errorf("expected enabled host %q missing from AvailableHosts(): %v", enabled, upl.AvailableHosts())
 		}

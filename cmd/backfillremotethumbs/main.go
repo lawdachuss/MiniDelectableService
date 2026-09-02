@@ -4,7 +4,7 @@
 //
 // Unlike backfillst (Streamtape's token-free API lets us Range-download the
 // video head), the hosts that actually stored these recordings — GoFile,
-// Mixdrop, Vidara, VOE.sx, UDrop — gate direct video downloads behind
+// Mixdrop, Vidara, VOE.sx — gate direct video downloads behind
 // Cloudflare/turnstile sessions and obfuscated players, so we cannot pull the
 // video file to render a frame. However, Vidara renders its own thumbnail for
 // each uploaded video and exposes it as the page's <meta property="og:image">,

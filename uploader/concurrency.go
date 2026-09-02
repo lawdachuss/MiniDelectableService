@@ -25,8 +25,6 @@ var (
 		"Mixdrop":       make(chan struct{}, defaultHostConcurrency),
 		"Vidara":        make(chan struct{}, defaultHostConcurrency),
 		"AnonMP4":       make(chan struct{}, defaultHostConcurrency),
-		"FileMoon":      make(chan struct{}, defaultHostConcurrency),
-		"UDrop":         make(chan struct{}, defaultHostConcurrency),
 		// Image upload hosts (thumbnails, sprites, previews)
 		"Catbox":        make(chan struct{}, defaultHostConcurrency),
 		"Pixhost":       make(chan struct{}, defaultHostConcurrency),

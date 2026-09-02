@@ -110,8 +110,6 @@ type MultiHostUploader struct {
 	mixdrop       *MixdropUploader
 	vidara        *VidaraUploader
 	anonmp4       *AnonMP4Uploader
-	filemoon      *FileMoonUploader
-	udrop         *UDropUploader
 	log           Logger
 	hostInitOnce  sync.Once
 	hosts         map[string]uploaderFunc // host name -> upload function, lazy-init
@@ -122,10 +120,10 @@ type MultiHostUploader struct {
 
 // package-level set of upload hosts that must never be attempted this run,
 // regardless of whether their API keys are configured. Populated once at
-// startup from DISABLED_UPLOAD_HOSTS (e.g. dead host "AnonMP4", locked
-// "UDrop"). The per-instance disabledHosts map is for runtime failures; this
-// config-level set is for operator-declared deadlist entries and is consulted
-// in initHosts so a listed host is never even registered.
+// startup from DISABLED_UPLOAD_HOSTS (e.g. a dead "AnonMP4"). The per-instance
+// disabledHosts map is for runtime failures; this config-level set is for
+// operator-declared deadlist entries and is consulted in initHosts so a listed
+// host is never even registered.
 var (
 	globallyDisabled    map[string]bool
 	globallyDisabledRWM sync.RWMutex
@@ -133,7 +131,7 @@ var (
 
 // SetDisabledHosts records host names that must never be attempted. Call once
 // at startup before any upload goroutines run. Names are matched exactly
-// against the configured host set (e.g. "AnonMP4", "UDrop", "VOE.sx").
+// against the configured host set (e.g. "AnonMP4", "VOE.sx").
 func SetDisabledHosts(names []string) {
 	globallyDisabledRWM.Lock()
 	defer globallyDisabledRWM.Unlock()
@@ -199,12 +197,6 @@ func (m *MultiHostUploader) initHosts() {
 		if m.anonmp4 != nil && !isGloballyDisabled("AnonMP4") {
 			m.hosts["AnonMP4"] = m.anonmp4.UploadWithProgress
 		}
-		if m.filemoon != nil && m.filemoon.HasToken() && !isGloballyDisabled("FileMoon") {
-			m.hosts["FileMoon"] = m.filemoon.UploadWithProgress
-		}
-		if m.udrop != nil && m.udrop.HasKeys() && !isGloballyDisabled("UDrop") {
-			m.hosts["UDrop"] = m.udrop.UploadWithProgress
-		}
 	})
 }
 
@@ -220,8 +212,6 @@ func NewMultiHostUploader(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEm
 		mixdrop:    NewMixdropUploader(mixdropEmail, mixdropToken),
 		vidara:     NewVidaraUploader(vidaraKey),
 		anonmp4:    NewAnonMP4Uploader(),
-		filemoon:   NewFileMoonUploader(),
-		udrop:      NewUDropUploader(),
 		log:        log,
 	}
 }
@@ -267,8 +257,8 @@ func isFailFastError(err error) bool {
 		strings.Contains(msg, "timeout") ||
 		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "eof") ||
-		// Credential/account failures (e.g. UDrop "could not authenticate user.
-		// The key pair may be invalid or your account may be locked") will not
+		// Credential/account failures (e.g. "could not authenticate user. The
+		// key pair may be invalid or your account may be locked") will not
 		// resolve within a single run; retrying just wastes time. Treat as
 		// fatal so the fallback / deathlist can move on immediately.
 		strings.Contains(msg, "could not authenticate") ||

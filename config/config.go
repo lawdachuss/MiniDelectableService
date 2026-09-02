@@ -511,7 +511,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 }
 
 // splitCommaList splits a comma-separated string into trimmed, non-empty
-// entries (e.g. DISABLED_UPLOAD_HOSTS "AnonMP4,UDrop" -> [AnonMP4, UDrop]).
+// entries (e.g. DISABLED_UPLOAD_HOSTS "AnonMP4,VOE.sx" -> [AnonMP4, VOE.sx]).
 func splitCommaList(s string) []string {
 	if s == "" {
 		return nil

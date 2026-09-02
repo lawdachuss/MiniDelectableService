@@ -83,38 +83,6 @@ test_host "AnonMP4" \
     "curl -s -X POST 'https://anonmp4api.xyz/upload' -F 'file=@$TEST_FILE'" \
     "embed_url"
 
-# 7. FileMoon
-if [ -n "$FILEMOON_API_TOKEN" ]; then
-    test_host "FileMoon" \
-        "curl -s -X POST 'https://filemoon.org/api/v1/files/upload' -H 'Authorization: Bearer $FILEMOON_API_TOKEN' -F 'file=@$TEST_FILE'" \
-        "success"
-else
-    echo "FileMoon: ⚠️ Missing credentials (FILEMOON_API_TOKEN)"
-fi
-
-# 8. UDrop
-if [ -n "$UDROP_KEY1" ] && [ -n "$UDROP_KEY2" ]; then
-    # First authorize
-    AUTH_RESPONSE=$(curl -s -X POST "https://www.udrop.com/api/v2/authorize" \
-        -H "key1: $UDROP_KEY1" \
-        -H "key2: $UDROP_KEY2")
-    
-    if echo "$AUTH_RESPONSE" | grep -q "access_token"; then
-        echo "UDrop authorization: ✅"
-        # Get access token
-        ACCESS_TOKEN=$(echo "$AUTH_RESPONSE" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
-        # Test upload endpoint (without actually uploading)
-        test_host "UDrop" \
-            "curl -s -X GET 'https://www.udrop.com/api/v2/user/account' -H 'Authorization: Bearer $ACCESS_TOKEN'" \
-            "account_id"
-    else
-        echo "UDrop authorization: ❌"
-        echo "Response: $AUTH_RESPONSE"
-    fi
-else
-    echo "UDrop: ⚠️ Missing credentials (UDROP_KEY1, UDROP_KEY2)"
-fi
-
 echo ""
 echo "=== Summary ==="
 echo "Check individual results above for detailed status."

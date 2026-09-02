@@ -72,12 +72,8 @@ jobs:
       IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
       IMGCHEST_TOKEN: ${{ secrets.IMGCHEST_TOKEN }}
       IMGPILE_KEY: ${{ secrets.IMGPILE_KEY }}
-      FILEMOON_API_TOKEN: ${{ secrets.FILEMOON_API_TOKEN }}
-      UDROP_KEY1: ${{ secrets.UDROP_KEY1 }}
-      UDROP_KEY2: ${{ secrets.UDROP_KEY2 }}
-      # Comma-separated upload hosts to never attempt this run (e.g. a dead
-      # "AnonMP4" or a locked "UDrop"). Backed by the DISABLED_UPLOAD_HOSTS
-      # deadlist feature in main.go.
+      # Comma-separated upload hosts to never attempt this run (backed by the
+      # DISABLED_UPLOAD_HOSTS deadlist feature in main.go).
       DISABLED_UPLOAD_HOSTS: ${{ secrets.DISABLED_UPLOAD_HOSTS }}
 
     steps:
