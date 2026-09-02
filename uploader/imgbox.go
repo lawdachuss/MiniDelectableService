@@ -84,7 +84,12 @@ func (u *ImgboxUploader) Upload(filePath string) (string, error) {
 		}
 		lastErr = err
 
-		if isFailFastError(err) {
+		// Bail immediately on a dead host (HTTP 5xx from the token/upload
+		// endpoint, connection refused, no such host) or an explicitly
+		// fail-fast error — retrying a service that's down on every attempt
+		// (Imgbox's token endpoint has returned 500 for weeks) just burns the
+		// retry budget before the fallback chain moves on.
+		if isFailFastError(err) || isHostDead(err) {
 			return "", err
 		}
 	}

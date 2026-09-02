@@ -189,7 +189,15 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	// keyframe seeks are instant index-based jumps.
 	workPath := videoPath
 	if ext == ".ts" {
-		remuxCtx, remuxCancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		remuxTimeout := 15 * time.Minute
+		if dur > 0 {
+			extra := time.Duration(dur/3600.) * 10 * time.Minute
+			if extra > 20*time.Minute {
+				extra = 20 * time.Minute
+			}
+			remuxTimeout += extra
+		}
+		remuxCtx, remuxCancel := context.WithTimeout(context.Background(), remuxTimeout)
 		defer remuxCancel()
 		workDir, mkErr := os.MkdirTemp("", "thumb-seekable-")
 		if mkErr != nil {
@@ -219,6 +227,30 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	spriteDone := make(chan string, 1)
 	previewDone := make(chan string, 1)
 
+	// Timeouts scale with video duration so very long recordings (2-4h)
+	// never get silently dropped for exceeding a fixed timeout on a slow
+	// host.  Fast keyframe seeks mean these are usually quick, but a short
+	// .ts remux or a heavily-loaded shared ffmpeg slot can push a long
+	// extract over the old fixed 15-minute ceiling.
+	base := 5 * time.Minute
+	if dur > 0 {
+		// scale linearly: 5 min at 0s → up to 25 min at 4h
+		extra := time.Duration(dur/3600.) * 5 * time.Minute
+		if extra > 20*time.Minute {
+			extra = 20 * time.Minute
+		}
+		base += extra
+	}
+	thumbTimeout := base
+	spriteTimeout := base * 3
+	if spriteTimeout > 45*time.Minute {
+		spriteTimeout = 45 * time.Minute
+	}
+	previewTimeout := base * 3
+	if previewTimeout > 45*time.Minute {
+		previewTimeout = 45 * time.Minute
+	}
+
 	// Mirror URL maps — populated by goroutines, read after they complete.
 	var thumbMirrors, spriteMirrors, previewMirrors map[string]string
 	var mirrorsMu sync.Mutex
@@ -235,7 +267,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				}
 			}
 		}()
-		thumbCtx, thumbCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		thumbCtx, thumbCancel := context.WithTimeout(context.Background(), thumbTimeout)
 		defer thumbCancel()
 
 		thumbJPG := videoPath + ".thumb.jpg"
@@ -356,7 +388,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				}
 			}
 		}()
-		spriteCtx, spriteCancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		spriteCtx, spriteCancel := context.WithTimeout(context.Background(), spriteTimeout)
 		defer spriteCancel()
 
 		spriteJPG := videoPath + ".sprite.jpg"
@@ -584,7 +616,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				}
 			}
 		}()
-		previewCtx, previewCancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		previewCtx, previewCancel := context.WithTimeout(context.Background(), previewTimeout)
 		defer previewCancel()
 
 		previewPath := videoPath + ".preview.webp"

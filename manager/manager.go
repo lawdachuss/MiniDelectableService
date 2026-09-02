@@ -760,7 +760,19 @@ func (m *Manager) ScanThumbnails() {
 			// "rate limit reached" failures.  A missing sprite/preview is
 			// cosmetic and can never succeed while the host is down; a missing
 			// thumbnail is not.
-			thumbURL, _, _ := server.LoadPreviewLinks(info.Name())
+			previewThumb, _, _ := server.LoadPreviewLinks(info.Name())
+			recThumb, _, _ := server.LoadRecordingThumbnails(info.Name())
+			// A thumbnail is considered present if either the preview_images
+			// row OR the recordings row has one.  Previously only preview_images
+			// was checked, so recordings whose recordings.thumbnail_url was
+			// NULL (but preview_images had a URL) were never regenerated — yet
+			// the videos page still showed no thumbnail because it reads the
+			// recordings row.  Treat either source as authoritative for a
+			// skipped regeneration.
+			thumbURL := previewThumb
+			if thumbURL == "" {
+				thumbURL = recThumb
+			}
 			if thumbURL != "" {
 				return nil
 			}
@@ -796,22 +808,16 @@ func (m *Manager) ScanThumbnails() {
 					}
 				}
 			} else if channel.IsUnreadableVideo(path) {
-				// Generation failed AND the file cannot even be probed — a
-				// permanently-corrupt recording.  Counting every failed scan
-				// would burn disk + image-host quota forever; evict it once it
-				// has failed MaxThumbFailures times (upload → save metadata →
-				// delete local entirely, per the eviction policy).
+				// Generation failed AND the file cannot even be probed.  We do
+				// NOT evict (delete) the file: the old behavior uploaded +
+				// saved metadata + deleted the local copy, permanently losing
+				// the source — and with it any future chance of a thumbnail
+				// (e.g. if image hosts come back or a different seek succeeds).
+				// Instead we record the failure and rely on the 45-min cooldown
+				// to pace retries.  The file stays on disk until it succeeds.
 				count := server.RecordThumbFailure(path)
-				if count >= server.MaxThumbFailures {
-					log.Printf("[thumb] %s failed thumbnail generation %d times and is unreadable — evicting (upload + metadata + delete)", info.Name(), count)
-					server.ClearThumbFailure(path)
-					if channel.UploadOrphanedFileEvict(path) {
-						log.Printf("[thumb] %s evicted successfully", info.Name())
-					} else {
-						log.Printf("[thumb] %s eviction upload failed — file kept, will retry", info.Name())
-					}
-					time.Sleep(thumbBackfillSpacing)
-					return nil
+				if count%10 == 0 {
+					log.Printf("[thumb] %s failed thumbnail generation %d times (unreadable?) — keeping file for periodic retry", info.Name(), count)
 				}
 			}
 			// Space regenerations so a mass backfill cannot exceed the image

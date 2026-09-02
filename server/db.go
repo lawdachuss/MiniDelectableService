@@ -1195,6 +1195,20 @@ func DeleteChannelsNotInDB(usernames []string) error {
 	return client.DeleteChannelsNotIn(usernames)
 }
 
+// LoadRecordingThumbnails returns the thumbnail, sprite, and preview URLs from
+// the recordings row for a filename (empty strings when missing/not found).
+func LoadRecordingThumbnails(filename string) (thumbURL, spriteURL, previewURL string) {
+	client := GetDBClient()
+	if client == nil {
+		return "", "", ""
+	}
+	rec, err := client.GetRecording(filename)
+	if err != nil || rec == nil {
+		return "", "", ""
+	}
+	return rec.ThumbnailURL, rec.SpriteURL, rec.PreviewURL
+}
+
 // UpdateRecordingThumbnails patches the thumbnail_url, sprite_url and preview_url on an
 // existing recording row identified by filename.
 func UpdateRecordingThumbnails(filename, thumbnailURL, spriteURL, previewURL string) error {

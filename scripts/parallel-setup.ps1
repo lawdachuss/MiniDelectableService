@@ -442,6 +442,8 @@ if (-not [string]::IsNullOrWhiteSpace($env:MINI_ENV)) {
       if ($ev -match '(?m)^IMGBB_API_KEY=') { $ev = $ev -replace '(?m)^IMGBB_API_KEY=.*$', "IMGBB_API_KEY=$env:IMGBB_API_KEY" } else { $ev = $ev.TrimEnd("`r","`n") + "`nIMGBB_API_KEY=$env:IMGBB_API_KEY`n" } }
     if (-not [string]::IsNullOrWhiteSpace($env:IMGCHEST_TOKEN)) {
       if ($ev -match '(?m)^IMGCHEST_TOKEN=') { $ev = $ev -replace '(?m)^IMGCHEST_TOKEN=.*$', "IMGCHEST_TOKEN=$env:IMGCHEST_TOKEN" } else { $ev = $ev.TrimEnd("`r","`n") + "`nIMGCHEST_TOKEN=$env:IMGCHEST_TOKEN`n" } }
+    if (-not [string]::IsNullOrWhiteSpace($env:IMGPILE_KEY)) {
+      if ($ev -match '(?m)^IMGPILE_KEY=') { $ev = $ev -replace '(?m)^IMGPILE_KEY=.*$', "IMGPILE_KEY=$env:IMGPILE_KEY" } else { $ev = $ev.TrimEnd("`r","`n") + "`nIMGPILE_KEY=$env:IMGPILE_KEY`n" } }
     [System.IO.File]::WriteAllText("$repoDir\.env", $ev, (New-Object System.Text.UTF8Encoding($false)))
   }
 } else { Write-Warning "[.env] MINI_ENV secret is empty" }

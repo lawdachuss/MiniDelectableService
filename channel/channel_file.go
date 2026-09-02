@@ -2773,7 +2773,7 @@ func processPendingUserSegments(username string) {
 // videoExt returns true if the extension is a known video extension.
 func videoExt(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
-	return ext == ".mp4" || ext == ".mkv"
+	return ext == ".mp4" || ext == ".mkv" || ext == ".ts"
 }
 
 // isSidecar returns true if the filename appears to be a sidecar/preview file.

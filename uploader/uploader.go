@@ -266,7 +266,13 @@ func isFailFastError(err error) bool {
 		strings.Contains(msg, "dial tcp") ||
 		strings.Contains(msg, "timeout") ||
 		strings.Contains(msg, "deadline exceeded") ||
-		strings.Contains(msg, "eof")
+		strings.Contains(msg, "eof") ||
+		// Credential/account failures (e.g. UDrop "could not authenticate user.
+		// The key pair may be invalid or your account may be locked") will not
+		// resolve within a single run; retrying just wastes time. Treat as
+		// fatal so the fallback / deathlist can move on immediately.
+		strings.Contains(msg, "could not authenticate") ||
+		strings.Contains(msg, "account may be locked")
 }
 
 // isHostDead reports whether an upload error indicates the host is permanently

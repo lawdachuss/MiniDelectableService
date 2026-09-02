@@ -187,6 +187,7 @@ func ChannelVideos(c *gin.Context) {
 var videoExts = map[string]bool{
 	".mp4": true,
 	".mkv": true,
+	".ts":  true,
 }
 
 func scanVideos() []*VideoEntry {

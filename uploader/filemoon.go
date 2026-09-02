@@ -16,6 +16,9 @@ import (
 )
 
 const (
+	// filemoon.org/api/v1 is the canonical FileMoon upload API. byse.sx was
+	// tried as a mirror but no longer serves the API (returns 404 on
+	// /api/v1/files/upload), so uploads must go to filemoon.org directly.
 	filemoonAPIBase = "https://filemoon.org/api/v1"
 
 	// filemoonHLSMaxWait is the maximum time to wait for HLS conversion

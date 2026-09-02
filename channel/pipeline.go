@@ -305,6 +305,12 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 			ch.Info("pipeline: saved preview links early for %s", p.Filename)
 		}
 	}
+
+	// Return an error when the critical thumbnail is missing so the pipeline
+	// retries later instead of silently proceeding with no thumbnail.
+	if p.ThumbURL == "" {
+		return fmt.Errorf("thumbnail generation/upload failed for %s — will retry later", p.Filename)
+	}
 	return nil
 }
 
@@ -620,6 +626,15 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 			ch.Info("upload: generated missing presentation assets for %s (retry)", p.Filename)
 		} else {
 			ch.Warn("upload: thumbnail generation failed for %s (skipped — local file kept for later retry)", p.Filename)
+		}
+		// If the critical thumbnail is still missing after this retry, fail the
+		// metadata stage so the pipeline retries (rather than writing a row
+		// with a NULL thumbnail that the UI would show without a preview).
+		// The local file is kept for the later retry per stageCleanup.
+		if p.ThumbURL == "" {
+			ch.Error("upload: no thumbnail for %s after retry — keeping recording for later retry", p.Filename)
+			p.LastError = "thumbnail generation failed after retry"
+			return fmt.Errorf("thumbnail generation failed after retry for %s", p.Filename)
 		}
 	}
 
@@ -1078,7 +1093,7 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 		wg.Wait()
 
 		if thumbErr != nil {
-			ch.Error("pipeline: thumbnail stage failed for %s: %v", filename, thumbErr)
+			ch.Warn("pipeline: thumbnail stage failed for %s: %v — will retry in stageSaveMetadata", filename, thumbErr)
 		}
 		if uploadErr != nil {
 			ch.Error("pipeline: upload stage failed for %s: %v — keeping recording for retry", filename, uploadErr)
@@ -1090,6 +1105,15 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 			ch.Error("pipeline: upload stage produced no links for %s — keeping recording for retry", filename)
 			p.Failed = true
 			p.LastError = "upload produced no links"
+			return
+		}
+
+		// When the thumbnail failed but video upload succeeded, stay at
+		// StageThumbnailUpload so stageSaveMetadata can retry thumbnail
+		// generation before saving metadata.  Only advance when the
+		// thumbnail also succeeded (or we already have one from a prior run).
+		if thumbErr != nil && p.ThumbURL == "" {
+			ch.Warn("pipeline: no thumbnail for %s — staying at thumbnail_upload for retry", filename)
 			return
 		}
 
