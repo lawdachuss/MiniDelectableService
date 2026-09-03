@@ -583,6 +583,16 @@ func (c *Client) GetAllRecordings() ([]Recording, error) {
 	return recordings, err
 }
 
+// GetRecordingsMissingThumbnails retrieves only the recording rows whose
+// thumbnail_url is NULL/empty.  This is a small subset of the full table, so
+// the periodic thumbnail-backfill sweep can avoid downloading every row on
+// every node on every tick.
+func (c *Client) GetRecordingsMissingThumbnails() ([]Recording, error) {
+	var recordings []Recording
+	err := c.getAllPaginated("/recordings?select=filename,thumbnail_url,sprite_url,preview_url&thumbnail_url=is.null", &recordings)
+	return recordings, err
+}
+
 // CountRecordings returns the total number of recording rows in Supabase using
 // PostgREST's exact-count header, so we never have to download every row just
 // to show a tally on the admin panel.

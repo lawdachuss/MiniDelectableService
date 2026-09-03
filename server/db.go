@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/teacat/chaturbate-dvr/database"
@@ -607,30 +609,29 @@ func SaveRecordingsToDB(data []byte) error {
 
 	// Parse the JSON data
 	type RecordingEntry struct {
-			Filename         string            `json:"filename"`
-			Timestamp        string            `json:"timestamp"`
-			RoomTitle        string            `json:"room_title"`
-			Tags             []string          `json:"tags"`
-			Viewers          int               `json:"viewers"`
-			Resolution       string            `json:"resolution"`
-			Framerate        int               `json:"framerate"`
-			Links            map[string]string `json:"links"`
-			ThumbnailURL     string            `json:"thumbnail_url"`
-			SpriteURL        string            `json:"sprite_url"`
-			PreviewURL       string            `json:"preview_url"`
-			ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"`
-			SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`
-			PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`
-			EmbedURL         string            `json:"embed_url"`
-			Filesize         int64             `json:"filesize"`
-			EndReason        string            `json:"end_reason,omitempty"`
-		}
+		Filename         string            `json:"filename"`
+		Timestamp        string            `json:"timestamp"`
+		RoomTitle        string            `json:"room_title"`
+		Tags             []string          `json:"tags"`
+		Viewers          int               `json:"viewers"`
+		Resolution       string            `json:"resolution"`
+		Framerate        int               `json:"framerate"`
+		Links            map[string]string `json:"links"`
+		ThumbnailURL     string            `json:"thumbnail_url"`
+		SpriteURL        string            `json:"sprite_url"`
+		PreviewURL       string            `json:"preview_url"`
+		ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"`
+		SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`
+		PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`
+		EmbedURL         string            `json:"embed_url"`
+		Filesize         int64             `json:"filesize"`
+		EndReason        string            `json:"end_reason,omitempty"`
+	}
 
-		type ChannelRecordings struct {
-			Gender     string           `json:"gender"`
-			Recordings []RecordingEntry `json:"recordings"`
-		}
-
+	type ChannelRecordings struct {
+		Gender     string           `json:"gender"`
+		Recordings []RecordingEntry `json:"recordings"`
+	}
 
 	type RecordingsDB struct {
 		Version  int                           `json:"version"`
@@ -645,22 +646,22 @@ func SaveRecordingsToDB(data []byte) error {
 	for username, chanData := range db.Channels {
 		for _, rec := range chanData.Recordings {
 			recording := &database.Recording{
-				Username:           username,
-				Filename:           rec.Filename,
-				Timestamp:          rec.Timestamp,
-				RoomTitle:          rec.RoomTitle,
-				Tags:               rec.Tags,
-				Viewers:            rec.Viewers,
-				Resolution:         rec.Resolution,
-				Framerate:          rec.Framerate,
-				Filesize:           rec.Filesize,
-				Gender:             chanData.Gender,
-				ThumbnailURL:       rec.ThumbnailURL,
-				SpriteURL:          rec.SpriteURL,
-				EmbedURL:           rec.EmbedURL,
-				ThumbnailMirrors:   rec.ThumbnailMirrors,
-				SpriteMirrors:      rec.SpriteMirrors,
-				PreviewMirrors:     rec.PreviewMirrors,
+				Username:         username,
+				Filename:         rec.Filename,
+				Timestamp:        rec.Timestamp,
+				RoomTitle:        rec.RoomTitle,
+				Tags:             rec.Tags,
+				Viewers:          rec.Viewers,
+				Resolution:       rec.Resolution,
+				Framerate:        rec.Framerate,
+				Filesize:         rec.Filesize,
+				Gender:           chanData.Gender,
+				ThumbnailURL:     rec.ThumbnailURL,
+				SpriteURL:        rec.SpriteURL,
+				EmbedURL:         rec.EmbedURL,
+				ThumbnailMirrors: rec.ThumbnailMirrors,
+				SpriteMirrors:    rec.SpriteMirrors,
+				PreviewMirrors:   rec.PreviewMirrors,
 			}
 
 			if err := client.SaveRecording(recording); err != nil {
@@ -685,13 +686,13 @@ func SaveRecordingsToDB(data []byte) error {
 
 			if rec.ThumbnailURL != "" || rec.SpriteURL != "" {
 				img := &database.PreviewImage{
-					RecordingID:        savedRec.ID,
-					Filename:           rec.Filename,
-					ThumbnailURL:       rec.ThumbnailURL,
-					SpriteURL:          rec.SpriteURL,
-					ThumbnailMirrors:   rec.ThumbnailMirrors,
-					SpriteMirrors:      rec.SpriteMirrors,
-					PreviewMirrors:     rec.PreviewMirrors,
+					RecordingID:      savedRec.ID,
+					Filename:         rec.Filename,
+					ThumbnailURL:     rec.ThumbnailURL,
+					SpriteURL:        rec.SpriteURL,
+					ThumbnailMirrors: rec.ThumbnailMirrors,
+					SpriteMirrors:    rec.SpriteMirrors,
+					PreviewMirrors:   rec.PreviewMirrors,
 				}
 				if err := client.SavePreviewImage(img); err != nil {
 					return fmt.Errorf("save preview image %s: %w", rec.Filename, err)
@@ -723,30 +724,29 @@ func LoadRecordingsFromDB() []byte {
 
 	// Convert to the old JSON format for compatibility
 	type RecordingEntry struct {
-			Filename         string            `json:"filename"`
-			Timestamp        string            `json:"timestamp"`
-			RoomTitle        string            `json:"room_title"`
-			Tags             []string          `json:"tags"`
-			Viewers          int               `json:"viewers"`
-			Resolution       string            `json:"resolution"`
-			Framerate        int               `json:"framerate"`
-			Links            map[string]string `json:"links"`
-			ThumbnailURL     string            `json:"thumbnail_url"`
-			SpriteURL        string            `json:"sprite_url"`
-			PreviewURL       string            `json:"preview_url"`
-			ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"`
-			SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`
-			PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`
-			EmbedURL         string            `json:"embed_url"`
-			Filesize         int64             `json:"filesize"`
-			EndReason        string            `json:"end_reason,omitempty"`
-		}
+		Filename         string            `json:"filename"`
+		Timestamp        string            `json:"timestamp"`
+		RoomTitle        string            `json:"room_title"`
+		Tags             []string          `json:"tags"`
+		Viewers          int               `json:"viewers"`
+		Resolution       string            `json:"resolution"`
+		Framerate        int               `json:"framerate"`
+		Links            map[string]string `json:"links"`
+		ThumbnailURL     string            `json:"thumbnail_url"`
+		SpriteURL        string            `json:"sprite_url"`
+		PreviewURL       string            `json:"preview_url"`
+		ThumbnailMirrors map[string]string `json:"thumbnail_mirrors,omitempty"`
+		SpriteMirrors    map[string]string `json:"sprite_mirrors,omitempty"`
+		PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`
+		EmbedURL         string            `json:"embed_url"`
+		Filesize         int64             `json:"filesize"`
+		EndReason        string            `json:"end_reason,omitempty"`
+	}
 
-		type ChannelRecordings struct {
-			Gender     string           `json:"gender"`
-			Recordings []RecordingEntry `json:"recordings"`
-		}
-
+	type ChannelRecordings struct {
+		Gender     string           `json:"gender"`
+		Recordings []RecordingEntry `json:"recordings"`
+	}
 
 	type RecordingsDB struct {
 		Version  int                           `json:"version"`
@@ -1236,6 +1236,93 @@ func UpdateRecordingThumbnails(filename, thumbnailURL, spriteURL, previewURL str
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
 	}
 	return nil
+}
+
+// Throttle + re-entrancy guard for SyncRecordingsThumbnails so the periodic
+// ticker (and startup sweep) never trigger overlapping syncs or hammer Supabase.
+var (
+	recThumbSyncMu   sync.Mutex
+	recThumbSyncing  bool
+	recThumbSyncLast time.Time
+)
+
+// recThumbSyncCooldown is the minimum interval between automatic backfill
+// sweeps. Each sweep PATCHes only recordings whose thumbnail is still missing
+// but has a preview_images row, so it is light; the cooldown just prevents the
+// ticker from re-scanning on adjacent ticks.
+const recThumbSyncCooldown = 10 * time.Minute
+
+// SyncRecordingsThumbnails is the automatic backfill: for every recording whose
+// recordings.thumbnail_url is empty but whose preview_images row has a thumbnail
+// (which the earlier generation/pipeline wrote), copy that thumbnail (plus
+// sprite/preview) onto the recordings row.
+//
+// This is the fleet-wide fix for thumbnails that land in preview_images but
+// never reach recordings.thumbnail_url — the column the video card reads. The
+// DVR's own thumbnail writer uses the anon key whose RLS silently rejects
+// recordings writes, so a periodic sweep with the service-role key is required
+// to keep the UI thumbnails populated.
+func SyncRecordingsThumbnails() {
+	recThumbSyncMu.Lock()
+	if recThumbSyncing {
+		recThumbSyncMu.Unlock()
+		return
+	}
+	if time.Since(recThumbSyncLast) < recThumbSyncCooldown {
+		recThumbSyncMu.Unlock()
+		return
+	}
+	recThumbSyncing = true
+	recThumbSyncMu.Unlock()
+	defer func() {
+		recThumbSyncMu.Lock()
+		recThumbSyncing = false
+		recThumbSyncLast = time.Now()
+		recThumbSyncMu.Unlock()
+	}()
+
+	client := GetDBClient()
+	if client == nil {
+		return
+	}
+	previews := LoadAllPreviewLinks()
+	if len(previews) == 0 {
+		return
+	}
+	recordings, err := client.GetRecordingsMissingThumbnails()
+	if err != nil {
+		log.Printf("[thumb-sync] could not load recordings: %v", err)
+		return
+	}
+
+	// Small delay so a mass backfill never trips image-host/Supabase rate
+	// limits (mirrors the pacing ScanThumbnails uses).
+	const pacing = 150 * time.Millisecond
+
+	fixed := 0
+	for i := range recordings {
+		rec := &recordings[i]
+		if rec.ThumbnailURL != "" {
+			continue
+		}
+		links, ok := previews[rec.Filename]
+		if !ok {
+			continue
+		}
+		thumb, sprite, preview := links[0], links[1], links[2]
+		if thumb == "" {
+			continue
+		}
+		if err := UpdateRecordingThumbnails(rec.Filename, thumb, sprite, preview); err != nil {
+			log.Printf("[thumb-sync] failed to sync %s: %v", rec.Filename, err)
+			continue
+		}
+		fixed++
+		time.Sleep(pacing)
+	}
+	if fixed > 0 {
+		log.Printf("[thumb-sync] backfilled thumbnail_url onto %d recording(s)", fixed)
+	}
 }
 
 // DeleteVideoCompletely removes all data associated with a video:

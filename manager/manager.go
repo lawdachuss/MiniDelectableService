@@ -17,9 +17,9 @@ import (
 	"github.com/r3labs/sse/v2"
 	"github.com/teacat/chaturbate-dvr/channel"
 	"github.com/teacat/chaturbate-dvr/coordinator"
-	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
+	"github.com/teacat/chaturbate-dvr/internal"
 	"github.com/teacat/chaturbate-dvr/notifier"
 	"github.com/teacat/chaturbate-dvr/router/view"
 	"github.com/teacat/chaturbate-dvr/server"
@@ -290,6 +290,7 @@ func (m *Manager) LoadConfig() error {
 	go func() {
 		channel.CleanupOrphanedFiles()
 		m.ScanThumbnails()
+		server.SyncRecordingsThumbnails()
 	}()
 
 	// Periodic orphan cleanup + thumbnail scan
@@ -300,9 +301,14 @@ func (m *Manager) LoadConfig() error {
 			for range ticker.C {
 				channel.CleanupOrphanedFiles()
 				m.ScanThumbnails()
+				server.SyncRecordingsThumbnails()
 			}
 		}()
 	}
+
+	// Dedicated short-interval thumbnail-backfill ticker (independent of the
+	// orphan-cleanup interval above).
+	startRecordingsThumbSync()
 
 	// File watcher for real-time orphan detection.
 	// Only watch the output directory — files in the temp "videos/"
@@ -401,6 +407,7 @@ func (m *Manager) LoadPooledConfig() error {
 	go func() {
 		channel.CleanupOrphanedFiles()
 		m.ScanThumbnails()
+		server.SyncRecordingsThumbnails()
 	}()
 
 	if server.Config.OrphanCleanupInterval > 0 {
@@ -410,9 +417,14 @@ func (m *Manager) LoadPooledConfig() error {
 			for range ticker.C {
 				channel.CleanupOrphanedFiles()
 				m.ScanThumbnails()
+				server.SyncRecordingsThumbnails()
 			}
 		}()
 	}
+
+	// Dedicated short-interval thumbnail-backfill ticker (independent of the
+	// orphan-cleanup interval above).
+	startRecordingsThumbSync()
 
 	// File watcher
 	if server.Config.OutputDir != "" {
@@ -651,7 +663,30 @@ const (
 	// permanently-broken recording would otherwise be re-hammered (3 hosts ×
 	// 3 attempts) on every startup and periodic scan.
 	thumbRetryCooldown = 45 * time.Minute
+	// thumbSyncInterval is how often the dedicated thumbnail-backfill ticker
+	// runs. SyncRecordingsThumbnails self-throttles to a 10-minute cooldown, so
+	// this keeps recordings.thumbnail_url current without waiting for the
+	// (default 60-minute) orphan-cleanup ticker.
+	thumbSyncInterval = 15 * time.Minute
 )
+
+// startRecordingsThumbSync runs SyncRecordingsThumbnails on a dedicated short
+// ticker, independent of the orphan-cleanup ticker, so recordings whose
+// thumbnail landed only in preview_images get their recordings.thumbnail_url
+// backfilled promptly. SyncRecordingsThumbnails self-throttles, so an
+// overlapping sticky/ticker call is a no-op.
+func startRecordingsThumbSync() {
+	go func() {
+		// An initial sweep immediately in case nothing else has run yet; the
+		// throttle guard makes a duplicate startup call harmless.
+		server.SyncRecordingsThumbnails()
+		ticker := time.NewTicker(thumbSyncInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			server.SyncRecordingsThumbnails()
+		}
+	}()
+}
 
 // ScanThumbnails walks the videos directory and generates thumbnails for any
 // video file that is missing preview URLs in Supabase.
