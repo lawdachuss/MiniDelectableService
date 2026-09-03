@@ -1108,15 +1108,6 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 			return
 		}
 
-		// When the thumbnail failed but video upload succeeded, stay at
-		// StageThumbnailUpload so stageSaveMetadata can retry thumbnail
-		// generation before saving metadata.  Only advance when the
-		// thumbnail also succeeded (or we already have one from a prior run).
-		if thumbErr != nil && p.ThumbURL == "" {
-			ch.Warn("pipeline: no thumbnail for %s — staying at thumbnail_upload for retry", filename)
-			return
-		}
-
 		if _, statErr := os.Stat(p.FilePath); statErr == nil {
 			p.advanceTo(StageSaveMetadata)
 		} else {
