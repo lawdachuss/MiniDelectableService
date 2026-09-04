@@ -61,16 +61,16 @@ import (
 const controllerUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 type assignerConfig struct {
-	CycleIntervalSec           int `json:"cycle_interval_sec"`
-	HeartbeatTimeoutSec        int `json:"heartbeat_timeout_sec"`
-	ColdStartOfflineThr        int `json:"cold_start_offline_threshold"`
-	ColdStartWaitSec           int `json:"cold_start_wait_sec"`
-	SCConcurrency              int `json:"sc_concurrency"`
-	SCCheckTimeoutSec          int `json:"sc_check_timeout_sec"`
-	SCStaleMin                 int `json:"sc_stale_min"`
+	CycleIntervalSec           int  `json:"cycle_interval_sec"`
+	HeartbeatTimeoutSec        int  `json:"heartbeat_timeout_sec"`
+	ColdStartOfflineThr        int  `json:"cold_start_offline_threshold"`
+	ColdStartWaitSec           int  `json:"cold_start_wait_sec"`
+	SCConcurrency              int  `json:"sc_concurrency"`
+	SCCheckTimeoutSec          int  `json:"sc_check_timeout_sec"`
+	SCStaleMin                 int  `json:"sc_stale_min"`
 	CBEnabled                  bool `json:"cb_enabled"`
-	LeaseTTLSec                int `json:"lease_ttl_sec"`
-	DeadlineMigrationWindowMin int `json:"deadline_migration_window_min"`
+	LeaseTTLSec                int  `json:"lease_ttl_sec"`
+	DeadlineMigrationWindowMin int  `json:"deadline_migration_window_min"`
 }
 
 func defaultAssignerConfig() assignerConfig {
@@ -147,8 +147,8 @@ func (c *Coordinator) runControllerCycle() {
 	now := time.Now()
 	activeSet := map[string]bool{}
 	protectedOwnerSet := map[string]bool{}
-	reclaimSet := map[string]bool{} // nodes whose channels are freed + redistributed
-	heldSet := map[string]bool{}    // briefly-offline nodes: channels HELD during grace
+	reclaimSet := map[string]bool{}         // nodes whose channels are freed + redistributed
+	heldSet := map[string]bool{}            // briefly-offline nodes: channels HELD during grace
 	deadlineMigrateSet := map[string]bool{} // nodes whose session deadline is near/past
 	var active, heldNodes, reclaim, deadlineMigrate []database.Node
 	offlineCount := 0
@@ -334,6 +334,10 @@ func (c *Coordinator) runControllerCycle() {
 			return held
 		}
 		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, protectedOwnerSet, needAssignment, renewLease)
+		// Live-aware load rebalance: relieve a node carrying more concurrent live
+		// recordings than its fair share by re-pointing its CLAIMED live (not yet
+		// recording) channels to the live-coldest node. Never touches recording rows.
+		c.rebalanceLiveLoad(all, activeSet, renewLease)
 	}
 	if needAssignment {
 		c.assignerAssignMu.Lock()
@@ -617,11 +621,11 @@ func (c *Coordinator) checkStripchatBatch(ctx context.Context, cfg assignerConfi
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			live, known := fetchStripchatLive(client, u)
-				if known {
-					mu.Lock()
-					out[u] = scLiveResult{live: live, known: true}
-					mu.Unlock()
-				}
+			if known {
+				mu.Lock()
+				out[u] = scLiveResult{live: live, known: true}
+				mu.Unlock()
+			}
 		}(ca.Username)
 	}
 	wg.Wait()
@@ -962,6 +966,105 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 		}
 		counts[want]++
 		mutations++
+	}
+}
+
+// rebalanceLiveLoad relieves a node that is carrying more concurrent live
+// recordings than its fair share by re-pointing its CLAIMED live (is_live &&
+// status != recording) channels to the node with the fewest live recordings.
+//
+// It ONLY touches rows where is_live=true AND status != "recording". At that
+// instant no node is capturing the channel, so re-pointing assigned_node loses
+// nothing — this is a pure pre-recording redirect. In-progress recordings
+// (status=="recording") are never candidates and never moved, so no recording
+// is ever split, moved, or lost. The move is applied atomically via
+// ReassignChannel, and only the excess over fair share is moved (and only to a
+// node strictly below its own share) to prevent churn / ping-pong.
+// liveRebalanceMove describes a single safe pre-recording reassignment.
+type liveRebalanceMove struct {
+	ca  database.ChannelAssignment
+	src string
+	dst string
+}
+
+// pickLiveRebalanceMove finds one reassignment that relieves a node over its
+// live fair share. Only a channel that is is_live && status != "recording"
+// (live but not yet recording — nothing is being captured) and owned by an
+// over-share node is a candidate, and it is re-pointed to the live-coldest
+// active node (fewest recordings, tie-break node_id) that is strictly below its
+// own share. Returns nil when balanced or nothing is safely movable. This pure
+// function carries the recording-safety invariants and is unit-tested.
+func pickLiveRebalanceMove(all []database.ChannelAssignment, active map[string]bool, rec map[string]int, fair int) *liveRebalanceMove {
+	for _, ca := range all {
+		if !ca.IsLive || ca.Status == "recording" || ca.AssignedNode == "" || !active[ca.AssignedNode] {
+			continue // never a recording, never an unassigned/off-node channel
+		}
+		src := ca.AssignedNode
+		if rec[src] <= fair {
+			continue // source within its fair share — no need to shed
+		}
+		dst := ""
+		dstRec := -1
+		for n := range active {
+			if rec[n] >= fair {
+				continue // target must be strictly below share to avoid ping-pong
+			}
+			if dst == "" || rec[n] < dstRec || (rec[n] == dstRec && n < dst) {
+				dst = n
+				dstRec = rec[n]
+			}
+		}
+		if dst == "" || dst == src {
+			continue
+		}
+		return &liveRebalanceMove{ca: ca, src: src, dst: dst}
+	}
+	return nil
+}
+
+func (c *Coordinator) rebalanceLiveLoad(all []database.ChannelAssignment, active map[string]bool, renewLease func() bool) {
+	if c.Client == nil || len(active) == 0 {
+		return
+	}
+
+	// Live-recording load per node (the work that actually stresses a node).
+	rec := make(map[string]int, len(active))
+	totalRec := 0
+	for _, ca := range all {
+		if ca.Status == "recording" && ca.AssignedNode != "" && active[ca.AssignedNode] {
+			rec[ca.AssignedNode]++
+			totalRec++
+		}
+	}
+	if totalRec == 0 {
+		return
+	}
+	fair := (totalRec + len(active) - 1) / len(active)
+	if fair < 1 {
+		fair = 1
+	}
+
+	mutations := 0
+	for {
+		m := pickLiveRebalanceMove(all, active, rec, fair)
+		if m == nil {
+			return
+		}
+		if mutations > 0 && mutations%10 == 0 && !renewLease() {
+			log.Printf("[controller] lease lost during live-load balance; stopping")
+			return
+		}
+		if err := c.Client.ReassignChannel(m.ca.Username, m.ca.Site, m.src, m.dst); err != nil {
+			log.Printf("[controller] live-load reassign %s/%s %s -> %s error: %v", m.ca.Site, m.ca.Username, m.src, m.dst, err)
+			// Degrade conservatively: stop shedding this source on a persistent
+			// error rather than retrying the same move forever.
+			rec[m.src] = fair
+			continue
+		}
+		rec[m.src]--
+		rec[m.dst]++
+		mutations++
+		log.Printf("[controller] live-load balance: moved %s/%s %s -> %s", m.ca.Site, m.ca.Username, m.src, m.dst)
 	}
 }
 

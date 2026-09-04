@@ -96,6 +96,102 @@ func TestHasMovableImbalanceDetectsRealImbalance(t *testing.T) {
 	}
 }
 
+func TestPickLiveRebalanceMoveNeverMovesARecording(t *testing.T) {
+	active := map[string]bool{"node-a": true, "node-b": true}
+	// node-a is over share (2 rec vs fair 1). It owns a live-claimed channel
+	// (movable) AND an in-progress recording. The move must pick the live-claimed
+	// channel and NEVER the recording.
+	all := []database.ChannelAssignment{
+		{Username: "aLiveMove", AssignedNode: "node-a", Status: "claimed", IsLive: true},
+		{Username: "aRec", AssignedNode: "node-a", Status: "recording", IsLive: true},
+	}
+	rec := map[string]int{"node-a": 2, "node-b": 0}
+	m := pickLiveRebalanceMove(all, active, rec, 1)
+	if m == nil {
+		t.Fatal("expected a move: node-a is over share and owns a live-claimed channel")
+	}
+	if m.ca.Username != "aLiveMove" {
+		t.Fatalf("pickLiveRebalanceMove picked %q, want the live-claimed channel (never a recording)", m.ca.Username)
+	}
+	if m.ca.Status == "recording" {
+		t.Fatalf("pickLiveRebalanceMove returned a recording channel: %+v", m.ca)
+	}
+}
+
+func TestPickLiveRebalanceMoveRequiresLiveNotRecordingCandidate(t *testing.T) {
+	active := map[string]bool{"node-a": true, "node-b": true}
+	rec := map[string]int{"node-a": 3, "node-b": 0}
+	// Node-a is heavily over share (fair 2), but the over-share channel it owns
+	// is OFFLINE (not live) — nothing is live-and-not-recording, so no move.
+	all := []database.ChannelAssignment{
+		{Username: "a1", AssignedNode: "node-a", Status: "claimed", IsLive: false},
+	}
+	if m := pickLiveRebalanceMove(all, active, rec, 2); m != nil {
+		t.Fatalf("no live-and-not-recording channel should be moved, got %+v", m.ca)
+	}
+}
+
+func TestPickLiveRebalanceMoveRelievesOverShareNodeToColdest(t *testing.T) {
+	active := map[string]bool{"node-a": true, "node-b": true, "node-c": true}
+	rec := map[string]int{"node-a": 3, "node-b": 1, "node-c": 0}
+	all := []database.ChannelAssignment{
+		// node-a is over share (3 vs fair 2); node-c is coldest (0).
+		{Username: "aLive", AssignedNode: "node-a", Status: "claimed", IsLive: true},
+		// A recording on node-a must remain untouched.
+		{Username: "aRec", AssignedNode: "node-a", Status: "recording", IsLive: true},
+	}
+	m := pickLiveRebalanceMove(all, active, rec, 2)
+	if m == nil {
+		t.Fatal("expected a move: node-a is over share and owns a live claimed channel")
+	}
+	if m.src != "node-a" {
+		t.Fatalf("source = %s, want node-a", m.src)
+	}
+	if m.dst != "node-c" {
+		t.Fatalf("dst = %s, want node-c (coldest)", m.dst)
+	}
+	if m.ca.Status == "recording" {
+		t.Fatal("must never move a recording")
+	}
+}
+
+func TestPickLiveRebalanceMoveTieBreaksDestByNodeID(t *testing.T) {
+	active := map[string]bool{"node-a": true, "node-b": true, "node-c": true}
+	rec := map[string]int{"node-a": 3, "node-b": 0, "node-c": 0}
+	all := []database.ChannelAssignment{
+		{Username: "aLive", AssignedNode: "node-a", Status: "claimed", IsLive: true},
+	}
+	// node-b and node-c both have 0 recordings (tie) and both below fair 2;
+	// node-b sorts first.
+	m := pickLiveRebalanceMove(all, active, rec, 2)
+	if m == nil || m.dst != "node-b" {
+		t.Fatalf("dst = %v, want node-b (tie-break by node_id)", m)
+	}
+}
+
+func TestPickLiveRebalanceMoveNilWhenBalanced(t *testing.T) {
+	active := map[string]bool{"node-a": true, "node-b": true}
+	rec := map[string]int{"node-a": 1, "node-b": 1}
+	all := []database.ChannelAssignment{
+		{Username: "aLive", AssignedNode: "node-a", Status: "claimed", IsLive: true},
+	}
+	if m := pickLiveRebalanceMove(all, active, rec, 1); m != nil {
+		t.Fatalf("node-a at fair share should not shed, got %+v", m.ca)
+	}
+}
+
+func TestPickLiveRebalanceMoveSkipsUnassignedAndNonActiveNodes(t *testing.T) {
+	active := map[string]bool{"node-b": true}
+	rec := map[string]int{"node-b": 0}
+	all := []database.ChannelAssignment{
+		{Username: "orphan", AssignedNode: "", Status: "claimed", IsLive: true},
+		{Username: "deadOwner", AssignedNode: "node-x", Status: "claimed", IsLive: true},
+	}
+	if m := pickLiveRebalanceMove(all, active, rec, 1); m != nil {
+		t.Fatalf("channels on unassigned/off-node must never be moved, got %+v", m.ca)
+	}
+}
+
 // TestFleetSignatureIncludesMigratingNode verifies that a node entering the
 // deadline-migration window produces a distinct fleet signature, so the
 // controller triggers exactly one reassignment when it enters/exits.
