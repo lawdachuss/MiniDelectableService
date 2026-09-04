@@ -38,6 +38,24 @@ func (s Stage) String() string { return stageNames[s] }
 // across restarts before it is abandoned and its state row is deleted.
 const maxPipelineRetries = 3
 
+// pipelineThumbnailTimeout bounds how long the thumbnail leg of the
+// thumbnail_upload stage may run before the pipeline proceeds WITHOUT it.
+//
+// Thumbnail generation is normally bounded by per-ffmpeg-call context
+// timeouts and image-host HTTP client timeouts, so a healthy node finishes in
+// minutes. But the stage must never hang FOREVER: the node-13 production
+// wedge froze every pipeline at thumbnail_upload with updated==created (video
+// uploads in the parallel goroutine still succeeded, so recordings had links
+// yet files were never cleaned and the disk filled at ~13 GB/h) because a
+// deadlocked thumbnail goroutine never returned and wg.Wait() waited on it
+// indefinitely. Bounding the wait degrades a pathological stall to "no
+// thumbnail yet" — links are already persisted, the file is kept by cleanup
+// when the thumbnail is missing, and ScanThumbnails/backfill fills it in
+// later — instead of freezing the whole node. Generous so a slow 4K file with
+// seek retries (up to ~45-min ffmpeg budgets each) plus image-host uploads is
+// never falsely abandoned.
+const pipelineThumbnailTimeout = 3 * time.Hour
+
 // defaultPipelineWorkers is how many pipelines one channel's queue processes
 // concurrently.  More workers means a channel with a backlog of recordings
 // uploads several files at once instead of serially.  The global UploadSem
@@ -584,6 +602,45 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 		return stat.Size(), nil
 	}()
 
+	// Emit an accurate terminal upload state the instant the video transfer
+	// finishes. Previously the last per-host progress callback (often a host
+	// at 100% with 0/6 marked "done") was the final update until the NEXT
+	// stage advanced, so a file whose upload had actually completed could sit
+	// in the admin upload matrix looking mid-transfer for minutes — or
+	// forever while the thumbnail leg of the stage ran on (or wedged, as in
+	// the node-13 ffmpegSem deadlock). The matrix now shows the real outcome:
+	// hosts that got links are "done", the rest are "pending"/"failed", and
+	// the status names the current phase instead of a stale byte count.
+	{
+		failedHosts := map[string]bool{}
+		for _, r := range results {
+			if r.Error != nil {
+				failedHosts[r.Host] = true
+			}
+		}
+		hosts := make([]entity.HostEntry, 0, len(allHosts))
+		for _, h := range allHosts {
+			e := entity.HostEntry{Host: h}
+			e.BytesTotal = p.FileSize
+			switch {
+			case p.Links[h] != "":
+				// Uploaded now, or already complete per the journal (skipped hosts
+				// may not appear in this run's results).
+				e.Status = "done"
+				e.Progress = 100
+				e.BytesCurrent = p.FileSize
+			case failedHosts[h]:
+				e.Status = "failed"
+				e.Progress = 100
+			default:
+				e.Status = "pending"
+			}
+			hosts = append(hosts, e)
+		}
+		status := fmt.Sprintf("uploaded %d/%d hosts — processing", len(p.Links), len(allHosts))
+		ch.SetUploadProgress(filename, status, 80, len(p.Links), len(allHosts), p.FileSize, p.FileSize, "", hosts)
+	}
+
 	return nil
 }
 
@@ -1049,21 +1106,24 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 		ch.Info("pipeline: stage thumbnail_upload for %s", filename)
 		ch.SetUploadProgress(filename, "generating thumbnails and uploading to hosts", 5, 0, 0, 0, 0, "", nil)
 
-		var wg sync.WaitGroup
 		var thumbErr error
 		var uploadErr error
+		thumbDone := make(chan error, 1)
+		uploadDone := make(chan error, 1)
 
-		// Start thumbnail generation + Pixhost upload in background
-		wg.Add(1)
+		// Start thumbnail generation + Pixhost upload in background. The result
+		// is ALWAYS delivered on thumbDone (deferred after recover) so a panic
+		// can never leave the stage waiting on a channel that never fires.
 		go func() {
-			defer wg.Done()
+			var err error
 			defer func() {
 				if r := recover(); r != nil {
 					ch.Error("pipeline: thumbnail panicked for %s: %v", filename, r)
-					thumbErr = fmt.Errorf("thumbnail panic: %v", r)
+					err = fmt.Errorf("thumbnail panic: %v", r)
 				}
+				thumbDone <- err
 			}()
-			thumbErr = p.stageThumbnail(ch)
+			err = p.stageThumbnail(ch)
 		}()
 
 		// Start video upload in background.
@@ -1077,24 +1137,26 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 		// waits on its own held slot, the workers starve, and the whole node
 		// deadlocks at the thumbnail_upload stage (seen in production: all
 		// pipeline states frozen at thumbnail_upload with updated==created).
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			var err error
 			defer func() {
 				if r := recover(); r != nil {
 					ch.Error("pipeline: upload goroutine panicked for %s: %v", filename, r)
-					uploadErr = fmt.Errorf("upload panic: %v", r)
+					err = fmt.Errorf("upload panic: %v", r)
 				}
+				uploadDone <- err
 			}()
-			uploadErr = p.stageUploadVideos(ch)
+			err = p.stageUploadVideos(ch)
 		}()
 
-		// Wait for both to finish
-		wg.Wait()
+		// Await the video upload FIRST and without a timeout: abandoning an
+		// in-flight upload could let a later stage delete a file that is
+		// still being pushed to hosts. The upload is bounded anyway (retry
+		// workers with attempt caps and per-host HTTP client timeouts).
+		uploadErr = <-uploadDone
 
-		if thumbErr != nil {
-			ch.Warn("pipeline: thumbnail stage failed for %s: %v — will retry in stageSaveMetadata", filename, thumbErr)
-		}
+		// If the video upload failed there is nothing to advance — fail fast
+		// and let the retry re-queue; do not wait out the thumbnail cap first.
 		if uploadErr != nil {
 			ch.Error("pipeline: upload stage failed for %s: %v — keeping recording for retry", filename, uploadErr)
 			p.Failed = true
@@ -1106,6 +1168,24 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 			p.Failed = true
 			p.LastError = "upload produced no links"
 			return
+		}
+
+		// Upload succeeded: links are persisted. Now await the thumbnails with
+		// a generous cap (pipelineThumbnailTimeout) so a deadlocked or starved
+		// thumbnail goroutine can never freeze this stage forever (the node-13
+		// wedge: pipelines stuck at thumbnail_upload with updated==created,
+		// uploads succeeded but files were never cleaned and disk filled). If
+		// they overrun, proceed without them — cleanup keeps the file when the
+		// thumbnail is missing, and ScanThumbnails/backfill fills it in later.
+		select {
+		case thumbErr = <-thumbDone:
+		case <-time.After(pipelineThumbnailTimeout):
+			ch.Error("pipeline: thumbnail stage for %s exceeded %s — proceeding without thumbnails (backfill will retry)", filename, pipelineThumbnailTimeout)
+			thumbErr = fmt.Errorf("thumbnail stage timed out after %s", pipelineThumbnailTimeout)
+		}
+
+		if thumbErr != nil {
+			ch.Warn("pipeline: thumbnail stage failed for %s: %v — will retry in stageSaveMetadata", filename, thumbErr)
 		}
 
 		if _, statErr := os.Stat(p.FilePath); statErr == nil {

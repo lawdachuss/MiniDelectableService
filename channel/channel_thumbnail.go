@@ -27,6 +27,14 @@ const (
 	previewWidth    = 320
 	previewDuration = 6.0 // seconds
 	previewSegments = 12  // number of smooth clips to stitch (each ~0.5s)
+
+	// thumbnailAssetTimeout caps how long generateThumbnailForFile waits for
+	// any single asset (thumbnail/sprite/preview) goroutine before giving up
+	// on it. Bounded waits mean a stalled asset can never hang the caller
+	// (pipeline thumbnail_upload stage, orphan rescan, backfill) forever; the
+	// recording still uploads and cleanup keeps the file when the thumbnail is
+	// missing for a later backfill retry.
+	thumbnailAssetTimeout = 3 * time.Hour
 )
 
 // ThumbnailResult holds the generated thumbnail, sprite, and preview URLs
@@ -315,8 +323,18 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			return runFFmpegFresh(thumbTimeout, args...)
 		}
 
-		config.AcquireFFmpeg()
-		defer config.ReleaseFFmpeg()
+		// NO outer ffmpeg slot is held here: runFFmpegFresh acquires (and
+		// releases) its own slot per invocation, so an extra acquire held for
+		// the goroutine's whole lifetime — including the multi-minute image-
+		// host uploads below — would nest a second acquire inside the first.
+		// When enough thumbnail goroutines overlapped (a file-rotation wave on
+		// a loaded node), every ffmpegSem slot became such an outer hold and
+		// each holder blocked forever on its inner acquire: a permanent
+		// hold-and-wait deadlock that froze every pipeline at
+		// stage=thumbnail_upload with updated==created (video uploads in the
+		// parallel goroutine still succeeded; files were never cleaned up and
+		// disk filled). Seen on node-13 after b16ac44 made this call route
+		// through runFFmpegFresh.
 		err := generateThumb(false)
 
 		if err != nil {
@@ -858,9 +876,30 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		previewDone <- ""
 	}()
 
-	result.ThumbURL = <-thumbDone
-	result.SpriteURL = <-spriteDone
-	result.PreviewURL = <-previewDone
+	// Each asset goroutine is internally bounded (per-ffmpeg-call context
+	// timeouts + image-host HTTP client timeouts + per-host semaphores), so a
+	// healthy file finishes in minutes. But the final wait must NEVER be
+	// unbounded: if anything stalls the goroutine (e.g. a future semaphore
+	// regression like the node-13 ffmpegSem wedge that froze every pipeline at
+	// thumbnail_upload), this function would hang forever and take the
+	// pipeline / orphan rescan / thumbnail backfill down with it. Each asset is
+	// capped individually; missing assets degrade to "no thumbnail" and are
+	// retried/backfilled later. The cap is generous so slow 4K files with seek
+	// retries (up to ~45-min ffmpeg budgets each) plus host uploads are never
+	// falsely abandoned.
+	deadline := time.NewTimer(thumbnailAssetTimeout)
+	defer deadline.Stop()
+	waitAsset := func(name string, dst *string, ch chan string) {
+		deadline.Reset(thumbnailAssetTimeout)
+		select {
+		case *dst = <-ch:
+		case <-deadline.C:
+			errFn("%s: timed out after %s waiting for %s asset — continuing without it", baseName, thumbnailAssetTimeout, name)
+		}
+	}
+	waitAsset("thumbnail", &result.ThumbURL, thumbDone)
+	waitAsset("sprite", &result.SpriteURL, spriteDone)
+	waitAsset("preview", &result.PreviewURL, previewDone)
 
 	mirrorsMu.Lock()
 	result.ThumbMirrors = thumbMirrors
