@@ -663,11 +663,11 @@ const (
 	// permanently-broken recording would otherwise be re-hammered (3 hosts ×
 	// 3 attempts) on every startup and periodic scan.
 	thumbRetryCooldown = 45 * time.Minute
-	// thumbSyncInterval is how often the dedicated thumbnail-backfill ticker
-	// runs. SyncRecordingsThumbnails self-throttles to a 10-minute cooldown, so
-	// this keeps recordings.thumbnail_url current without waiting for the
-	// (default 60-minute) orphan-cleanup ticker.
-	thumbSyncInterval = 15 * time.Minute
+// thumbSyncInterval is how often the dedicated thumbnail-backfill ticker
+// runs. SyncRecordingsThumbnails self-throttles to a 10-minute cooldown, so
+// this keeps recordings.thumbnail_url current without waiting for the
+// (default 60-minute) orphan-cleanup ticker.
+	thumbSyncInterval = 30 * time.Minute
 )
 
 // startRecordingsThumbSync runs SyncRecordingsThumbnails on a dedicated short
