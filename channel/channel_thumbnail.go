@@ -138,6 +138,21 @@ func runFFmpegParallel(workers, n int, fn func(i int) error) error {
 	return firstErr
 }
 
+// runFFmpegFresh runs an ffmpeg command with a fresh timeout context of the
+// given duration, acquiring a global ffmpeg slot for the duration.  Each
+// invocation gets its own context so a retry (slow seek, blank fallback,
+// regenerate, assembly) is never killed instantly by a shared per-task context
+// whose budget was already fully consumed by a failed fast seek — otherwise
+// the retry fails with an immediate "context deadline exceeded" even though it
+// never got a chance to run.
+func runFFmpegFresh(timeout time.Duration, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	config.AcquireFFmpeg()
+	defer config.ReleaseFFmpeg()
+	return config.FFmpegCommandContext(ctx, args...).Run()
+}
+
 func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{}), onHost OnHostUploadFunc) ThumbnailResult {
 	var result ThumbnailResult
 	ext := strings.ToLower(filepath.Ext(videoPath))
@@ -267,9 +282,6 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				}
 			}
 		}()
-		thumbCtx, thumbCancel := context.WithTimeout(context.Background(), thumbTimeout)
-		defer thumbCancel()
-
 		thumbJPG := videoPath + ".thumb.jpg"
 		defer os.Remove(thumbJPG)
 
@@ -281,7 +293,10 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 
 		// generateThumb extracts the single thumbnail frame (slow=true uses
-		// slow seek for codecs where fast seek crashes ffmpeg).
+		// slow seek for codecs where fast seek crashes ffmpeg).  It uses a
+		// fresh context per attempt so the slow-seek retry / regeneration is
+		// never killed instantly by a shared context exhausted by the failed
+		// fast seek.
 		generateThumb := func(slow bool) error {
 			args := []string{"-y"}
 			if slow {
@@ -297,7 +312,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				"-q:v", "5",
 				thumbJPG,
 			)
-			return config.FFmpegCommandContext(thumbCtx, args...).Run()
+			return runFFmpegFresh(thumbTimeout, args...)
 		}
 
 		config.AcquireFFmpeg()
@@ -359,7 +374,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 		errFn("thumb: upload failed for %s — all hosts rejected", baseName)
 		thumbDone <- ""
-		}()
+	}()
 
 	// ── Sprite sheet (4×4 grid covering the full video duration) ───────────
 	// Each frame is spriteFrameW×spriteFrameH px; total image is
@@ -388,9 +403,6 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				}
 			}
 		}()
-		spriteCtx, spriteCancel := context.WithTimeout(context.Background(), spriteTimeout)
-		defer spriteCancel()
-
 		spriteJPG := videoPath + ".sprite.jpg"
 		defer os.Remove(spriteJPG)
 
@@ -446,13 +458,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					"-q:v", "5",
 					tilePath,
 				}
-				config.AcquireFFmpeg()
-				err := config.FFmpegCommandContext(spriteCtx, seekArgs...).Run()
-				config.ReleaseFFmpeg()
+				err := runFFmpegFresh(spriteTimeout, seekArgs...)
 				if err != nil || !fileExists(tilePath) {
 					// Fast seek failed (some codecs crash with -ss before -i on
 					// Windows, exit 0xffffffea).  Retry with slow seek (-ss after
 					// -i); the decode cost is bounded by the GOP, not the file.
+					// Fresh context so the retry gets its own full budget.
 					errFn("sprite: tile %d fast seek failed for %s: %v — retrying with slow seek", i, baseName, err)
 					slowArgs := []string{
 						"-y",
@@ -465,9 +476,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						"-q:v", "5",
 						tilePath,
 					}
-					config.AcquireFFmpeg()
-					err = config.FFmpegCommandContext(spriteCtx, slowArgs...).Run()
-					config.ReleaseFFmpeg()
+					err = runFFmpegFresh(spriteTimeout, slowArgs...)
 				}
 				// If the tile still failed, generate a blank (black) frame so
 				// the 4×4 grid is complete and the sprite can still be used.
@@ -486,9 +495,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						"-q:v", "5",
 						tilePath,
 					}
-					config.AcquireFFmpeg()
-					_ = config.FFmpegCommandContext(spriteCtx, blankArgs...).Run()
-					config.ReleaseFFmpeg()
+					_ = runFFmpegFresh(spriteTimeout, blankArgs...)
 					if !fileExists(tilePath) {
 						// Even the blank-frame fallback failed — log but do not
 						// abort the entire sprite; the grid will have a missing
@@ -515,8 +522,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			// Assemble the 16 tiles into the 4×4 contact sheet via the image2
 			// demuxer + tile filter (one cheap pass over the tiny JPEGs).
 			pattern := filepath.ToSlash(filepath.Join(tileDir, "t%d.jpg"))
-			config.AcquireFFmpeg()
-			err := config.FFmpegCommandContext(spriteCtx,
+			err := runFFmpegFresh(spriteTimeout,
 				"-y",
 				"-framerate", "1",
 				"-start_number", "0",
@@ -526,8 +532,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				"-c:v", "mjpeg",
 				"-q:v", "5",
 				spriteJPG,
-			).Run()
-			config.ReleaseFFmpeg()
+			)
 			return err
 		}
 
@@ -575,7 +580,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 		errFn("sprite: upload failed for %s — all hosts rejected", baseName)
 		spriteDone <- ""
-		}()
+	}()
 
 	// ── Animated WEBP hover preview (smooth clips from across the video, 6s) ─
 	// Animated WEBP is used instead of GIF because:
@@ -616,9 +621,6 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				}
 			}
 		}()
-		previewCtx, previewCancel := context.WithTimeout(context.Background(), previewTimeout)
-		defer previewCancel()
-
 		previewPath := videoPath + ".preview.webp"
 		// Remove on the final return, but NOT if ffmpeg failed — leave the
 		// file on disk so a later restart or manual retry can pick it up.
@@ -644,14 +646,11 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			return false
 		}
 
-		config.AcquireFFmpeg()
-		defer config.ReleaseFFmpeg()
-
 		var err error
 		if dur <= previewDuration || dur <= 0 {
 			// Short or unmeasurable video — no segmenting needed, just scale.
 			// libwebp needs a constant frame rate, so -r 15 forces CFR.
-			err = config.FFmpegCommandContext(previewCtx,
+			err = runFFmpegFresh(previewTimeout,
 				"-y",
 				"-i", workPath,
 				"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
@@ -661,7 +660,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				"-r", "15",
 				"-an",
 				previewPath,
-			).Run()
+			)
 		} else {
 			// Extract 12 short clips via keyframe seeks into a temp dir, then
 			// concat them and run ONE final WEBP encode.  Each clip is tiny
@@ -705,9 +704,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						"-an",
 						clipPath,
 					}
-					config.AcquireFFmpeg()
-					seekErr := config.FFmpegCommandContext(previewCtx, seekArgs...).Run()
-					config.ReleaseFFmpeg()
+					seekErr := runFFmpegFresh(previewTimeout, seekArgs...)
 					if seekErr != nil || !fileExists(clipPath) {
 						if seekErr != nil {
 							errFn("preview: clip %d fast seek failed for %s: %v — retrying with slow seek", i, baseName, seekErr)
@@ -726,9 +723,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 							"-an",
 							clipPath,
 						}
-						config.AcquireFFmpeg()
-						seekErr = config.FFmpegCommandContext(previewCtx, slowArgs...).Run()
-						config.ReleaseFFmpeg()
+						seekErr = runFFmpegFresh(previewTimeout, slowArgs...)
 						if seekErr != nil || !fileExists(clipPath) {
 							// Both fast and slow seek failed — generate a black
 							// placeholder clip so the concat step can still run.
@@ -744,9 +739,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 								"-an",
 								clipPath,
 							}
-							config.AcquireFFmpeg()
-							_ = config.FFmpegCommandContext(previewCtx, blackArgs...).Run()
-							config.ReleaseFFmpeg()
+							_ = runFFmpegFresh(previewTimeout, blackArgs...)
 							if !fileExists(clipPath) {
 								return fmt.Errorf("clip %d at %.2fs: both seeks and blank fallback failed", i, start)
 							}
@@ -779,7 +772,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					if werr := os.WriteFile(listPath, []byte(list.String()), 0o666); werr != nil {
 						err = fmt.Errorf("write concat list: %w", werr)
 					} else {
-						err = config.FFmpegCommandContext(previewCtx,
+						err = runFFmpegFresh(previewTimeout,
 							"-y",
 							"-f", "concat",
 							"-safe", "0",
@@ -790,7 +783,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 							"-r", "15",
 							"-an",
 							previewPath,
-						).Run()
+						)
 					}
 				}
 			}
@@ -801,16 +794,14 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			// videos (e.g. unusual stream timing), so keep the fallback.
 			//
 			// Use a fresh context so the fallback gets its own 5-minute
-			// timeout instead of inheriting the nearly-expired previewCtx.
+			// timeout instead of inheriting a nearly-expired shared context.
 			if err != nil || !fileExists(previewPath) {
 				if err != nil {
 					errFn("preview: clip extraction failed for %s: %v, trying simple fallback", baseName, err)
 				} else {
 					errFn("preview: clip concat produced no output for %s, trying simple fallback", baseName)
 				}
-				fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				defer fallbackCancel()
-				err = config.FFmpegCommandContext(fallbackCtx,
+				err = runFFmpegFresh(5*time.Minute,
 					"-y",
 					"-ss", fmt.Sprintf("%.2f", dur*0.3),
 					"-i", workPath,
@@ -822,7 +813,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					"-r", "15",
 					"-an",
 					previewPath,
-				).Run()
+				)
 			}
 		}
 
