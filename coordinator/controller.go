@@ -305,9 +305,14 @@ func (c *Coordinator) runControllerCycle() {
 	}
 	c.assignerAssignMu.Unlock()
 
-	// A cancelled runner leaves its final recording marker in the database.  A
-	// fresh marker is protected, while an expired one is made movable so a full
-	// restart can converge instead of preserving stale imbalance forever.
+	// A cancelled runner leaves its final recording marker in the database. An
+	// expired marker (channel heartbeat older than recordingLeaseTTL) is made
+	// movable so a full restart can converge instead of preserving stale
+	// imbalance forever — but only when its owner is NOT protected. The reset is
+	// filtered server-side to exclude protectedOwnerSet (nodes alive within the
+	// reclaim grace), so a live node's in-progress recording can never be
+	// unpinned and handed to a second node just because its assignment-sync
+	// refresh lagged.
 	c.clearStaleRecordingLeases(all, now, protectedOwnerSet)
 
 	// Do not let the repair check bypass the cold-start gate.  In particular, an

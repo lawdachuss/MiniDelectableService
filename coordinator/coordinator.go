@@ -346,19 +346,41 @@ type Coordinator struct {
 	// live channel. Live and Unknown results reset the streak.
 	liveCheckMiss   map[string]int
 	liveCheckMissMu sync.Mutex
+
+	// recordingMarked tracks, for THIS process, which channels this node has
+	// marked status='recording' in the DB (assignment-sync mark phase). Because
+	// the controller never resets a recording marker whose owner node is alive,
+	// the owner itself must clear its finished recordings: the sync loop resets
+	// a previously-marked channel to 'claimed' exactly once, the first cycle
+	// after it stops recording. Keyed by site+username because the same handle
+	// can exist on chaturbate AND stripchat as distinct channel_assignments
+	// rows, each with its own marker to clear. Guarded by the single-flight
+	// assignment-sync cycle guard (runAssignmentSyncCycleWith), so no mutex is
+	// needed.
+	recordingMarked map[recMarkKey]bool
+}
+
+// recMarkKey identifies one channel_assignments row (site+username) that this
+// node has marked status='recording'. The same username can exist on both
+// sites, so a bare username would make one site's cleanup clear (or miss) the
+// other site's marker.
+type recMarkKey struct {
+	site     string
+	username string
 }
 
 // New creates a new Coordinator. If CHANNEL_POOL_MODE=pooled, Start() must
 // be called to begin background goroutines.
 func New(client *database.Client, mgr ChannelManager) *Coordinator {
 	return &Coordinator{
-		NodeID:         detectNodeID(),
-		Mode:           channelPoolMode(),
-		Client:         client,
-		Manager:        mgr,
-		stopCh:         make(chan struct{}),
-		stuckPauseSeen: make(map[string]int),
-		liveCheckMiss:  make(map[string]int),
+		NodeID:          detectNodeID(),
+		Mode:            channelPoolMode(),
+		Client:          client,
+		Manager:         mgr,
+		stopCh:          make(chan struct{}),
+		stuckPauseSeen:  make(map[string]int),
+		liveCheckMiss:   make(map[string]int),
+		recordingMarked: make(map[recMarkKey]bool),
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // reqRecord captures one request the fake Supabase received.
@@ -130,6 +131,83 @@ func makePairs(n int) [][2]string {
 		pairs[i] = [2]string{fmt.Sprintf("model_%03d", i), "chaturbate"}
 	}
 	return pairs
+}
+
+// ============================================================================
+// ResetStaleRecordingAssignments (protected-owner exclusion)
+// ============================================================================
+
+// TestResetStaleRecordingAssignmentsExcludesProtectedNodes verifies that a
+// stale recording marker whose owner is in protectedNodeIDs is never touched:
+// the PATCH filter must exclude those nodes server-side, so a live node's
+// in-progress recording cannot be unpinned and handed to a second node just
+// because its assignment-sync heartbeat refresh lagged.
+func TestResetStaleRecordingAssignmentsExcludesProtectedNodes(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	before := time.Now().UTC().Add(-2 * time.Minute)
+	if _, err := c.ResetStaleRecordingAssignments(before, []string{"node-a", "node-b"}); err != nil {
+		t.Fatalf("ResetStaleRecordingAssignments error: %v", err)
+	}
+
+	reqs := fake.patchRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d PATCH requests, want 1", len(reqs))
+	}
+	path := reqs[0].path
+	if !strings.Contains(path, "status=eq.recording") {
+		t.Fatalf("PATCH missing recording filter: %s", path)
+	}
+	if !strings.Contains(path, "last_heartbeat.is.null") {
+		t.Fatalf("PATCH missing null-heartbeat clause: %s", path)
+	}
+	if !strings.Contains(path, "assigned_node=not.in.(node-a,node-b)") {
+		t.Fatalf("PATCH missing protected-owner exclusion: %s", path)
+	}
+	if reqs[0].body != `{"status":"claimed"}` {
+		t.Fatalf("PATCH body = %s, want {\"status\":\"claimed\"}", reqs[0].body)
+	}
+}
+
+// TestResetStaleRecordingAssignmentsNoProtectedNodes verifies that with an
+// empty protected list the reset keeps its original behaviour (no exclusion
+// filter), so a genuinely dead runner's leftover marker is still cleaned up.
+func TestResetStaleRecordingAssignmentsNoProtectedNodes(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	before := time.Now().UTC().Add(-2 * time.Minute)
+	if _, err := c.ResetStaleRecordingAssignments(before, nil); err != nil {
+		t.Fatalf("ResetStaleRecordingAssignments error: %v", err)
+	}
+	reqs := fake.patchRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d PATCH requests, want 1", len(reqs))
+	}
+	if strings.Contains(reqs[0].path, "assigned_node=") {
+		t.Fatalf("empty protected list must not add an exclusion filter: %s", reqs[0].path)
+	}
+}
+
+// TestResetStaleRecordingAssignmentsEmptyProtectedSameAsNil treats an empty
+// (non-nil) protected list exactly like nil — the controller builds the list
+// from a map that is often empty at cold start.
+func TestResetStaleRecordingAssignmentsEmptyProtectedSameAsNil(t *testing.T) {
+	fake := &fakeSupabase{}
+	c := newTestClient(t, fake)
+
+	before := time.Now().UTC().Add(-2 * time.Minute)
+	if _, err := c.ResetStaleRecordingAssignments(before, []string{}); err != nil {
+		t.Fatalf("ResetStaleRecordingAssignments error: %v", err)
+	}
+	reqs := fake.patchRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d PATCH requests, want 1", len(reqs))
+	}
+	if strings.Contains(reqs[0].path, "assigned_node=") {
+		t.Fatalf("empty protected list must not add an exclusion filter: %s", reqs[0].path)
+	}
 }
 
 // maxFilterURLLen is a generous bound: the real proxy limit is ~8KB, so any

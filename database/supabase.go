@@ -1469,9 +1469,23 @@ func (c *Client) SetAssignmentStatus(username, site, status string) error {
 // MarkChannelRecording. Any row whose status is 'recording' and whose heartbeat
 // is older than `before` (or is null) is no longer recording, so it is safely
 // reset back to 'claimed'.
+//
+// protectedNodeIDs are NEVER reset. A stale channel-row heartbeat alone does
+// not mean the recording ended: the refresh (assignment-sync's
+// MarkChannelRecording) can lag behind a DB slowdown or a skipped cycle while
+// the owner node is alive and still writing the file. Unpinning such a row
+// would let the live-load rebalancer hand the channel to a second node
+// mid-file (duplicate capture). The caller passes exactly the owners it treats
+// as alive/protected (online or draining with a recent node heartbeat), which
+// matches the grace window used everywhere else; a genuinely dead runner falls
+// out of that set once its heartbeat ages past the grace, after which its
+// leftover marker becomes movable again.
 func (c *Client) ResetStaleRecordingAssignments(before time.Time, protectedNodeIDs []string) ([]ChannelAssignment, error) {
 	path := fmt.Sprintf("/channel_assignments?status=eq.recording&or=(last_heartbeat.lt.%s,last_heartbeat.is.null)",
 		url.QueryEscape(before.UTC().Format(time.RFC3339Nano)))
+	if len(protectedNodeIDs) > 0 {
+		path += "&assigned_node=not.in.(" + joinEscaped(protectedNodeIDs) + ")"
+	}
 	resp, err := c.requestWithRetry("PATCH", path, map[string]interface{}{"status": "claimed"})
 	if err != nil {
 		return nil, err
@@ -1909,16 +1923,23 @@ func (c *Client) MarkChannelRecording(username, site string) error {
 	return nil
 }
 
-// ReassertAssignmentNode forces a channel's owning node back to nodeID. Used by
-// the reconcile loop to keep a channel pinned to the node that is actively
-// recording it, so a reassignment (coordinator rebalance or an external
-// autopilot, possibly via a raw DB UPDATE) cannot fragment an in-progress
-// recording by moving it to — and spawning a duplicate on — another node. It
-// updates by (username, site) and is a no-op if the row does not exist.
-func (c *Client) ReassertAssignmentNode(username, site, nodeID string) error {
+// ReassertAssignmentNode forces a channel's owning node back to nodeID, but
+// only while the row is still owned by expectedCurrentNode. Used by the sync
+// loop to keep a channel pinned to the node that is actively recording it, so
+// a reassignment (coordinator rebalance or an external autopilot, possibly via
+// a raw DB UPDATE) cannot fragment an in-progress recording by moving it to —
+// and spawning a duplicate on — another node.
+//
+// The conditional filter is what makes this safe under races: if the row moved
+// again between the caller's read and this PATCH (e.g. a user pause released it
+// to NULL), the PATCH matches zero rows and becomes a no-op instead of
+// resurrecting a released/paused channel into the orphaned "assigned_node set
+// but status unassigned" state that RepairOrphanedAssignments exists to fix.
+// It updates by (username, site) and is a no-op if the row does not exist.
+func (c *Client) ReassertAssignmentNode(username, site, nodeID, expectedCurrentNode string) error {
 	return c.patch(
-		fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s",
-			url.QueryEscape(username), url.QueryEscape(site)),
+		fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s&assigned_node=eq.%s",
+			url.QueryEscape(username), url.QueryEscape(site), url.QueryEscape(expectedCurrentNode)),
 		map[string]interface{}{
 			"assigned_node": nodeID,
 		})
