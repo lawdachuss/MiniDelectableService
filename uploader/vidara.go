@@ -92,6 +92,14 @@ func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFu
 				lastErr = nil
 				continue
 			}
+			// Fail fast on host-side capacity failures: "no healthy upload
+			// server" (503) and nginx 504 gateway timeouts mean Vidara itself
+			// is saturated — burning the remaining attempts on it just stalls
+			// the file while other hosts could have finished. Bail immediately
+			// and let the caller's parallel host chain take the load.
+			if isVidaraCapacityError(err) {
+				return "", lastErr
+			}
 			if attempt < maxAttempts {
 				continue
 			}
@@ -102,6 +110,21 @@ func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFu
 	}
 
 	return "", lastErr
+}
+
+// isVidaraCapacityError reports whether the error is a Vidara-side capacity
+// failure (503 no healthy upload server / 504 gateway timeout). Retrying
+// within the same upload window cannot fix these — the site's own upstream
+// is down or saturated.
+func isVidaraCapacityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no healthy upload server") ||
+		strings.Contains(msg, "status 503") ||
+		strings.Contains(msg, "status 504") ||
+		strings.Contains(msg, "504 gateway time-out")
 }
 
 // getUploadServer gets the upload server URL from the Vidara API

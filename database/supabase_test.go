@@ -523,3 +523,145 @@ func TestSetChannelsNotLiveEmptyClearsAll(t *testing.T) {
 		t.Errorf("clear-all PATCH should have no or= filter, got: %s", patchReqs[0].path)
 	}
 }
+
+// ============================================================================
+// TouchChannelRecordings (owned-but-idle last_recorded_at refresh)
+// ============================================================================
+
+// fakeTouchDB records touch RPC payloads and can simulate HTTP 204 (void RPC),
+// a PGRST202 (RPC not in schema cache), or a plain error response.
+type fakeTouchDB struct {
+	mu       sync.Mutex
+	reqs     []reqRecord
+	respCode int
+	respBody string
+}
+
+func (f *fakeTouchDB) handler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.reqs = append(f.reqs, reqRecord{method: r.Method, path: r.URL.RequestURI(), body: string(body)})
+	code, respBody := f.respCode, f.respBody
+	f.mu.Unlock()
+
+	if code != 0 {
+		w.WriteHeader(code)
+		fmt.Fprint(w, respBody)
+		return
+	}
+	// Default: behave like a void SECURITY DEFINER RPC (204 No Content).
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func newTouchTestClient(t *testing.T, fake *fakeTouchDB) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(srv.Close)
+	return &Client{URL: srv.URL, APIKey: "test-key", client: srv.Client()}
+}
+
+// TestTouchChannelRecordingsPayloadShape verifies the RPC path, the node id,
+// and that every (username, site) pair arrives in the JSON payload.
+func TestTouchChannelRecordingsPayloadShape(t *testing.T) {
+	fake := &fakeTouchDB{}
+	c := newTouchTestClient(t, fake)
+
+	channels := []ChannelAssignment{
+		{Username: "alice", Site: "chaturbate"},
+		{Username: "bob", Site: "stripchat"},
+	}
+	if err := c.TouchChannelRecordings("node-9", channels); err != nil {
+		t.Fatalf("TouchChannelRecordings: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.reqs) != 1 {
+		t.Fatalf("request count = %d, want 1", len(fake.reqs))
+	}
+	rec := fake.reqs[0]
+	if rec.method != "POST" || !strings.HasPrefix(rec.path, "/rest/v1/rpc/touch_channel_recordings") {
+		t.Fatalf("unexpected request: %s %s", rec.method, rec.path)
+	}
+	for _, want := range []string{`"p_node_id":"node-9"`, `"username":"alice"`, `"site":"chaturbate"`, `"username":"bob"`, `"site":"stripchat"`} {
+		if !strings.Contains(rec.body, want) {
+			t.Errorf("payload missing %s: %s", want, rec.body)
+		}
+	}
+}
+
+// TestTouchChannelRecordingsChunks verifies the 200-pair-per-RPC chunking.
+func TestTouchChannelRecordingsChunks(t *testing.T) {
+	fake := &fakeTouchDB{}
+	c := newTouchTestClient(t, fake)
+
+	const n = 450 // ceil(450/200) = 3 chunks
+	channels := make([]ChannelAssignment, n)
+	for i := range channels {
+		channels[i] = ChannelAssignment{Username: fmt.Sprintf("u%03d", i), Site: "chaturbate"}
+	}
+	if err := c.TouchChannelRecordings("node-1", channels); err != nil {
+		t.Fatalf("TouchChannelRecordings: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.reqs) != 3 {
+		t.Fatalf("request count = %d, want 3 chunks", len(fake.reqs))
+	}
+}
+
+// TestTouchChannelRecordingsEmptyNoRequest verifies an empty set is a no-op.
+func TestTouchChannelRecordingsEmptyNoRequest(t *testing.T) {
+	fake := &fakeTouchDB{}
+	c := newTouchTestClient(t, fake)
+
+	if err := c.TouchChannelRecordings("node-1", nil); err != nil {
+		t.Fatalf("TouchChannelRecordings(nil): %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.reqs) != 0 {
+		t.Fatalf("request count = %d, want 0", len(fake.reqs))
+	}
+}
+
+// TestTouchChannelRecordings204 verifies the void-RPC (204 No Content) path
+// decodes cleanly — the mark/reset RPCs return 204 in production.
+func TestTouchChannelRecordings204(t *testing.T) {
+	fake := &fakeTouchDB{respCode: http.StatusNoContent}
+	c := newTouchTestClient(t, fake)
+
+	if err := c.TouchChannelRecordings("node-1", []ChannelAssignment{{Username: "a", Site: "chaturbate"}}); err != nil {
+		t.Fatalf("TouchChannelRecordings with 204: %v", err)
+	}
+}
+
+// TestTouchChannelRecordingsPGRST202SkipsSilently verifies the degradation
+// path: a project that has not applied the migration returns PGRST202 and the
+// call must be swallowed — staleness visibility is best-effort.
+func TestTouchChannelRecordingsPGRST202SkipsSilently(t *testing.T) {
+	fake := &fakeTouchDB{
+		respCode: http.StatusBadRequest,
+		respBody: `{"code":"PGRST202","message":"Could not find the function"}`,
+	}
+	c := newTouchTestClient(t, fake)
+
+	if err := c.TouchChannelRecordings("node-1", []ChannelAssignment{{Username: "a", Site: "chaturbate"}}); err != nil {
+		t.Fatalf("PGRST202 must be swallowed, got: %v", err)
+	}
+}
+
+// TestTouchChannelRecordingsErrorSurfaced verifies non-PGRST202 failures are
+// returned so the caller can log them.
+func TestTouchChannelRecordingsErrorSurfaced(t *testing.T) {
+	fake := &fakeTouchDB{
+		respCode: http.StatusBadRequest,
+		respBody: `{"message":"boom"}`,
+	}
+	c := newTouchTestClient(t, fake)
+
+	if err := c.TouchChannelRecordings("node-1", []ChannelAssignment{{Username: "a", Site: "chaturbate"}}); err == nil {
+		t.Fatalf("expected an error for a plain 400")
+	}
+}

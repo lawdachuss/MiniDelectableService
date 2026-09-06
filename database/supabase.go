@@ -1603,6 +1603,15 @@ type AssignmentStats struct {
 // payload and decodes the claimed rows. All claim RPCs use SELECT ... FOR
 // UPDATE SKIP LOCKED so two nodes can never claim the same channel
 // concurrently (no TOCTOU between a GET and a PATCH).
+//
+// Fair-share cap: the claim RPCs no longer trust p_limit as the real budget —
+// they compute the node's remaining fair share server-side
+// (share = ceil(pool / eligible_nodes), budget = min(p_limit, share - load))
+// and a BEFORE UPDATE trigger (enforce_fair_share_claim) backstops EVERY
+// writer, re-pointing a claim that would push a live-channel node past its
+// share to the coldest eligible node. This is the data-layer guarantee that
+// no node can ever claim all/most of the pool, regardless of which binary or
+// external tool issues the claim. p_limit still bounds a single RPC call.
 func (c *Client) claimRPC(rpcName, nodeID string, limit int) ([]ChannelAssignment, error) {
 	body := map[string]interface{}{
 		"p_node_id": nodeID,
@@ -1630,7 +1639,9 @@ func (c *Client) claimRPC(rpcName, nodeID string, limit int) ([]ChannelAssignmen
 // ClaimChannels atomically claims up to `limit` unassigned channels for this
 // node, regardless of is_live. Kept for compatibility; the claim cycle now
 // prefers ClaimOfflineChannels/ClaimLiveChannels so offline budget claims can
-// never sweep live channels.
+// never sweep live channels. The server caps every claim at the node's
+// remaining fair share (see claimRPC) — an oversized limit can never sweep
+// the pool onto one node.
 func (c *Client) ClaimChannels(nodeID string, limit int) ([]ChannelAssignment, error) {
 	return c.claimRPC("claim_channels", nodeID, limit)
 }
@@ -1919,6 +1930,54 @@ func (c *Client) MarkChannelRecording(username, site string) error {
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// TouchChannelRecordings refreshes last_recorded_at for channels this node
+// OWNS but is not actively recording (status stays 'claimed').
+//
+// mark_channel_recording only fires while a channel is actually recording, so
+// last_recorded_at on a claimed channel freezes at the end of its last session
+// and looks stale forever — which hides genuinely dead owners behind noise and
+// makes "how long since this channel last captured" unreadable. This is the
+// owned-but-idle counterpart: it proves the row's owner is alive and the
+// channel is healthy-but-idle, without flipping status back to 'recording' or
+// touching the recording pin (last_heartbeat).
+//
+// Chunks of (username, site) pairs go through the touch_channel_recordings RPC
+// (SECURITY DEFINER — plain anon PATCH is RLS-blocked on channel_assignments).
+// The RPC filters server-side on assigned_node=nodeID AND status='claimed', so
+// a row that was released or reassigned between the caller's read and this
+// call is left untouched (the update simply matches zero rows).
+//
+// Degradation: on PGRST202 (RPC not yet in the PostgREST schema cache, e.g.
+// migration not applied on some projects) the error is swallowed — staleness
+// visibility is best-effort and must never break the assignment-sync cycle.
+func (c *Client) TouchChannelRecordings(nodeID string, channels []ChannelAssignment) error {
+	const chunk = 200
+	for start := 0; start < len(channels); start += chunk {
+		end := start + chunk
+		if end > len(channels) {
+			end = len(channels)
+		}
+		batch := channels[start:end]
+		pairs := make([]map[string]string, len(batch))
+		for i, ca := range batch {
+			pairs[i] = map[string]string{"username": ca.Username, "site": ca.Site}
+		}
+		body := map[string]interface{}{
+			"p_node_id":  nodeID,
+			"p_channels": pairs,
+		}
+		resp, err := c.requestWithRetry("POST", "/rpc/touch_channel_recordings", body)
+		if err != nil {
+			if strings.Contains(err.Error(), "PGRST202") {
+				return nil // RPC not deployed on this project — skip silently
+			}
+			return fmt.Errorf("touch channel recordings: %w", err)
+		}
+		resp.Body.Close()
 	}
 	return nil
 }

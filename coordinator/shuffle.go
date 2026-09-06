@@ -172,6 +172,7 @@ func (c *Coordinator) runAssignmentSyncCycleWith(db *database.Client) {
 	// re-pinned this cycle) are (re)marked — a row that moved to another node
 	// must NOT be refreshed by us, or our heartbeat would make the new owner
 	// look like it is recording and block the re-pin.
+	idleOwned := make([]database.ChannelAssignment, 0)
 	for _, lc := range local {
 		if !dbMap[lc] && !repinned[lc] {
 			continue
@@ -193,6 +194,15 @@ func (c *Coordinator) runAssignmentSyncCycleWith(db *database.Client) {
 				}
 				delete(c.recordingMarked, key)
 			}
+			// Owned but idle: refresh last_recorded_at so the row's "last capture"
+			// timestamp reflects a live owner proving the channel is healthy-idle,
+			// not abandoned. mark_channel_recording only fires while actually
+			// recording, so without this the timestamp freezes at the end of the
+			// last session and staleness is indistinguishable from a dead node.
+			// The RPC is owner-filtered server-side (assigned_node=this node AND
+			// status='claimed'), so a row released or reassigned mid-cycle is left
+			// untouched and this can never pin a channel we no longer own.
+			idleOwned = append(idleOwned, database.ChannelAssignment{Username: lc, Site: site})
 			continue
 		}
 		if err := db.MarkChannelRecording(lc, site); err != nil {
@@ -200,6 +210,15 @@ func (c *Coordinator) runAssignmentSyncCycleWith(db *database.Client) {
 			continue
 		}
 		c.recordingMarked[recMarkKey{site: site, username: lc}] = true
+	}
+
+	// One bulked RPC for the whole owned-idle set instead of a PATCH per
+	// channel — with ~55 claimed rows per node at a 30s sync interval this
+	// keeps the touch to a single request per cycle.
+	if len(idleOwned) > 0 {
+		if err := db.TouchChannelRecordings(c.NodeID, idleOwned); err != nil {
+			log.Printf("[coordinator] assignment-sync: touch owned-idle last_recorded_at error: %v", err)
+		}
 	}
 
 	// Ghost-marker cleanup: a marker this process set whose row moved to another

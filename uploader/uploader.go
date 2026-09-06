@@ -116,6 +116,7 @@ type MultiHostUploader struct {
 	progress      ProgressFunc
 	disabledHosts map[string]bool // hosts disabled for the rest of this run
 	disabledMu    sync.Mutex
+	consecFails   failingHosts // consecutive failures per host -> auto-disable at threshold
 }
 
 // package-level set of upload hosts that must never be attempted this run,
@@ -161,11 +162,56 @@ func (m *MultiHostUploader) DisableHost(name string) {
 	m.disabledHosts[name] = true
 	m.disabledMu.Unlock()
 }
-
 func (m *MultiHostUploader) isHostDisabled(name string) bool {
 	m.disabledMu.Lock()
 	defer m.disabledMu.Unlock()
 	return m.disabledHosts[name]
+}
+
+// recordHostFailure bumps the host's consecutive-failure streak and returns
+// the new count. Failures are only meaningful against OTHER hosts succeeding
+// on the same file — the caller (UploadSelectedWithCallback / priority path)
+// evaluates that separately; here it is a plain streak.
+func (m *MultiHostUploader) recordHostFailure(name string) int {
+	m.disabledMu.Lock()
+	defer m.disabledMu.Unlock()
+	return m.consecFails.recordFailure(name)
+}	// recordHostSuccess resets a host's consecutive-failure streak after a
+// successful upload.
+func (m *MultiHostUploader) recordHostSuccess(name string) {
+	m.disabledMu.Lock()
+	defer m.disabledMu.Unlock()
+	m.consecFails.recordSuccess(name)
+}
+
+// failingHostsThreshold is how many consecutive files a host may fail before
+// it is auto-disabled for the rest of the run. A single failure can be
+// transient (one bad file, one blip) — a host failing several files in a row
+// while every other host succeeds is outages/rate-limits, and re-attempting it
+// on every following file only burns minutes of upload time per file (the
+// seven-day AnonMP4 zero-success stretch burned ~2-6 min/file on 17 nodes).
+const failingHostsThreshold = 3
+
+// failingHosts tracks consecutive failures per host (guarded by disabledMu,
+// shared with the disabledHosts map it feeds). Consecutive = reset to 0 on any
+// success; when a host's streak reaches failingHostsThreshold it is disabled
+// for the rest of the run.
+type failingHosts struct {
+	counts map[string]int
+}
+
+func (f *failingHosts) recordSuccess(name string) {
+	if f.counts != nil {
+		delete(f.counts, name)
+	}
+}
+
+func (f *failingHosts) recordFailure(name string) int {
+	if f.counts == nil {
+		f.counts = map[string]int{}
+	}
+	f.counts[name]++
+	return f.counts[name]
 }
 
 type uploaderFunc func(string, ProgressFunc) (string, error)
@@ -360,9 +406,13 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 				} else if isHostDead(err) {
 					m.log.Error("upload: %s is permanently unreachable — disabling it for the rest of this run", host)
 					m.DisableHost(host)
+				} else if n := m.recordHostFailure(host); n >= failingHostsThreshold {
+					m.log.Error("upload: %s failed %d files in a row — disabling it for the rest of this run", host, n)
+					m.DisableHost(host)
 				}
 			} else {
 				m.log.Info("upload: %s successful for %s: %s", host, filePath, link)
+				m.recordHostSuccess(host)
 				if onHost != nil {
 					onHost(host, link)
 				}
@@ -420,9 +470,13 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 			} else if isHostDead(err) {
 				m.log.Error("upload: %s is permanently unreachable — disabling it for the rest of this run", host)
 				m.DisableHost(host)
+			} else if n := m.recordHostFailure(host); n >= failingHostsThreshold {
+				m.log.Error("upload: %s failed %d files in a row — disabling it for the rest of this run", host, n)
+				m.DisableHost(host)
 			}
 		} else {
 			m.log.Info("upload: %s (priority) successful for %s: %s", host, filePath, link)
+			m.recordHostSuccess(host)
 		}
 	}
 

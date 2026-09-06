@@ -48,6 +48,20 @@ func TestAnonMP4ChunkedUploadFlow(t *testing.T) {
 		mu.Lock()
 		gotChunks[idx] = r.Header.Get("Content-Range")
 		mu.Unlock()
+		// Mirror the real Worker: 201 Created with a plain-text cumulative
+		// bytes-received ack ("0-<received-1>/<total>"), not JSON. Compute the
+		// running total from the echoed Content-Range header; the final chunk
+		// answers 200 once everything is assembled.
+		var total int64
+		if n, err := fmt.Sscanf(r.Header.Get("Content-Range"), "bytes %*d-%*d/%d", &total); err == nil && n == 1 && total > 0 {
+			received := int64(idx) * anonmp4ChunkSize
+			if received > total {
+				received = total
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, "0-%d/%d", received-1, total)
+			return
+		}
 		fmt.Fprint(w, `{"status":"ok"}`)
 	}))
 	defer nodeSrv.Close()
@@ -114,6 +128,52 @@ func TestAnonMP4ChunkedUploadFlow(t *testing.T) {
 	}
 	if maxReport != int64(len(data)) {
 		t.Errorf("max progress = %d, want %d", maxReport, len(data))
+	}
+}
+
+// TestAnonMP4Chunk201AckAccepted is the regression test for the seven-day
+// fleet-wide AnonMP4 outage: the upload Worker answers 201 Created with a
+// plain-text cumulative bytes-received ack ("0-2097151/6291456") for every
+// non-final chunk. That response used to be parsed as an error
+// ("chunk 1/903 failed: HTTP 201: 0-10485759/1893599352") and every upload
+// died on its first chunk. The chunk must be accepted and the upload succeed.
+func TestAnonMP4Chunk201AckAccepted(t *testing.T) {		nodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var total int64
+			if n, _ := fmt.Sscanf(r.Header.Get("Content-Range"), "bytes %d-%d/%d", new(int), new(int), &total); n != 3 || total <= 0 {
+				t.Errorf("bad Content-Range: %q", r.Header.Get("Content-Range"))
+			}
+		// 201 on every chunk — the real Worker only switches to 200 on the
+		// final one, and 201 alone must never be a failure.
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, "0-%d/%d", total-1, total)
+	}))
+	defer nodeSrv.Close()
+
+	siteSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/get-upload-node":
+			fmt.Fprintf(w, `{"status":true,"node_id":"n1","upload_url":%q,"node_token":"tok"}`, nodeSrv.URL)
+		case "/get-video-node":
+			fmt.Fprint(w, `{"success":true,"video_id":"v1","embed_url":"https://anonmp4.to/embed/v1"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer siteSrv.Close()
+
+	oldBase := anonmp4SiteBase
+	anonmp4SiteBase = siteSrv.URL
+	defer func() { anonmp4SiteBase = oldBase }()
+
+	// One chunk only, so the test isolates the 201-ack handling.
+	file := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(file, make([]byte, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewAnonMP4Uploader().Upload(file)
+	if err != nil {
+		t.Fatalf("201-ack chunk upload must succeed, got: %v", err)
 	}
 }
 

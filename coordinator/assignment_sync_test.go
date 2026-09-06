@@ -327,6 +327,49 @@ func TestAssignmentSyncMarksRecordingOwnedChannel(t *testing.T) {
 	}
 }
 
+// TestAssignmentSyncTouchesIdleOwnedChannels: channels assigned to us that are
+// locally present but NOT recording must be refreshed via the
+// touch_channel_recordings RPC (last_recorded_at visibility for healthy-idle
+// rows). Channels no longer assigned to this node must NOT be touched, and
+// actively recording channels go through mark_channel_recording instead.
+func TestAssignmentSyncTouchesIdleOwnedChannels(t *testing.T) {
+	fake := &fakeSyncDB{
+		nodeAssignments: []database.ChannelAssignment{
+			{Username: "X", Site: "chaturbate", AssignedNode: "node-a", Status: "recording"},
+			{Username: "Y", Site: "chaturbate", AssignedNode: "node-a", Status: "claimed"},
+		},
+	}
+	client := newFakeSyncClient(t, fake)
+
+	stub := newSyncChanStub()
+	stub.local["X"] = &syncChannelState{site: "chaturbate", recording: true}
+	stub.local["Y"] = &syncChannelState{site: "chaturbate", recording: false}
+	stub.local["Z"] = &syncChannelState{site: "chaturbate", recording: false} // not assigned to us
+
+	coord := &Coordinator{NodeID: "node-a", Manager: stub, Client: client, recordingMarked: map[recMarkKey]bool{}}
+	coord.runAssignmentSyncCycleWith(client)
+
+	// Y is owned + idle → the touch payload must carry Y (and only Y).
+	touch := fake.record("POST", "/rpc/touch_channel_recordings", `"p_node_id":"node-a"`)
+	if touch == nil {
+		t.Fatalf("expected owned-idle channel Y to be touched; requests=%+v", fake.reqs)
+	}
+	if !strings.Contains(touch.body, `"username":"Y"`) {
+		t.Fatalf("touch payload must include idle-owned Y: %s", touch.body)
+	}
+	// Z is not assigned to us → must never be touched.
+	if strings.Contains(touch.body, `"username":"Z"`) {
+		t.Fatalf("touch payload must NOT include unassigned Z: %s", touch.body)
+	}
+	// X is actively recording → mark path, not the idle touch.
+	if fake.record("POST", "/rpc/mark_channel_recording", `"p_username":"X"`) == nil {
+		t.Fatalf("recording channel X must be marked via mark_channel_recording")
+	}
+	if strings.Contains(touch.body, `"username":"X"`) {
+		t.Fatalf("recording channel X must not go through the idle touch: %s", touch.body)
+	}
+}
+
 // TestAssignmentSyncClearsGhostMarkerMovedAway: this node marked G 'recording'
 // earlier, but the row moved to node-b while the re-pin could not run (DB
 // unreachable — the same wedge that let the lease reset move the row). G is no

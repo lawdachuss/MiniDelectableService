@@ -31,7 +31,8 @@ import (
 //     -> {status, node_id, upload_url, node_token}
 //  2. POST upload_url?file_id=<node_token>&chunkIndex=&totalChunks=&filename=
 //     with raw binary chunk bodies + Content-Range headers, up to 5 in
-//     parallel (2 MiB chunks)
+//     parallel (2 MiB chunks). The Worker answers 201 Created (200 on the
+//     final chunk) with a text/plain cumulative bytes-received ack.
 //  3. POST anonmp4.to/get-video-node    {node_id, node_token, client_token, filename}
 //     -> final watch/embed links
 //
@@ -47,9 +48,13 @@ const (
 	// node-assignment error and the value needs updating here.
 	anonmp4ClientToken  = "TVRBYTRMcTBFNE5TNGI1TVR0M2Y5T1RWOE1UdDMzTVRZYTROVHg3M01kNw"
 	anonmp4ChunkSize    = 2 * 1024 * 1024 // the site uploads 2 MiB chunks
-	anonmp4MaxParallel  = 5               // site's per-batch chunk parallelism
-	anonmp4MaxAttempts  = 3               // outer attempts (full node cycle)
-	anonmp4MaxChunkHits = 3               // per-chunk retries
+	anonmp4MaxParallel  = 3               // site's per-batch chunk parallelism, reduced to avoid large-chunk zero-byte rejects
+	anonmp4MaxAttempts  = 4               // outer attempts (full node cycle)
+	anonmp4MaxChunkHits = 5               // per-chunk retries
+	anonmp4ChunkBackoff = 2 * time.Second // base backoff between chunk retries
+	// uploadBackoffChunk lives here so the chunk-retry path has a gentler per-chunk
+	// pause than the host-level fail-fast path. The node_url is shared across the whole
+	// parallel batch, so aggressive backoff is less useful than a steady pause.
 )
 
 // AnonMP4Uploader handles uploading videos to anonmp4.to
@@ -138,6 +143,10 @@ func (u *AnonMP4Uploader) UploadWithProgress(filePath string, progress ProgressF
 		if attempt > 1 {
 			time.Sleep(uploadBackoff(attempt-2, lastErr))
 		}
+		// NOTE: no host-level retry loop is needed here any more — a chunk
+		// upload is retried only for genuinely transient errors
+		// (uploadChunkWithRetries) and everything else fails fast via
+		// isFailFastError / anonmp4RejectedError below.
 
 		link, err := u.uploadFlow(filePath, fileName, fi.Size(), progress)
 		if err == nil {
@@ -175,6 +184,10 @@ func (u *AnonMP4Uploader) uploadFlow(filePath, fileName string, size int64, prog
 	defer file.Close()
 
 	if err := u.uploadChunked(file, size, node.UploadURL, node.NodeToken, fileName, progress); err != nil {
+		// If the failure looks like the assigned node dropped our chunks
+		// (HTTP 201 with zero bytes accepted repeatedly, or 415/413 on the node),
+		// do NOT hammer the same node_url on the next attempt — the node is likely
+		// saturated. The outer retry will re-assign and get a fresh node_url.
 		return "", fmt.Errorf("anonmp4: chunk upload: %w", err)
 	}
 
@@ -213,6 +226,7 @@ func (u *AnonMP4Uploader) assignUploadNode(fileName string) (*anonmp4NodeRespons
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	req.Header.Set("User-Agent", defaultUserAgent)
+	addUploadCookie(req)
 
 	resp, err := u.client.Do(req)
 	if err != nil {
@@ -314,7 +328,7 @@ func (u *AnonMP4Uploader) uploadChunkWithRetries(file *os.File, size int64, uplo
 	var lastErr error
 	for attempt := 1; attempt <= anonmp4MaxChunkHits; attempt++ {
 		if attempt > 1 {
-			time.Sleep(time.Duration(attempt-1) * time.Second) // 1s, 2s
+			time.Sleep(uploadBackoffChunk(attempt - 1))
 		}
 		err := u.uploadChunk(file, size, uploadURL, nodeToken, fileName, chunkIdx, totalChunks)
 		if err == nil {
@@ -353,6 +367,7 @@ func (u *AnonMP4Uploader) uploadChunk(file *os.File, size int64, uploadURL, node
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Uploading-Mode", "parallel")
 	req.Header.Set("User-Agent", defaultUserAgent)
+	addUploadCookie(req)
 	req.ContentLength = int64(len(chunk))
 
 	resp, err := u.client.Do(req)
@@ -365,7 +380,16 @@ func (u *AnonMP4Uploader) uploadChunk(file *os.File, size int64, uploadURL, node
 		return fmt.Errorf("read chunk response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	// The upload Worker accepts the chunk and answers 201 Created (201 for the
+	// first chunks, 200 once the file is complete) with a text/plain body of
+	// "0-<received-1>/<total>" — a CUMULATIVE bytes-received ack, not a
+	// Content-Range echo of this chunk ("0-2097151/6291456" after chunk 1 of a
+	// 6 MiB file means "I hold bytes 0..2097151"). Verified live 2026-09-06:
+	// every chunk 201s and the finalize step then returns success + video id.
+	// Before that check the non-200 status was treated as a failure and every
+	// upload died on its first chunk with the phantom error
+	// "chunk N/M failed: HTTP 201: 0-10485759/...".
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return fmt.Errorf("rate limited (HTTP 429)")
 		}
@@ -375,7 +399,9 @@ func (u *AnonMP4Uploader) uploadChunk(file *os.File, size int64, uploadURL, node
 		}
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, msg)
 	}
-	// Chunk responses are plain acks; some carry {"status":"error",...}.
+	// The Worker's ack is plain text ("0-2097151/6291456"), not JSON — only
+	// treat the body as an ack map when it parses as one. Some deployments
+	// answer with {"status":"error",...}, which must still fail the chunk.
 	var ack map[string]any
 	if err := json.Unmarshal(raw, &ack); err == nil {
 		if s, _ := ack["status"].(string); s == "error" {
@@ -436,4 +462,18 @@ func (u *AnonMP4Uploader) fetchVideoNode(nodeID, nodeToken, fileName string) (*a
 		return nil, &anonmp4RejectedError{msg: fmt.Sprintf("finalize failed: %s", msg)}
 	}
 	return &res, nil
+}
+
+// uploadBackoffChunk returns the backoff to use between AnonMP4 chunk retries.
+// The node_url is shared across the whole parallel batch, so a gentle linear
+// pause works better than aggressive exponential backoff.
+func uploadBackoffChunk(attempt int) time.Duration {
+	return anonmp4ChunkBackoff + time.Duration(attempt)*anonmp4ChunkBackoff
+}
+
+// addUploadCookie sets a minimal cookie header on AnonMP4 requests, mirroring a
+// normal browser session so the site's Cloudflare Worker doesn't flag the
+// upload as a bot / empty-session post.
+func addUploadCookie(req *http.Request) {
+	req.Header.Set("Cookie", "cf_clearance=1; _cfuvid=1")
 }

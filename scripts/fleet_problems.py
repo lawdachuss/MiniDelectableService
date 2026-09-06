@@ -220,6 +220,65 @@ def disk_anomaly(sql):
     )
 
 
+def stale_claimed_assignments(sql, cutoff):
+    """Claimed (owned-but-idle) channel rows whose last_recorded_at is older
+    than the cutoff, grouped per owning node.
+
+    A claimed row's last_recorded_at is refreshed every ~30s by the node's
+    assignment-sync touch loop (touch_channel_recordings RPC) once the new
+    binary is rolled out — so a STALE timestamp means either:
+      * owner node heartbeats are fresh  -> touch loop not deployed/broken on
+        that node (visibility gap, not an outage), or
+      * owner node heartbeat is ALSO stale -> the node is genuinely dead and
+        its channels need reclaiming (use node_health / GetDeadNodes).
+    Rows with status='recording' are excluded: those refresh via
+    mark_channel_recording while actively capturing.
+    """
+    return sql(
+        "select ca.assigned_node as node_id, "
+        "count(*) as stale_rows, "
+        "max(now() - ca.last_recorded_at) as oldest_age, "
+        "n.status as node_status, "
+        "n.last_heartbeat as node_hb, "
+        "(now() - n.last_heartbeat) as node_hb_age "
+        "from channel_assignments ca "
+        "left join nodes n on n.node_id = ca.assigned_node "
+        "where ca.status = 'claimed' "
+        "and (ca.last_recorded_at is null or ca.last_recorded_at < '" + cutoff + "') "
+        "group by ca.assigned_node, n.status, n.last_heartbeat "
+        "order by stale_rows desc"
+    )
+
+
+# ---------------------------------------------------------------- helpers
+
+def _interval_seconds(val):
+    """Best-effort conversion of a Postgres interval (arriving as a string like
+    '00:00:15.9' or '1 day, 02:03:04' from /pg/query) into total seconds.
+    Returns None when it cannot be parsed."""
+    if val is None:
+        return None
+    if hasattr(val, "total_seconds"):
+        return val.total_seconds()
+    text = str(val).replace(" ", "")
+    days = 0
+    if "," in text:
+        d, text = text.split(",", 1)
+        try:
+            days = int(d.rstrip("day"))
+        except ValueError:
+            return None
+    parts = text.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        h, m = int(parts[0]), int(parts[1])
+        s = float(parts[2])
+    except ValueError:
+        return None
+    return days * 86400 + h * 3600 + m * 60 + s
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -279,6 +338,12 @@ def main():
         out["disk"] = disk_anomaly(sql)
     except Exception as e:
         out["disk"] = f"error: {e}"
+
+    # 9. Claimed rows with stale last_recorded_at (>30 min)
+    try:
+        out["stale_claimed"] = stale_claimed_assignments(sql, cutoff)
+    except Exception as e:
+        out["stale_claimed"] = f"error: {e}"
 
     # 4b. Sample upload failure messages (top failing hosts)
     try:
@@ -357,6 +422,25 @@ def main():
             print(f"  {d['node_id']:<9} use%={d['percent_used']} free={d['free_bytes']} total={d['total_bytes']} at={d['recorded_at']}")
     else:
         print(" ", out["disk"])
+
+    print(f"\n=== Claimed rows with stale last_recorded_at (>30 min) ===")
+    sc = out.get("stale_claimed")
+    if isinstance(sc, list):
+        if not sc:
+            print("  none — every claimed row was touched within the last 30 min")
+        for r in sc:
+            node = r["node_id"] or "NULL(orphaned)"
+            hb_age = str(r["node_hb_age"])[:9] if r["node_hb_age"] is not None else "?"
+            status = (r["node_status"] or "?")[:8]
+            hb_secs = _interval_seconds(r["node_hb_age"])
+            if hb_secs is not None and hb_secs < 180 and status.startswith("online"):
+                verdict = "touch loop NOT deployed/broken on this node (node looks alive)"
+            else:
+                verdict = "node likely DEAD — reclaim its channels"
+            print(f"  {node:<9} stale_rows={r['stale_rows']:<5} oldest={str(r['oldest_age'])[:9]:<10} "
+                  f"node_status={status:<9} node_hb_age={hb_age:<10} -> {verdict}")
+    else:
+        print(" ", sc)
 
 
 if __name__ == "__main__":
