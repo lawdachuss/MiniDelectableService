@@ -71,6 +71,8 @@ func (s *stubManager) IsFileUploadInFlight(filePath string) bool {
 }
 func (s *stubManager) ActiveRecordingFiles() []string     { return nil }
 func (s *stubManager) SessionInfo() (time.Duration, bool) { return 0, false }
+
+func (s *stubManager) IsProcessingSession() bool { return false }
 func (s *stubManager) TriggerSessionStop()                {}
 func (s *stubManager) UploadEntries() *entity.UploadsResponse {
 	return &entity.UploadsResponse{}

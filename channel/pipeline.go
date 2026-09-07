@@ -976,16 +976,17 @@ func (pq *PipelineQueue) QueuedEntries() []entity.PendingEntry {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	entries := make([]entity.PendingEntry, 0, len(pq.pipelines))
-	for _, p := range pq.pipelines {
-		entries = append(entries, entity.PendingEntry{
-			Channel:  p.Username,
-			Filename: p.Filename,
-			Stage:    p.CurrentStage.String(),
-			Failed:   p.Failed,
-			Error:    p.LastError,
-		})
-	}
-	return entries
+for _, p := range pq.pipelines {
+			entries = append(entries, entity.PendingEntry{
+				Channel:  p.Username,
+				Filename: p.Filename,
+				Stage:    p.CurrentStage.String(),
+				Failed:   p.Failed,
+				Error:    p.LastError,
+				Size:     p.FileSize,
+			})
+		}
+		return entries
 }
 
 // HistoryEntries returns the recent pipeline history.
@@ -1089,6 +1090,7 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 				Stage:    stageStr,
 				Failed:   p.Failed,
 				Error:    p.LastError,
+				Size:     p.FileSize,
 			})
 		}
 	}()

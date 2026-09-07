@@ -247,6 +247,15 @@ func (fw *FileWatcher) processFile(filePath string) {
 			log.Printf("[watcher] %s already fully uploaded; keeping local copy", base)
 			return
 		}
+		// Only drop the local copy when the THUMBNAIL exists: the video is
+		// already safe on the hosts, but deleting the source of a recording
+		// whose thumbnail never landed makes the thumbnail un-recoverable
+		// forever (thumbnail generation needs the local video).  Leave the
+		// file for the periodic ScanThumbnails pass to retry generation.
+		if !channel.ThumbnailExists(filePath) {
+			log.Printf("[watcher] %s already fully uploaded but thumbnail missing — keeping local copy for thumbnail retry", base)
+			return
+		}
 		log.Printf("[watcher] %s already fully uploaded — removing local copy", base)
 		os.Remove(filePath)
 		channel.DeleteSidecarFiles(filePath)

@@ -574,7 +574,9 @@ func (ch *Channel) runFFmpegFinalizer(filename string) (string, error) {
 	}
 
 	ch.Info("running ffmpeg %s for `%s`", server.Config.FinalizeMode, filepath.Base(filename))
-	config.AcquireFFmpegHeavy()
+	if err := config.AcquireFFmpegHeavyFor(config.FFmpegHeavyAcquireTimeout); err != nil {
+		return "", fmt.Errorf("could not acquire ffmpeg slot to finalize: %w", err)
+	}
 	defer config.ReleaseFFmpegHeavy()
 
 	// Attempt 1: strict finalization.  A truncated tail (the last fragment
@@ -1033,8 +1035,12 @@ func CleanupOrphanedFiles() {
 				thumbURL := thumb.ThumbURL
 				spriteURL := thumb.SpriteURL
 				previewURL := thumb.PreviewURL
-				UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
-				DeleteSidecarFiles(info.path)
+				// Keep sidecars unless the upload fully completed: a deferred
+				// save (missing thumbnail) or failed upload leaves everything
+				// for the next scan's retry.
+				if UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL) {
+					DeleteSidecarFiles(info.path)
+				}
 				_ = stem
 			}()
 		}
@@ -1059,9 +1065,14 @@ func CleanupOrphanedFiles() {
 					thumbURL := thumb.ThumbURL
 					spriteURL := thumb.SpriteURL
 					previewURL := thumb.PreviewURL
-					UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL)
+					// Keep the local file unless the upload fully completed: a
+					// deferred save (missing thumbnail) or failed upload must
+					// leave the source for the next scan's retry.
+					if UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL) {
+						DeleteSidecarFiles(vInfo.path)
+						_ = os.Remove(vInfo.path)
+					}
 				}
-				DeleteSidecarFiles(vInfo.path)
 				continue
 			}
 
@@ -1082,14 +1093,19 @@ func CleanupOrphanedFiles() {
 					recoveryLogf(vInfo.name, "recovery: mux failed for %s: %v — uploading video-only", stem, err)
 					// Fall back to uploading just the video track
 					if !MaybeDeferToPending(vInfo.path) && !IsUploadInFlight(vInfo.path) {
-						thumb := GenerateThumbnailForFile(vInfo.path)
-						thumbURL := thumb.ThumbURL
-						spriteURL := thumb.SpriteURL
-						previewURL := thumb.PreviewURL
-						UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL)
+					thumb := GenerateThumbnailForFile(vInfo.path)
+					thumbURL := thumb.ThumbURL
+					spriteURL := thumb.SpriteURL
+					previewURL := thumb.PreviewURL
+					// Keep the local file unless the upload fully completed: a
+					// deferred save (missing thumbnail) or failed upload must
+					// leave the source for the next scan's retry.
+					if UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL) {
+						DeleteSidecarFiles(vInfo.path)
+						_ = os.Remove(vInfo.path)
 					}
-					DeleteSidecarFiles(vInfo.path)
-					return
+				}
+				return
 				}
 
 				// Delete source sidecars
@@ -1112,9 +1128,13 @@ func CleanupOrphanedFiles() {
 				thumbURL := thumb.ThumbURL
 				spriteURL := thumb.SpriteURL
 				previewURL := thumb.PreviewURL
-				UploadOrphanedFile(muxedPath, thumbURL, spriteURL, previewURL)
-				DeleteSidecarFiles(muxedPath)
-				os.Remove(muxedPath)
+				// Only drop the muxed output when the upload fully completed —
+				// a deferred save (missing thumbnail) or failed upload leaves
+				// it for the next scan instead of losing the just-muxed file.
+				if UploadOrphanedFile(muxedPath, thumbURL, spriteURL, previewURL) {
+					DeleteSidecarFiles(muxedPath)
+					_ = os.Remove(muxedPath)
+				}
 			}()
 		}
 
@@ -1193,14 +1213,17 @@ func CleanupOrphanedFiles() {
 			thumbURL := thumb.ThumbURL
 			spriteURL := thumb.SpriteURL
 			previewURL := thumb.PreviewURL
-			UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
-			DeleteSidecarFiles(info.path)
+			// Keep sidecars unless the upload fully completed (same rule as
+			// above: deferred saves and failed uploads retry on the next scan).
+			if UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL) {
+				DeleteSidecarFiles(info.path)
+			}
 			_ = stem
 		}
 
 		// Process any pending segments (short videos awaiting merge).
 		// Pending segments are stored under .pending/{username}/.
-		processAllPendingSegments()
+		processAllPendingSegments(false)
 
 		// Clean up orphaned sidecar files whose main video no longer exists
 		sidecarExts := []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".preview.mp4", ".thumb", ".sprite"}
@@ -1600,8 +1623,17 @@ func uploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string, thumbM
 			// Supabase outage).  Recover the metadata from the local journal's
 			// stored links instead of re-uploading, which would duplicate the
 			// video on every host.
-			if recoverOrphanMetadataFromJournal(filePath, filename, fileHash) {
+			//
+			// Tri-state: false can mean "stale journal" (nothing recoverable —
+			// clear the journal and re-upload) OR "thumbnail still missing"
+			// (journal is GOOD — never clear it, that would trigger a wasteful
+			// duplicate re-upload to every host).  Distinguish via the flag so
+			// a thumbnail-defer leaves the journal intact for the next scan.
+			if ok, journalGood := recoverOrphanMetadataFromJournal(filePath, filename, fileHash); ok {
 				return true
+			} else if journalGood {
+				recoveryLogf(filename, "recovery deferred: thumbnail still missing — journal kept, file kept for thumbnail retry")
+				return false
 			}
 			recoveryLogf(filename, "stale journal has no Supabase recording and no recoverable links; clearing journal and re-uploading")
 			if fileHash != "" {
@@ -1669,6 +1701,36 @@ func uploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string, thumbM
 				embedURL = embedURLFromLink(r.Host, r.DownloadLink)
 			}
 		}
+	}
+
+	// Thumbnail gate (mirrors the pipeline's stageSaveMetadata rule): never
+	// persist a recording row whose THUMBNAIL is missing while the local
+	// source could still produce one.  A NULL-thumbnail row that outlives the
+	// file can never be repaired — ScanThumbnails needs the local video — so
+	// retry generation once here and, if it still fails, defer the whole
+	// save: the journal keeps every host's completion, the file stays on
+	// disk, and the next orphan scan resumes via the journal-recovery path
+	// (which regenerates and saves).  Returning false tells callers to keep
+	// the local copy.
+	// Placed AFTER the all-hosts-failed early return: when the video itself
+	// failed to upload there is nothing to save yet, and burning an ffmpeg
+	// generation pass (up to the 3-hour asset timeout) would only stall the
+	// retry loop.
+	if thumbMustExist && thumbURL == "" && len(links) > 0 {
+		recoveryLogf(filename, "thumbnail missing before metadata save — regenerating once")
+		thumb := GenerateThumbnailForFile(filePath)
+		if thumb.ThumbURL != "" {
+			thumbURL = thumb.ThumbURL
+			spriteURL = thumb.SpriteURL
+			previewURL = thumb.PreviewURL
+			if err := server.SavePreviewLinks(filename, thumbURL, spriteURL, previewURL, thumb.ThumbMirrors, thumb.SpriteMirrors, thumb.PreviewMirrors); err != nil {
+				recoveryLogf(filename, "could not save preview links: %v", err)
+			}
+		}
+	}
+	if thumbMustExist && thumbURL == "" && len(links) > 0 {
+		recoveryLogf(filename, "thumbnail generation failed — deferring metadata save, keeping file for thumbnail retry")
+		return false
 	}
 
 	if err != nil {
@@ -1756,13 +1818,55 @@ func saveOrphanMetadataAndCleanup(filePath, filename, fileHash, embedURL string,
 // save.  The file was already fully uploaded (all hosts recorded as success in
 // the journal), so we persist the stored links instead of re-uploading — which
 // would duplicate the video on every host.
-func recoverOrphanMetadataFromJournal(filePath, filename, fileHash string) bool {
+//
+// Thumbnails: the journal stores links only, so the saved row would otherwise
+// have a NULL thumbnail_url (the exact bug that stranded thumbnail-less rows —
+// e.g. nicolle_mitchelle 2026-09-05, eve_kiwi100/liaglamour/terrryliq earlier
+// — with no preview_images row and no way back once the local file was
+// deleted).  We reuse any thumbnail already stored in preview_images, else
+// generate one now from the local file, and save it to preview_images so the
+// periodic thumb-sync copies it onto the recordings row.  When generation
+// fails, the save is DEFERRED: the local file and journal stay and the next
+// scan retries — a NULL-thumbnail row that outlives the file can never be
+// repaired.
+//
+// Returns (true, _) when the metadata was saved (or intentionally skipped),
+// (false, false) when the journal is stale/unrecoverable and the caller may
+// clear it, and (false, true) when the journal is valid but the save was
+// deferred on thumbnail generation — the caller must keep the journal.
+func recoverOrphanMetadataFromJournal(filePath, filename, fileHash string) (bool, bool) {
 	if fileHash == "" {
-		return false
+		return false, false
 	}
 	links := server.LoadJournalLinks(fileHash)
 	if len(links) == 0 {
-		return false
+		return false, false
+	}
+
+	// Reuse an already-stored thumbnail before spending an ffmpeg+upload pass:
+	// preview_images is the authoritative store the pipeline and ScanThumbnails
+	// write, the recordings row is checked too (it may hold a thumb even when
+	// preview_images lost its row).
+	thumbURL, spriteURL, previewURL := server.LoadPreviewLinks(filename)
+	if thumbURL == "" {
+		if t, s, p := server.LoadRecordingThumbnails(filename); t != "" {
+			thumbURL, spriteURL, previewURL = t, s, p
+		}
+	}
+	if thumbURL == "" {
+		recoveryLogf(filename, "recovery: no stored thumbnail — generating from local file")
+		thumb := GenerateThumbnailForFile(filePath)
+		thumbURL = thumb.ThumbURL
+		spriteURL = thumb.SpriteURL
+		previewURL = thumb.PreviewURL
+		if thumbURL == "" {
+			// Keep file + journal; the next orphan scan retries this recovery.
+			recoveryLogf(filename, "recovery: thumbnail generation failed — deferring metadata save, keeping file for thumbnail retry")
+			return false, true
+		}
+		if err := server.SavePreviewLinks(filename, thumbURL, spriteURL, previewURL, thumb.ThumbMirrors, thumb.SpriteMirrors, thumb.PreviewMirrors); err != nil {
+			recoveryLogf(filename, "recovery: could not save preview links: %v", err)
+		}
 	}
 
 	stat, _ := os.Stat(filePath)
@@ -1787,7 +1891,7 @@ func recoverOrphanMetadataFromJournal(filePath, filename, fileHash string) bool 
 	}
 
 	recoveryLogf(filename, "recovery: restoring metadata for fully-uploaded file from journal (%d hosts)", len(links))
-	return saveOrphanMetadataAndCleanup(filePath, filename, fileHash, embedURL, filesize, dur, timestamp, "", "", "", links, true)
+	return saveOrphanMetadataAndCleanup(filePath, filename, fileHash, embedURL, filesize, dur, timestamp, thumbURL, spriteURL, previewURL, links, true), true
 }
 
 // pendingSegmentsDir returns the directory where short video segments are stored
@@ -2048,16 +2152,23 @@ func IsUnreadableVideo(videoPath string) bool {
 // VideoDurationSeconds probes the duration of a video file using ffprobe, falling back
 // to parsing ffmpeg's "Duration:" stderr output when ffprobe fails.
 func VideoDurationSeconds(videoPath string) (float64, error) {
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer probeCancel()
-	config.AcquireFFmpeg()
-	defer config.ReleaseFFmpeg()
-	out, err := config.FFprobeCommandContext(probeCtx,
-		"-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		videoPath,
-	).Output()
+	var out []byte
+	var err error
+	doProbe := func() {
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer probeCancel()
+		out, err = config.FFprobeCommandContext(probeCtx,
+			"-v", "error",
+			"-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1",
+			videoPath,
+		).Output()
+	}
+	if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+		return 0, fmt.Errorf("could not acquire ffmpeg slot to probe: %w", err)
+	}
+	doProbe()
+	config.ReleaseFFmpeg()
 	if err == nil {
 		dur, parseErr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
 		if parseErr == nil {
@@ -2156,7 +2267,9 @@ func mergeVideos(inputs []string, outputPath string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	config.AcquireFFmpegHeavy()
+	if err := config.AcquireFFmpegHeavyFor(config.FFmpegHeavyAcquireTimeout); err != nil {
+		return err
+	}
 	defer config.ReleaseFFmpegHeavy()
 
 	// ── Phase 1: Fast stream-copy concat ────────────────────────────────
@@ -2555,11 +2668,21 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath, endReason string) bool {
 	return true // video was deferred to pending (or merged+uploaded)
 }
 
+// FlushPendingSegmentsAtBoundary merges/uploads any short segments parked in
+// .pending after a session drain. force=true (the FINAL drain before a runner
+// is torn down, or a graceful StopSession) uploads sub-threshold residual
+// segments instead of deleting or re-parking them — a short clip uploaded
+// beats content lost forever with the VM.
+func FlushPendingSegmentsAtBoundary(force bool) {
+	processAllPendingSegments(force)
+}
+
 // processAllPendingSegments scans all .pending/* subdirectories and processes any
 // accumulated segments.  If segments exist they are merged together and uploaded.
 // This is called during startup orphan cleanup so short segments from a previous
-// run don't stay pending forever when no new recording arrives.
-func processAllPendingSegments() {
+// run don't stay pending forever when no new recording arrives, and again after
+// every session drain (force=true on the final drain before VM teardown).
+func processAllPendingSegments(force bool) {
 	// Scan exactly the pending root the min-duration system actually uses:
 	// pendingSegmentsDir resolves to OutputDir/.pending when OutputDir is set,
 	// otherwise "videos/.pending".  Scanning BOTH roots (as an older version
@@ -2578,7 +2701,7 @@ func processAllPendingSegments() {
 		if !ud.IsDir() {
 			continue
 		}
-		processPendingUserSegments(ud.Name())
+		processPendingUserSegments(ud.Name(), force)
 	}
 }
 
@@ -2588,7 +2711,8 @@ func processAllPendingSegments() {
 // so it can never run concurrently with handleMinDurationAndMerge on the same
 // segments — that concurrency previously let both flows renameOverwriting the
 // shared stable merged-* name out from under each other's upload.
-func processPendingUserSegments(username string) {
+// force=true uploads sub-threshold residual segments (final drain).
+func processPendingUserSegments(username string, force bool) {
 	mmu := mergeMu(username)
 	mmu.Lock()
 	defer mmu.Unlock()
@@ -2613,11 +2737,15 @@ func processPendingUserSegments(username string) {
 	// extended by newer recordings within pendingMaxAge means the stream is
 	// not coming back — keeping it would leak disk forever with no upload
 	// ever possible.  Delete it outright.
-	deleteStalePendingSegments(pendingSegmentsDir(username))
-	segments = collectPendingSegmentsInDir(pendingSegmentsDir(username))
-	if len(segments) < 1 {
-		mu.Unlock()
-		return
+	// On the final drain (force) we never delete: everything uploads, so the
+	// pending dir is emptied by the upload path below, not by age.
+	if !force {
+		deleteStalePendingSegments(pendingSegmentsDir(username))
+		segments = collectPendingSegmentsInDir(pendingSegmentsDir(username))
+		if len(segments) < 1 {
+			mu.Unlock()
+			return
+		}
 	}
 
 	// Quarantine corrupt segments so they can never poison a merge.
@@ -2663,11 +2791,16 @@ func processPendingUserSegments(username string) {
 
 	// A single remaining segment can still be uploaded if it alone meets
 	// the threshold (e.g. all other segments were quarantined as corrupt).
+	// On the final drain (force) upload it regardless of duration.
 	if len(segCopy) == 1 {
 		if !IsUploadInFlight(segCopy[0]) {
 			singleDur, dErr := VideoDurationSeconds(segCopy[0])
-			if dErr == nil && singleDur >= float64(minDur) {
-				recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (>= %ds) — uploading", singleDur, minDur)
+			if dErr == nil && (force || singleDur >= float64(minDur)) {
+				if force && singleDur < float64(minDur) {
+					recoveryLogf(segCopy[0], "recovery: final drain — single pending segment = %.1fs, uploading (below threshold allowed)", singleDur)
+				} else {
+					recoveryLogf(segCopy[0], "recovery: single pending segment = %.1fs (>= %ds) — uploading", singleDur, minDur)
+				}
 				thumb := GenerateThumbnailForFile(segCopy[0])
 				thumbURL := thumb.ThumbURL
 				spriteURL := thumb.SpriteURL
@@ -2700,7 +2833,7 @@ func processPendingUserSegments(username string) {
 	}
 
 	mergedDur, durErr := VideoDurationSeconds(mergedPath)
-	if durErr != nil || mergedDur < float64(minDur) {
+	if durErr != nil || (!force && mergedDur < float64(minDur)) {
 		// Keep pending under the stable name so the next merge dedupes it.
 		// Consume the inputs first: a crash between the removal and the rename
 		// leaves a sole scratch that recoverMergeScratch finalizes.
@@ -2726,7 +2859,7 @@ func processPendingUserSegments(username string) {
 			totalInputDur += d
 		}
 	}
-	if totalInputDur > 0 && mergedDur < totalInputDur*0.5 {
+	if totalInputDur > 0 && !force && mergedDur < totalInputDur*0.5 {
 		// Keep pending under the stable name too.  Remove the inputs first so
 		// a crash here leaves a sole scratch that recoverMergeScratch
 		// finalizes.
@@ -2748,7 +2881,11 @@ func processPendingUserSegments(username string) {
 		os.Remove(s)
 	}
 	mu.Unlock()
-	recoveryLogf(mergedPath, "recovery: merged = %.1fs (>= %ds) — uploading", mergedDur, minDur)
+	if force {
+		recoveryLogf(mergedPath, "recovery: final drain — merged = %.1fs, uploading (below threshold allowed)", mergedDur)
+	} else {
+		recoveryLogf(mergedPath, "recovery: merged = %.1fs (>= %ds) — uploading", mergedDur, minDur)
+	}
 	// Rename the unique scratch output to the STABLE merged-* name and
 	// upload from there so the archive keeps a clean filename and correct
 	// username (see handleMinDurationAndMerge). mergeMu guarantees no

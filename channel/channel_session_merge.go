@@ -216,7 +216,10 @@ func mergeTwoFiles(a, b string) (string, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	config.AcquireFFmpegHeavy()
+	if err := config.AcquireFFmpegHeavyFor(config.FFmpegHeavyAcquireTimeout); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("could not acquire ffmpeg slot to merge: %w", err)
+	}
 	defer config.ReleaseFFmpegHeavy()
 	out, err := config.FFmpegCommandContext(ctx, args...).CombinedOutput()
 	if err != nil {

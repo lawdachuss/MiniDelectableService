@@ -30,6 +30,9 @@ type IManager interface {
 	StartWatcher()
 	IsFileUploadInFlight(filePath string) bool
 	SessionInfo() (time.Duration, bool)
+	// IsProcessingSession reports whether the node is currently in the
+	// post-session drain phase (finalize/compress/upload) rather than recording.
+	IsProcessingSession() bool
 	TriggerSessionStop()
 	UploadEntries() *entity.UploadsResponse
 	ReportCFBlock(username string)

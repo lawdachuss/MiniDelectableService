@@ -107,8 +107,8 @@ func TestAnonMP4ChunkedUploadFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}
-	if link != "https://anonmp4.to/embed/v123" {
-		t.Errorf("link = %q, want embed URL", link)
+	if link != "https://anonmp4.help/embed/v123" {
+		t.Errorf("link = %q, want normalized embed URL (anonmp4.to -> anonmp4.help)", link)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -200,5 +200,55 @@ func TestAnonMP4NodeAssignmentFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "node assignment failed") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestNormalizeAnonMP4Link verifies that watch/embed links on any known anonmp4
+// view domain are rewritten to the configured working domain, while preserving
+// path/query, and that unknown hosts pass through untouched.
+func TestNormalizeAnonMP4Link(t *testing.T) {
+	oldBase := anonmp4ViewBase
+	oldDomains := anonmp4ViewDomains
+	defer func() {
+		anonmp4ViewBase = oldBase
+		anonmp4ViewDomains = oldDomains
+	}()
+	anonmp4ViewBase = "https://anonmp4.help"
+	anonmp4ViewDomains = []string{"anonmp4.to", "anonmp4.help", "anonmp4.art"}
+
+	cases := []struct{ in, want string }{
+		{"https://anonmp4.art/embed/2fWaPS7AsdG7uLR", "https://anonmp4.help/embed/2fWaPS7AsdG7uLR"},
+		{"https://anonmp4.art/v/2fWaPS7AsdG7uLR?seed=1", "https://anonmp4.help/v/2fWaPS7AsdG7uLR?seed=1"},
+		{"https://anonmp4.to/embed/abc123", "https://anonmp4.help/embed/abc123"},
+		{"https://anonmp4.help/embed/abc123", "https://anonmp4.help/embed/abc123"}, // idempotent
+		{"http://anonmp4.art/embed/x", "https://anonmp4.help/embed/x"},
+		{"https://other-host.com/v/xyz", "https://other-host.com/v/xyz"}, // unknown host passes through
+		{"", ""},
+		{"not a url", "not a url"},
+	}
+	for _, c := range cases {
+		if got := normalizeAnonMP4Link(c.in); got != c.want {
+			t.Errorf("normalizeAnonMP4Link(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestSetAnonMP4ViewBase verifies the env override replaces the default and
+// that invalid values restore it.
+func TestSetAnonMP4ViewBase(t *testing.T) {
+	oldBase := anonmp4ViewBase
+	defer func() { anonmp4ViewBase = oldBase }()
+
+	SetAnonMP4ViewBase("https://anonmp4.xyz")
+	if anonmp4ViewBase != "https://anonmp4.xyz" {
+		t.Fatalf("SetAnonMP4ViewBase = %q, want https://anonmp4.xyz", anonmp4ViewBase)
+	}
+	SetAnonMP4ViewBase("   ")
+	if anonmp4ViewBase != "https://anonmp4.help" {
+		t.Fatalf("empty override must restore default, got %q", anonmp4ViewBase)
+	}
+	SetAnonMP4ViewBase("not-a-url")
+	if anonmp4ViewBase != "https://anonmp4.help" {
+		t.Fatalf("invalid override must restore default, got %q", anonmp4ViewBase)
 	}
 }

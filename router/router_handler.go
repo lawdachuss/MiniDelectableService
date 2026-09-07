@@ -104,10 +104,15 @@ type AdminData struct {
 	Uploads  *entity.UploadsResponse
 	Orphans  []orphanEntry
 
+	// QueueBytes is the total size of everything queued + actively uploading
+	// (drives the "Upload Queue" metric card).
+	QueueBytes int64
+
 	// Session
-	SessionActive    bool
-	SessionRemaining string
-	SessionDuration  string
+	SessionActive     bool
+	SessionRemaining  string
+	SessionDuration   string
+	SessionProcessing bool
 
 	// System health
 	GoVersion    string
@@ -274,6 +279,16 @@ func AdminPage(c *gin.Context) {
 		sessionRemaining = remaining.Round(time.Second).String()
 		sessionDuration = server.Config.SessionDurationParsed.Round(time.Second).String()
 	}
+	sessionProcessing := server.Manager.IsProcessingSession()
+
+	// ── Queue bytes (pending pipelines + active uploads) ──
+	var queueBytes int64
+	for _, p := range uploads.Pending {
+		queueBytes += p.Size
+	}
+	for _, a := range uploads.Active {
+		queueBytes += a.BytesTotal
+	}
 
 	// ── System health ──
 	var memStats runtime.MemStats
@@ -352,6 +367,8 @@ func AdminPage(c *gin.Context) {
 		SessionActive:    sessionActive,
 		SessionRemaining: sessionRemaining,
 		SessionDuration:  sessionDuration,
+		SessionProcessing: sessionProcessing,
+		QueueBytes:        queueBytes,
 
 		GoVersion:    runtime.Version(),
 		GoGoroutines: runtime.NumGoroutine(),
@@ -1520,9 +1537,13 @@ func ServeLiveThumb(c *gin.Context) {
 		// 2 — seek near the end (avoid blank first frame in completed files)
 		for attempt := 0; attempt < 3 && !thumbOK; attempt++ {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			config.AcquireFFmpeg()
-			defer config.ReleaseFFmpeg()
+			if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+				// Pool starved — don't hold this request hostage (and don't
+				// grab a slot until the whole function returns): fall back to
+				// the CDN preview below.
+				cancel()
+				break
+			}
 			args := []string{"-y"}
 			switch attempt {
 			case 0:
@@ -1557,6 +1578,8 @@ func ServeLiveThumb(c *gin.Context) {
 				)
 			}
 			err := config.FFmpegCommandContext(ctx, args...).Run()
+			config.ReleaseFFmpeg() // release immediately — the slot must not be held across attempts
+			cancel()
 			if err == nil {
 				data, readErr := os.ReadFile(cachePath)
 				if readErr == nil {

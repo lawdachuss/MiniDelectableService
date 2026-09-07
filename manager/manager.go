@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/r3labs/sse/v2"
@@ -121,6 +122,12 @@ type Manager struct {
 	sessionStarted bool
 	sessionStopped bool // set by StopSession to permanently stop the loop
 
+	// sessionProcessing is true while a session-stop drain is running
+	// (mux/compress/upload phase). The admin UI falls back to "No active
+	// session" the instant the deadline is cleared, which made the drain look
+	// like the channels were merely paused — this lets it show the real phase.
+	sessionProcessing atomic.Bool
+
 	// Cloudflare block tracking: channels currently in a blocked state, plus
 	// whether the global multi-channel alert has already fired.
 	cfMu             sync.Mutex
@@ -182,6 +189,13 @@ func (m *Manager) SessionInfo() (remaining time.Duration, active bool) {
 		return 0, false
 	}
 	return remaining, true
+}
+
+// IsProcessingSession reports whether the node is currently in the
+// post-session drain phase (finalizing, compressing, uploading queued
+// recordings) rather than recording.
+func (m *Manager) IsProcessingSession() bool {
+	return m.sessionProcessing.Load()
 }
 
 // New initializes a new Manager instance with an SSE server.
@@ -1063,6 +1077,9 @@ func (m *Manager) StartWatcher() {
 // processes one channel at a time (mux all pending files, wait for all
 // uploads) so CPU, disk, and network contention is minimised.
 func (m *Manager) StopWithProcessingQueue(workers int) {
+	m.sessionProcessing.Store(true)
+	defer m.sessionProcessing.Store(false)
+
 	var chs []*channel.Channel
 	m.Channels.Range(func(key, value any) bool {
 		chs = append(chs, value.(*channel.Channel))
@@ -1326,6 +1343,23 @@ sessionWait:
 	m.StopWithProcessingQueue(10)
 
 	log.Println("[session] all processing complete — session ended")
+
+	// Flush short fragments parked in .pending by the min-duration gate.
+	// At a normal boundary (session restarts) sub-threshold segments stay
+	// parked to merge with the next session.  On the FINAL drain — graceful
+	// StopSession, or a run deadline too close to start another session — they
+	// are force-uploaded so a parked 10-minute clip is not lost with the VM.
+	m.sessionMu.Lock()
+	force := m.sessionStopped
+	m.sessionMu.Unlock()
+	if !force {
+		if rd := resolveRunDeadline(); !rd.IsZero() {
+			if time.Until(rd.Add(-earlyDrainMargin)) < sessionResumeMin {
+				force = true
+			}
+		}
+	}
+	channel.FlushPendingSegmentsAtBoundary(force)
 
 	// Signal workflow that all uploads are done so it can safely exit.
 	if err := os.WriteFile("upload-complete.flag", []byte("done"), 0644); err != nil {
@@ -1737,7 +1771,9 @@ func (m *Manager) PublishLog(username, line string) {
 
 // UploadEntries returns the full uploads response (active + pending + history) for the API.
 func (m *Manager) UploadEntries() *entity.UploadsResponse {
-	resp := &entity.UploadsResponse{}
+	resp := &entity.UploadsResponse{
+		Processing: m.IsProcessingSession(),
+	}
 	m.Channels.Range(func(_, value any) bool {
 		ch := value.(*channel.Channel)
 		e := ch.UploadEntry()

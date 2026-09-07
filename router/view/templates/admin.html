@@ -503,6 +503,16 @@
             <div class="sub">{{ len .Uploads.Pending }} pending</div>
         </div>
         <div class="metric-card">
+            <div class="label">Upload Queue</div>
+            <div class="value">{{ add (len .Uploads.Active) (len .Uploads.Pending) }}</div>
+            <div class="sub">{{ printf "%.1f" (divBytes .QueueBytes) }} MB upcoming</div>
+        </div>
+        <div class="metric-card">
+            <div class="label">Videos On Disk</div>
+            <div class="value">{{ if .Recon }}{{ .Recon.LocalFiles }}{{ else }}0{{ end }}</div>
+            <div class="sub">{{ if .Recon }}{{ .Recon.LocalBytesHuman }}{{ else }}n/a{{ end }}</div>
+        </div>
+        <div class="metric-card">
             <div class="label">Pipeline History</div>
             <div class="value">{{ len .Uploads.History }}</div>
             <div class="sub">{{ subFailed .Uploads.History }} failed</div>
@@ -517,6 +527,8 @@
             <div class="value" style="font-size:18px">
                 {{ if .SessionActive }}
                 <span class="status-badge pending" style="font-size:11px">Active</span>
+                {{ else if .SessionProcessing }}
+                <span class="status-badge pending" style="font-size:11px;background:rgba(245,158,11,0.15);color:#f59e0b;border-color:rgba(245,158,11,0.35)">Processing</span>
                 {{ else }}
                 <span class="status-badge" style="font-size:11px;background:rgba(113,113,122,0.12);color:#71717a">Inactive</span>
                 {{ end }}
@@ -524,6 +536,8 @@
             <div class="sub">
                 {{ if .SessionActive }}
                 {{ .SessionRemaining }} left · {{ .SessionDuration }} total
+                {{ else if .SessionProcessing }}
+                Finalizing &amp; uploading recordings…
                 {{ else }}
                 No active session
                 {{ end }}
@@ -910,7 +924,7 @@
     {{ end }}
 
     <!-- ════════ PIPELINE QUEUE ════════ -->
-    <details class="section">
+    <details class="section" open>
         <summary><span class="arrow">▶</span> Pipeline Queue <span class="count">{{ len .Uploads.Pending }}</span></summary>
         <div class="section-body">
             <table class="admin-table">
@@ -919,6 +933,7 @@
                         <th>Channel</th>
                         <th>File</th>
                         <th>Stage</th>
+                        <th>Size</th>
                         <th>Failed</th>
                         <th>Error</th>
                     </tr>
@@ -930,12 +945,13 @@
                         <td><strong>{{ .Channel }}</strong></td>
                         <td class="mono truncate" title="{{ .Filename }}">{{ .Filename }}</td>
                         <td><span class="status-badge pending">{{ .Stage }}</span></td>
+                        <td class="mono">{{ if .Size }}{{ printf "%.1f" (divBytes .Size) }} MB{{ else }}—{{ end }}</td>
                         <td>{{ if .Failed }}<span class="status-badge failed">Yes</span>{{ else }}<span class="status-badge done">No</span>{{ end }}</td>
                         <td class="mono" style="color:var(--text-muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ .Error }}">{{ if .Error }}{{ .Error }}{{ else }}—{{ end }}</td>
                     </tr>
                     {{ end }}
                     {{ else }}
-                    <tr><td colspan="5" class="empty-state">No pending pipelines</td></tr>
+                    <tr><td colspan="6" class="empty-state">No pending pipelines</td></tr>
                     {{ end }}
                 </tbody>
             </table>
@@ -943,7 +959,7 @@
     </details>
 
     <!-- ════════ PIPELINE HISTORY ════════ -->
-    <details class="section">
+    <details class="section" open>
         <summary><span class="arrow">▶</span> Pipeline History <span class="count">{{ len .Uploads.History }}</span></summary>
         <div class="section-body">
             <table class="admin-table">
@@ -952,6 +968,7 @@
                         <th>Channel</th>
                         <th>File</th>
                         <th>Stage</th>
+                        <th>Size</th>
                         <th>Result</th>
                         <th>Error</th>
                     </tr>
@@ -963,12 +980,13 @@
                         <td><strong>{{ .Channel }}</strong></td>
                         <td class="mono truncate" title="{{ .Filename }}">{{ .Filename }}</td>
                         <td><span class="status-badge done">{{ .Stage }}</span></td>
+                        <td class="mono">{{ if .Size }}{{ printf "%.1f" (divBytes .Size) }} MB{{ else }}—{{ end }}</td>
                         <td>{{ if .Failed }}<span class="status-badge failed">Failed</span>{{ else }}<span class="status-badge done">OK</span>{{ end }}</td>
                         <td class="mono" style="color:var(--text-muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ .Error }}">{{ if .Error }}{{ .Error }}{{ else }}—{{ end }}</td>
                     </tr>
                     {{ end }}
                     {{ else }}
-                    <tr><td colspan="5" class="empty-state">No pipeline history</td></tr>
+                    <tr><td colspan="6" class="empty-state">No pipeline history</td></tr>
                     {{ end }}
                 </tbody>
             </table>

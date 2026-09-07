@@ -380,6 +380,12 @@ func main() {
 				Value:   "",
 			},
 			&cli.StringFlag{
+				Name:    "anonmp4-view-base",
+				Usage:   "Base URL that AnonMP4 archive links are normalized to (e.g. https://anonmp4.help)",
+				EnvVars: []string{"ANONMP4_VIEW_BASE"},
+				Value:   "",
+			},
+			&cli.StringFlag{
 				Name:    "catbox-proxy-url",
 				Usage:   "Cloudflare Worker proxy URL for Catbox uploads (avoids direct IP blocks)",
 				EnvVars: []string{"CATBOX_PROXY_URL"},
@@ -626,6 +632,10 @@ func start(c *cli.Context) error {
 	uploader.SetDisabledHosts(server.Config.DisabledUploadHosts)
 	if len(server.Config.DisabledUploadHosts) > 0 {
 		fmt.Printf("[startup] disabled upload hosts (never attempted): %v\n", server.Config.DisabledUploadHosts)
+	}
+	uploader.SetAnonMP4ViewBase(server.Config.AnonMP4ViewBase)
+	if server.Config.AnonMP4ViewBase != "" {
+		fmt.Printf("[startup] AnonMP4 archive links normalized to %s\n", server.Config.AnonMP4ViewBase)
 	}
 	channel.SetPipelineWorkers(pipelineW)
 	fmt.Printf("[startup] upload concurrency (VM-sized, %d vCPU): %d files max, %d/%d per host (GoFile/other), %d retry workers, %d pipelines/channel\n",

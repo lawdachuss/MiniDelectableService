@@ -42,7 +42,11 @@ var availableEncoders = []videoEncoder{
 
 // detectEncoder finds the best available encoder
 func detectEncoder() (videoEncoder, string) {
-	config.AcquireFFmpegHeavy()
+	if err := config.AcquireFFmpegHeavyFor(config.FFmpegHeavyAcquireTimeout); err != nil {
+		// CPU fallback is always available if ffmpeg is installed; a starved
+		// pool must not block encoder detection forever.
+		return availableEncoders[len(availableEncoders)-1], "CPU"
+	}
 	defer config.ReleaseFFmpegHeavy()
 	for _, enc := range availableEncoders {
 		// Test if encoder is available by running ffmpeg with it
@@ -110,7 +114,11 @@ func (ch *Channel) CompressFile(srcPath, endReason string) {
 		args = append(args, encoder.args...)
 		args = append(args, "-c:a", "aac", "-b:a", "128k", mkvPath)
 
-		config.AcquireFFmpegHeavy()
+		if err := config.AcquireFFmpegHeavyFor(config.FFmpegHeavyAcquireTimeout); err != nil {
+			ch.Error("compress: could not acquire ffmpeg slot for %s: %v", srcFilename, err)
+			ch.MoveToOutputDir(srcPath, endReason)
+			return
+		}
 		defer config.ReleaseFFmpegHeavy()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()

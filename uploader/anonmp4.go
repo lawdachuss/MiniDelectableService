@@ -42,6 +42,56 @@ import (
 // server.
 var anonmp4SiteBase = "https://anonmp4.to"
 
+// anonmp4ViewBase is the base URL that watch/embed links returned by the API
+// are rewritten to. The site rotates its public view domain (anonmp4.to →
+// anonmp4.help → anonmp4.art), and in Sep 2026 it started answering
+// /get-video-node with links on anonmp4.art while the videos still only
+// rendered on anonmp4.help (anonmp4.to hard-404'd, anonmp4.art refused/bot-
+// challenged connections from every vantage). Archive links on any known
+// view domain are normalized to this base so stored URLs keep working after
+// the API drifts. Overridable via ANONMP4_VIEW_BASE.
+var anonmp4ViewBase = "https://anonmp4.help"
+
+// anonmp4ViewDomains are the public view domains that may appear in finalize
+// links. A link whose host is one of these is rewritten to anonmp4ViewBase;
+// unknown hosts pass through untouched (assumed to be the current working
+// domain).
+var anonmp4ViewDomains = []string{"anonmp4.to", "anonmp4.help", "anonmp4.art"}
+
+// SetAnonMP4ViewBase overrides the domain archive links are normalized to
+// (wired from ANONMP4_VIEW_BASE). An empty/invalid value restores the default.
+func SetAnonMP4ViewBase(base string) {
+	base = strings.TrimSpace(base)
+	if base != "" {
+		if u, err := url.Parse(base); err == nil && u.Host != "" {
+			anonmp4ViewBase = strings.TrimSuffix(base, "/")
+			return
+		}
+	}
+	anonmp4ViewBase = "https://anonmp4.help"
+}
+
+// normalizeAnonMP4Link rewrites a watch/embed URL on one of the known anonmp4
+// view domains to anonmp4ViewBase (same path/query), so a domain the site
+// stopped serving never poisons the archive. Non-anonmp4 links are returned
+// unchanged.
+func normalizeAnonMP4Link(link string) string {
+	if link == "" {
+		return link
+	}
+	u, err := url.Parse(link)
+	if err != nil || u.Host == "" {
+		return link
+	}
+	host := strings.ToLower(u.Host)
+	for _, d := range anonmp4ViewDomains {
+		if host == d {
+			return anonmp4ViewBase + u.RequestURI()
+		}
+	}
+	return link
+}
+
 const (
 	// anonmp4ClientToken mirrors the token the anonmp4.to homepage embeds in
 	// its upload JS. If the site ever rotates it, uploads fail with a clear
@@ -207,6 +257,9 @@ func (u *AnonMP4Uploader) uploadFlow(filePath, fileName string, size int64, prog
 	}
 	// Ensure HTTPS
 	link = strings.Replace(link, "http://", "https://", 1)
+	// The API sometimes returns links on a view domain that is not serving
+	// videos (see anonmp4ViewBase). Pin them to the working domain.
+	link = normalizeAnonMP4Link(link)
 	return link, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/teacat/chaturbate-dvr/config"
+	"github.com/teacat/chaturbate-dvr/server"
 	"github.com/teacat/chaturbate-dvr/uploader"
 )
 
@@ -72,6 +73,22 @@ func GenerateThumbnailForFile(videoPath string) ThumbnailResult {
 		func(f string, a ...interface{}) { log.Printf("[thumb:err] "+f, a...) },
 		nil,
 	)
+}
+
+// ThumbnailExists reports whether the THUMBNAIL — the asset actually shown on
+// the video card — is already stored for this file, either in preview_images or
+// on the recordings row.  Used by cleanup paths (watcher, orphan scans) to
+// decide whether the local video source may be deleted: without a stored
+// thumbnail the local file is the only way to ever (re)generate one.
+func ThumbnailExists(filePath string) bool {
+	name := filepath.Base(filePath)
+	if thumb, _, _ := server.LoadPreviewLinks(name); thumb != "" {
+		return true
+	}
+	if thumb, _, _ := server.LoadRecordingThumbnails(name); thumb != "" {
+		return true
+	}
+	return false
 }
 
 // generateThumbnailForFile creates a static thumbnail (JPEG), a multi-frame sprite
@@ -154,10 +171,12 @@ func runFFmpegParallel(workers, n int, fn func(i int) error) error {
 // the retry fails with an immediate "context deadline exceeded" even though it
 // never got a chance to run.
 func runFFmpegFresh(timeout time.Duration, args ...string) error {
+	if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+		return err
+	}
+	defer config.ReleaseFFmpeg()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	config.AcquireFFmpeg()
-	defer config.ReleaseFFmpeg()
 	return config.FFmpegCommandContext(ctx, args...).Run()
 }
 
@@ -187,19 +206,22 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	defer probeCancel()
 
 	var dur float64
-	config.AcquireFFmpeg()
-	probeOut, probeErr := config.FFprobeCommandContext(probeCtx,
-		"-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		videoPath,
-	).Output()
-	config.ReleaseFFmpeg() // release immediately — the 3 goroutines below also need slots
-	if probeErr == nil {
-		var parseErr error
-		dur, parseErr = strconv.ParseFloat(strings.TrimSpace(string(probeOut)), 64)
-		if parseErr != nil {
-			log.Printf("WARN: could not parse probe duration %q: %v", strings.TrimSpace(string(probeOut)), parseErr)
+	if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+		errFn("thumb: could not acquire ffmpeg slot to probe %s: %v — continuing without duration", filepath.Base(videoPath), err)
+	} else {
+		probeOut, probeErr := config.FFprobeCommandContext(probeCtx,
+			"-v", "error",
+			"-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1",
+			videoPath,
+		).Output()
+		config.ReleaseFFmpeg() // release immediately — the 3 goroutines below also need slots
+		if probeErr == nil {
+			var parseErr error
+			dur, parseErr = strconv.ParseFloat(strings.TrimSpace(string(probeOut)), 64)
+			if parseErr != nil {
+				log.Printf("WARN: could not parse probe duration %q: %v", strings.TrimSpace(string(probeOut)), parseErr)
+			}
 		}
 	}
 
@@ -228,20 +250,23 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		} else {
 			defer os.RemoveAll(workDir)
 			seekablePath := filepath.Join(workDir, "seekable.mp4")
-			config.AcquireFFmpeg()
-			remuxErr := config.FFmpegCommandContext(remuxCtx,
-				"-y",
-				"-i", videoPath,
-				"-c", "copy",
-				"-movflags", "+faststart",
-				seekablePath,
-			).Run()
-			config.ReleaseFFmpeg()
-			if remuxErr == nil && fileExists(seekablePath) {
-				workPath = seekablePath
-				info("thumb: remuxed %s to seekable temp for fast extraction", baseName)
+			if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+				errFn("thumb: could not acquire ffmpeg slot for seekable remux of %s: %v — extracting directly", baseName, err)
 			} else {
-				errFn("thumb: seekable remux failed for %s: %v — extracting directly", baseName, remuxErr)
+				remuxErr := config.FFmpegCommandContext(remuxCtx,
+					"-y",
+					"-i", videoPath,
+					"-c", "copy",
+					"-movflags", "+faststart",
+					seekablePath,
+				).Run()
+				config.ReleaseFFmpeg()
+				if remuxErr == nil && fileExists(seekablePath) {
+					workPath = seekablePath
+					info("thumb: remuxed %s to seekable temp for fast extraction", baseName)
+				} else {
+					errFn("thumb: seekable remux failed for %s: %v — extracting directly", baseName, remuxErr)
+				}
 			}
 		}
 	}

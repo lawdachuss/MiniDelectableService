@@ -397,9 +397,39 @@ func FFprobeCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, ffprobeBin(), args...)
 }
 
-// AcquireFFmpeg blocks until a lightweight ffmpeg slot is available.
-func AcquireFFmpeg() {
-	ffmpegSem <- struct{}{}
+// FFmpegAcquireTimeout bounds how long a caller waits for a free lightweight
+// ffmpeg slot before giving up on the operation.  Without a bound, an acquire
+// on a saturated semaphore (or against a wedged holder) blocks forever: the
+// per-command context timeout never starts because the process never launches,
+// and every pipeline waiting on that thumbnail stalls at "uploaded X/6 hosts
+// — processing" for the full pipelineThumbnailTimeout while files pile up on
+// disk.  The bound is generous enough to ride out brief contention waves but
+// short enough that a genuinely starved pool degrades fast (skip the
+// thumbnail, backfill later) instead of hanging the fleet.
+const FFmpegAcquireTimeout = 5 * time.Minute
+
+// FFmpegHeavyAcquireTimeout bounds how long a caller waits for a free
+// CPU-bound compression slot.  Same rationale as FFmpegAcquireTimeout.
+const FFmpegHeavyAcquireTimeout = 5 * time.Minute
+
+// AcquireFFmpeg acquires a lightweight ffmpeg slot, blocking until one is
+// available or ctx is done.  It returns nil on acquisition and ctx.Err()
+// when the caller's wait budget expires first, so a saturated pool fails
+// fast instead of hanging the pipeline.
+func AcquireFFmpeg(ctx context.Context) error {
+	select {
+	case ffmpegSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// AcquireFFmpegFor blocks up to timeout for a lightweight ffmpeg slot.
+func AcquireFFmpegFor(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return AcquireFFmpeg(ctx)
 }
 
 // ReleaseFFmpeg releases a lightweight ffmpeg slot.
@@ -407,9 +437,23 @@ func ReleaseFFmpeg() {
 	<-ffmpegSem
 }
 
-// AcquireFFmpegHeavy blocks until a CPU-bound compression slot is available.
-func AcquireFFmpegHeavy() {
-	ffmpegHeavySem <- struct{}{}
+// AcquireFFmpegHeavy acquires a CPU-bound compression slot, blocking until one
+// is available or ctx is done.  Returns nil on acquisition and ctx.Err() when
+// the caller's wait budget expires first.
+func AcquireFFmpegHeavy(ctx context.Context) error {
+	select {
+	case ffmpegHeavySem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// AcquireFFmpegHeavyFor blocks up to timeout for a CPU-bound compression slot.
+func AcquireFFmpegHeavyFor(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return AcquireFFmpegHeavy(ctx)
 }
 
 // ReleaseFFmpegHeavy releases a CPU-bound compression slot.
@@ -451,6 +495,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		MixdropToken:            c.String("mixdrop-token"),
 		VidaraKey:               c.String("vidara-key"),
 		DisabledUploadHosts:     splitCommaList(c.String("disabled-upload-hosts")),
+		AnonMP4ViewBase:         strings.TrimSpace(c.String("anonmp4-view-base")),
 		CatboxProxyURL:          c.String("catbox-proxy-url"),
 		UploadMaxConcurrent:     c.Int("upload-max-concurrent"),
 		UploadHostConcurrency:   c.Int("upload-host-concurrency"),

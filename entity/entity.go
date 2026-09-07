@@ -169,6 +169,7 @@ type PendingEntry struct {
 	Stage    string `json:"stage"`    // human-readable current stage
 	Failed   bool   `json:"failed"`
 	Error    string `json:"error,omitempty"`
+	Size     int64  `json:"size"` // final on-disk file size in bytes (0 when unknown)
 }
 
 // UploadsResponse is the full JSON body returned by GET /api/uploads.
@@ -176,6 +177,10 @@ type UploadsResponse struct {
 	Active  []UploadEntry  `json:"active"`  // currently uploading per-channel
 	Pending []PendingEntry `json:"pending"` // queued and waiting for processing
 	History []PendingEntry `json:"history"` // recently completed or failed pipelines
+
+	// Processing is true while the node is in the post-session drain
+	// (finalizing, compressing, uploading queued recordings).
+	Processing bool `json:"processing"`
 }
 
 // DiskInfo holds disk usage information for the UI.
@@ -230,6 +235,12 @@ type Config struct {
 	// run (e.g. permanent/size-cap failures), regardless of whether their API
 	// keys are configured. Comma-separated e.g. "AnonMP4,VOE.sx".
 	DisabledUploadHosts []string
+
+	// AnonMP4ViewBase is the base URL that AnonMP4 watch/embed links from the
+	// uploader are normalized to (the site rotates its public view domain; a
+	// returned domain that stopped serving videos would otherwise poison the
+	// archive). Empty uses the built-in default.
+	AnonMP4ViewBase string
 
 	// Upload throughput tuning.
 	UploadMaxConcurrent   int // max video files uploading concurrently (0 = auto, VM-sized)

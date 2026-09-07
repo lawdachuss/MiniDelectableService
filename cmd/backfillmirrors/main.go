@@ -48,7 +48,36 @@ func main() {
 	flag.StringVar(&proxyFlag, "proxy", "", "HTTP proxy URL for Catbox downloads (e.g. http://127.0.0.1:7890)")
 	flag.StringVar(&proxyToken, "token", "", "Cloudflare Access token for proxy auth (or set CF_ACCESS_TOKEN env)")
 	skipImgBB := flag.Bool("skip-imgbb", false, "Skip ImgBB uploads (use when keys are rate-limited)")
+	since := flag.String("since", "", "Only process recordings at/after this point: an RFC3339-ish date (2026-09-01) or a duration back from now (168h). Empty = no filter.")
+	force := flag.Bool("force", false, "Re-mirror assets even when a mirror set already exists (default: skip assets that already have >=1 mirror)")
+	skipHostsFlag := flag.String("skip-hosts", "", "Comma-separated image hosts to skip (e.g. \"Imgbox,ImgPile\" when they are down — avoids their retry stalls)")
 	flag.Parse()
+
+	var skipHostsList []string
+	if *skipHostsFlag != "" {
+		for _, h := range strings.Split(*skipHostsFlag, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				skipHostsList = append(skipHostsList, h)
+			}
+		}
+	}
+
+	// Parse -since into a cutoff time: a duration (e.g. "168h") counts back
+	// from now, anything else is tried as a date. Invalid values abort rather
+	// than silently processing the whole backlog.
+	var sinceCutoff time.Time
+	if *since != "" {
+		if d, derr := time.ParseDuration(*since); derr == nil {
+			sinceCutoff = time.Now().Add(-d)
+		} else if t, terr := time.Parse("2006-01-02", *since); terr == nil {
+			sinceCutoff = t
+		} else if t, terr := time.Parse(time.RFC3339, *since); terr == nil {
+			sinceCutoff = t
+		} else {
+			log.Fatalf("backfillmirrors: invalid -since value %q (want a duration like 168h or a date like 2026-09-01)", *since)
+		}
+		log.Printf("backfillmirrors: only processing recordings with timestamp >= %s", sinceCutoff.Format(time.RFC3339))
+	}
 
 	// Fall back to environment proxy if not specified via flag
 	if proxyFlag == "" {
@@ -95,38 +124,59 @@ func main() {
 		candidateMap[candidates[i].Filename] = &candidates[i]
 	}
 
-	if *limit > 0 {
-		// Apply limit
-		var limited []*database.Recording
-		for _, rec := range candidateMap {
-			limited = append(limited, rec)
-			if len(limited) >= *limit {
-				break
+	// Convert to a slice FIRST, newest-first (the query already orders by
+	// timestamp desc; the map dedups but must not randomize selection), then
+	// apply -since and -limit in that order so the flags compose correctly:
+	// -since narrows to the target window, -limit caps the count. Previously
+	// -limit was applied to an unordered map, which selected a random subset
+	// of the backlog instead of the newest recordings.
+	candidatePtrs := make([]*database.Recording, 0, len(candidateMap))
+	for i := range candidates {
+		rec := &candidates[i]
+		if _, seen := candidateMap[rec.Filename]; !seen {
+			continue
+		}
+		delete(candidateMap, rec.Filename) // dedup: keep first (newest) occurrence
+		if !sinceCutoff.IsZero() {
+			ts, terr := time.Parse(time.RFC3339, rec.Timestamp)
+			if terr != nil {
+				// Timestamps are written in RFC3339 by the DVR; keep anything
+				// that fails to parse rather than silently dropping it.
+				log.Printf("WARN: could not parse timestamp %q for %s — including", rec.Timestamp, rec.Filename)
+			} else if ts.Before(sinceCutoff) {
+				continue
 			}
 		}
-		candidateMap = make(map[string]*database.Recording)
-		for _, rec := range limited {
-			candidateMap[rec.Filename] = rec
-		}
-	}
-
-	// Convert to sorted slice
-	var candidatePtrs []*database.Recording
-	for _, rec := range candidateMap {
 		candidatePtrs = append(candidatePtrs, rec)
 	}
 	candidateMap = nil // free
+
+	if *limit > 0 && len(candidatePtrs) > *limit {
+		candidatePtrs = candidatePtrs[:*limit]
+	}
 
 	log.Printf("processing %d recordings", len(candidatePtrs))
 
 	// Create the image uploader
 	imgUploader := uploader.NewMultiImageUploader()
 
-	// Pre-check ImgBB availability
+	// Apply host skips: -skip-imgbb plus any -skip-hosts entries.  Skipping a
+	// DOWN host matters at scale: each asset would otherwise stall through 3
+	// retry rounds against it (~20s) before UploadToAll returns.
 	if *skipImgBB {
 		log.Printf("skipping ImgBB uploads (--skip-imgbb)")
 		imgUploader.SetSkipHosts("ImgBB")
-	} else {
+	}
+	if len(skipHostsList) > 0 {
+		log.Printf("skipping hosts: %s (--skip-hosts)", strings.Join(skipHostsList, ", "))
+		imgUploader.SetSkipHosts(skipHostsList...)
+	}
+
+	// Pre-check ImgBB availability — but only when ImgBB is not already
+	// skipped AND no other host is being skipped (the pre-check uploads a
+	// test image to ALL hosts, which would hit skip-listed hosts anyway and
+	// is pointless when the caller explicitly tuned the host set).
+	if !*skipImgBB && len(skipHostsList) == 0 {
 		log.Printf("pre-checking ImgBB availability...")
 		tmpImg, _ := os.CreateTemp("", "imgbb-check-*.jpg")
 		tmpImg.Write([]byte{0xFF, 0xD8, 0xFF, 0xD9})
@@ -164,28 +214,62 @@ func main() {
 	for i, rec := range candidatePtrs {
 		log.Printf("[%d/%d] processing %s", i+1, len(candidatePtrs), rec.Filename)
 
-		// Collect all Catbox URLs for this recording
+		// Collect all Catbox URLs for this recording.  Idempotency: an asset
+		// that already has a mirror set is skipped (unless -force) so a re-run
+		// only fills actual gaps instead of uploading duplicate copies of the
+		// whole Catbox-era library on every invocation.
+		//
+		// preview_images is the AUTHORITATIVE mirror store (the pipeline writes
+		// mirrors there; the recordings-row mirror columns are sparsely
+		// populated), so the has-mirror check consults preview_images — falling
+		// back to the recordings row only when no preview_images row exists.
+		// Without this the first run already-processed rows would be re-mirrored
+		// (duplicate image-host uploads) on every subsequent invocation.
+		prevImg, perr := client.GetPreviewImage(rec.Filename)
+		hasPreviewRow := perr == nil && prevImg != nil
+
 		type asset struct {
-			name     string
-			url      string
-			field    string // "thumbnail", "sprite", "preview"
+			name      string
+			url       string
+			field     string // "thumbnail", "sprite", "preview"
+			isCatbox  bool   // primary URL is the Catbox original — reuse it as the Catbox mirror instead of re-uploading a duplicate copy
 		}
 		var assets []asset
 
+		thumbMirrors, spriteMirrors, previewMirrors := rec.ThumbnailMirrors, rec.SpriteMirrors, rec.PreviewMirrors
+		if hasPreviewRow {
+			if len(prevImg.ThumbnailMirrors) > 0 {
+				thumbMirrors = prevImg.ThumbnailMirrors
+			}
+			if len(prevImg.SpriteMirrors) > 0 {
+				spriteMirrors = prevImg.SpriteMirrors
+			}
+			if len(prevImg.PreviewMirrors) > 0 {
+				previewMirrors = prevImg.PreviewMirrors
+			}
+		}
+
 		if strings.Contains(rec.ThumbnailURL, "catbox.moe") {
-			assets = append(assets, asset{"thumbnail", rec.ThumbnailURL, "thumbnail"})
+			if *force || len(thumbMirrors) == 0 {
+				assets = append(assets, asset{"thumbnail", rec.ThumbnailURL, "thumbnail", true})
+			}
 		}
 		if strings.Contains(rec.SpriteURL, "catbox.moe") {
-			assets = append(assets, asset{"sprite", rec.SpriteURL, "sprite"})
+			if *force || len(spriteMirrors) == 0 {
+				assets = append(assets, asset{"sprite", rec.SpriteURL, "sprite", true})
+			}
 		}
 		if strings.Contains(rec.PreviewURL, "catbox.moe") {
-			assets = append(assets, asset{"preview", rec.PreviewURL, "preview"})
+			if *force || len(previewMirrors) == 0 {
+				assets = append(assets, asset{"preview", rec.PreviewURL, "preview", true})
+			}
 		}
 
 		if len(assets) == 0 {
-			log.Printf("  SKIP: no Catbox URLs found")
+			log.Printf("  SKIP: no Catbox URLs needing mirrors")
 			continue
 		}
+		mirroredAny := false
 
 		log.Printf("  found %d Catbox assets to mirror: %v", len(assets), func() []string {
 			var names []string
@@ -200,6 +284,17 @@ func main() {
 			mu.Lock()
 			totalAsset++
 			mu.Unlock()
+
+			// Reuse the Catbox PRIMARY as the Catbox mirror entry — re-uploading
+			// the same bytes to Catbox would just mint a second, unreferenced
+			// URL.  This saves one upload per Catbox-primary asset (~30% of all
+			// uploads across the library backfill).  Only assets whose primary
+			// is Catbox (isCatbox=true, the only candidates this tool selects)
+			// take this path.
+			successURLs := map[string]string{}
+			if asset.isCatbox {
+				successURLs["Catbox"] = asset.url
+			}
 
 			// Download from Catbox
 			tmpFile, err := downloadThumbnail(asset.url, rec.Filename+"_"+asset.name)
@@ -220,14 +315,9 @@ func main() {
 			results := imgUploader.UploadToAll(tmpFile, nil)
 
 			// Collect successful URLs and log failures
-			successURLs := make(map[string]string)
-			var primaryURL string
 			for _, r := range results {
 				if r.Err == nil && r.URL != "" {
 					successURLs[r.Host] = r.URL
-					if primaryURL == "" {
-						primaryURL = r.URL
-					}
 				} else if r.Err != nil {
 					log.Printf("  WARN: %s failed: %v", r.Host, r.Err)
 				}
@@ -241,55 +331,64 @@ func main() {
 
 			log.Printf("  %s: uploaded to %d hosts: %v", asset.name, len(successURLs), successURLs)
 
-			// Update the appropriate field in the recording
+			// The EXISTING primary URL is kept as-is (only the mirror set is
+			// filled below) — overwriting a known-good, referenced primary with
+			// a nondeterministic first-success host could downgrade it.
+
+			// Update the mirror set on the recording
 			switch asset.field {
 			case "thumbnail":
-				rec.ThumbnailURL = primaryURL
 				rec.ThumbnailMirrors = successURLs
 			case "sprite":
-				rec.SpriteURL = primaryURL
 				rec.SpriteMirrors = successURLs
 			case "preview":
-				rec.PreviewURL = primaryURL
 				rec.PreviewMirrors = successURLs
 			}
 
 			mu.Lock()
 			processed++
 			mu.Unlock()
+			mirroredAny = true
 
 			// Small delay between asset uploads
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		// Save the recording with all updated mirrors
-		if !*dryRun {
-			if err := client.SaveRecording(rec); err != nil {
-				log.Printf("  ERROR: save recording: %v", err)
-				failed++
-				continue
-			}
-
-			// Update preview_images table
-			img := &database.PreviewImage{
-				Filename:          rec.Filename,
-				ThumbnailURL:      rec.ThumbnailURL,
-				ThumbnailMirrors:  rec.ThumbnailMirrors,
-				SpriteURL:         rec.SpriteURL,
-				SpriteMirrors:     rec.SpriteMirrors,
-				PreviewURL:        rec.PreviewURL,
-				PreviewMirrors:    rec.PreviewMirrors,
-			}
-			if err := client.SavePreviewImage(img); err != nil {
-				log.Printf("  ERROR: save preview image: %v", err)
-				failed++
-				continue
-			}
-
-			log.Printf("  OK: saved recording with mirrors (thumb=%d, sprite=%d, preview=%d)",
-				len(rec.ThumbnailMirrors), len(rec.SpriteMirrors), len(rec.PreviewMirrors))
-			succeeded++
+		// Save the recording with all updated mirrors — only when something
+		// was actually mirrored this pass.  An all-assets-skipped row is
+		// already complete, so rewriting it would be a pure no-op write.
+		if *dryRun {
+			// Asset-level DRY-RUN lines above already counted `processed`.
+			continue
 		}
+		if !mirroredAny {
+			continue
+		}
+		if err := client.SaveRecording(rec); err != nil {
+			log.Printf("  ERROR: save recording: %v", err)
+			failed++
+			continue
+		}
+
+		// Update preview_images table
+		img := &database.PreviewImage{
+			Filename:         rec.Filename,
+			ThumbnailURL:     rec.ThumbnailURL,
+			ThumbnailMirrors: rec.ThumbnailMirrors,
+			SpriteURL:        rec.SpriteURL,
+			SpriteMirrors:    rec.SpriteMirrors,
+			PreviewURL:       rec.PreviewURL,
+			PreviewMirrors:   rec.PreviewMirrors,
+		}
+		if err := client.SavePreviewImage(img); err != nil {
+			log.Printf("  ERROR: save preview image: %v", err)
+			failed++
+			continue
+		}
+
+		log.Printf("  OK: saved recording with mirrors (thumb=%d, sprite=%d, preview=%d)",
+			len(rec.ThumbnailMirrors), len(rec.SpriteMirrors), len(rec.PreviewMirrors))
+		succeeded++
 
 		if *delay > 0 && i < len(candidatePtrs)-1 {
 			time.Sleep(*delay)
