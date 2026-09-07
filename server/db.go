@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -827,6 +828,37 @@ func RecordingExists(filename string) bool {
 	return err == nil
 }
 
+// hashtagRegex matches broadcaster hashtags embedded in room titles (e.g.
+// "#lovense #anal"). The Chaturbate API's separate `tags` array is routinely
+// empty, so hashtags parsed from the title are the reliable source of tags.
+var hashtagRegex = regexp.MustCompile(`#[A-Za-z0-9_]+`)
+
+// mergeHashtags combines scraper-provided tags with #hashtags parsed from the
+// room title. Every tag is normalized to lowercase and deduplicated so the tag
+// cloud is not fragmented by case variants.
+func mergeHashtags(roomTitle string, tags []string) []string {
+	seen := make(map[string]struct{}, len(tags)+6)
+	out := make([]string, 0, len(tags)+6)
+	add := func(tag string) {
+		tag = strings.ToLower(strings.TrimSpace(tag))
+		if tag == "" {
+			return
+		}
+		if _, ok := seen[tag]; ok {
+			return
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	for _, t := range tags {
+		add(t)
+	}
+	for _, m := range hashtagRegex.FindAllString(roomTitle, -1) {
+		add(m[1:])
+	}
+	return out
+}
+
 // SaveChannelProfile persists scraped full-profile data for a channel into the
 // existing channels table. Best-effort: failures are logged and ignored so a
 // profile scrape can never break recording.
@@ -853,7 +885,7 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 		Filename:     filename,
 		Timestamp:    timestamp,
 		RoomTitle:    roomTitle,
-		Tags:         tags,
+		Tags:         mergeHashtags(roomTitle, tags),
 		Viewers:      viewers,
 		Resolution:   resolution,
 		Framerate:    framerate,
@@ -931,7 +963,7 @@ func SaveRecordingBasics(username, filename, timestamp, roomTitle string, tags [
 		Filename:   filename,
 		Timestamp:  timestamp,
 		RoomTitle:  roomTitle,
-		Tags:       tags,
+		Tags:       mergeHashtags(roomTitle, tags),
 		Viewers:    viewers,
 		Gender:     gender,
 		EndReason:  endReason,
